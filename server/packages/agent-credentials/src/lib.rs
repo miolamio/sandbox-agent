@@ -401,6 +401,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -440,12 +441,16 @@ mod tests {
     }
 
     fn empty_home_dir() -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time before unix epoch")
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("sandbox-agent-agent-credentials-test-{nanos}"));
+        let path = std::env::temp_dir().join(format!(
+            "sandbox-agent-agent-credentials-test-{pid}-{seq}-{nanos}"
+        ));
         fs::create_dir_all(&path).expect("failed to create temp home dir");
         path
     }
@@ -523,5 +528,56 @@ mod tests {
                 assert_eq!(anthropic.auth_type, AuthType::ApiKey);
             },
         );
+    }
+
+    fn home_with_codex_auth(auth: &str) -> PathBuf {
+        let home = empty_home_dir();
+        fs::create_dir_all(home.join(".codex")).expect("failed to create .codex dir");
+        fs::write(home.join(".codex").join("auth.json"), auth).expect("failed to write auth.json");
+        home
+    }
+
+    const CODEX_OAUTH_AUTH_JSON: &str =
+        r#"{"OPENAI_API_KEY": null, "tokens": {"access_token": "fake-access-token"}}"#;
+
+    #[test]
+    fn extract_codex_credentials_reads_oauth_tokens() {
+        let options = CredentialExtractionOptions {
+            home_dir: Some(home_with_codex_auth(CODEX_OAUTH_AUTH_JSON)),
+            include_oauth: true,
+        };
+        let creds = extract_codex_credentials(&options).expect("expected codex oauth credentials");
+
+        assert_eq!(creds.api_key, "fake-access-token");
+        assert_eq!(creds.source, "codex");
+        assert_eq!(creds.auth_type, AuthType::Oauth);
+        assert_eq!(creds.provider, "openai");
+    }
+
+    #[test]
+    fn extract_codex_credentials_ignores_oauth_when_disabled() {
+        let options = CredentialExtractionOptions {
+            home_dir: Some(home_with_codex_auth(CODEX_OAUTH_AUTH_JSON)),
+            include_oauth: false,
+        };
+        assert!(
+            extract_codex_credentials(&options).is_none(),
+            "codex oauth tokens should be ignored when include_oauth is false"
+        );
+    }
+
+    #[test]
+    fn extract_codex_credentials_prefers_api_key_over_oauth() {
+        let options = CredentialExtractionOptions {
+            home_dir: Some(home_with_codex_auth(
+                r#"{"OPENAI_API_KEY": "sk-fake", "tokens": {"access_token": "fake-access-token"}}"#,
+            )),
+            include_oauth: true,
+        };
+        let creds =
+            extract_codex_credentials(&options).expect("expected codex api key credentials");
+
+        assert_eq!(creds.api_key, "sk-fake");
+        assert_eq!(creds.auth_type, AuthType::ApiKey);
     }
 }
