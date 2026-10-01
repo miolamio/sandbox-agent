@@ -173,6 +173,11 @@ fn ensure_openai_ok(
 }
 
 fn health_check_anthropic(credentials: &ProviderCredentials) -> Result<(), TestAgentConfigError> {
+    if credentials.auth_type == AuthType::ApiKeyHelper {
+        // The agent obtains its key from apiKeyHelper at runtime; there is no
+        // static token to health-check with.
+        return Ok(());
+    }
     let credentials = credentials.clone();
     run_blocking_check("anthropic", move || {
         let client = Client::builder()
@@ -207,6 +212,7 @@ fn health_check_anthropic(credentials: &ProviderCredentials) -> Result<(), TestA
                     })?,
                 );
             }
+            AuthType::ApiKeyHelper => return Ok(()),
         }
         headers.insert(
             "anthropic-version",
@@ -358,4 +364,20 @@ fn credentials_with(
     credentials.anthropic = anthropic_cred;
     credentials.openai = openai_cred;
     credentials
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_check_anthropic_skips_api_key_helper() {
+        let credentials = ProviderCredentials {
+            api_key: String::new(),
+            source: "claude-code-api-key-helper".to_string(),
+            auth_type: AuthType::ApiKeyHelper,
+            provider: "anthropic".to_string(),
+        };
+        assert!(health_check_anthropic(&credentials).is_ok());
+    }
 }

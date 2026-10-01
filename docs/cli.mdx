@@ -204,6 +204,18 @@ sandbox-agent credentials extract [OPTIONS]
 sandbox-agent credentials extract --agent claude --reveal
 ```
 
+Each credential reports an `auth_type`:
+
+| `auth_type` | Meaning |
+|-------------|---------|
+| `api_key` | Static API key |
+| `oauth` | OAuth access token. Expired tokens are skipped. |
+| `api_key_helper` | Claude Code `apiKeyHelper` is set in `~/.claude/settings.json`. Claude fetches its own key at runtime, so there is no static value. |
+
+Claude credentials are checked in this order: API keys in `~/.claude.json`, OAuth tokens in `~/.claude/.credentials.json`, `apiKeyHelper` in `~/.claude/settings.json`, then the macOS Keychain. The Keychain is skipped when `--home-dir` is set or with `--no-oauth`.
+
+With `--agent claude` or `--provider anthropic`, an `api_key_helper` credential is an error because there is no token to print.
+
 ### credentials extract-env
 
 ```bash
@@ -219,6 +231,8 @@ sandbox-agent credentials extract-env [OPTIONS]
 ```bash
 eval "$(sandbox-agent credentials extract-env --export)"
 ```
+
+When Claude uses `apiKeyHelper`, no `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY` line is printed. A shell comment is printed instead, so the output stays safe to `eval`.
 
 ## api
 

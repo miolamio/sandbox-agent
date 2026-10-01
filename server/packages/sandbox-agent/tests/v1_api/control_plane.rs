@@ -229,3 +229,30 @@ async fn lazy_install_runs_on_first_bootstrap() {
         .join("agent_processes/codex-acp")
         .exists());
 }
+
+#[tokio::test]
+#[serial]
+async fn v1_agents_reports_claude_credentials_with_api_key_helper() {
+    let test_app = TestApp::with_setup(AuthConfig::disabled(), |install_path| {
+        // install_dir is <root>/xdg-data/sandbox-agent/bin; HOME is <root>/home.
+        let home = install_path
+            .ancestors()
+            .nth(3)
+            .expect("docker test root")
+            .join("home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude dir");
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"apiKeyHelper":"/bin/echo test"}"#,
+        )
+        .expect("write claude settings");
+    });
+
+    let (status, _, body) =
+        send_request(&test_app.app, Method::GET, "/v1/agents/claude", None, &[]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let parsed = parse_json(&body);
+    assert_eq!(parsed["credentialsAvailable"], true, "body: {parsed}");
+}

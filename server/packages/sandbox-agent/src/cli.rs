@@ -959,23 +959,40 @@ fn run_credentials(command: &CredentialsCommand) -> Result<(), CliError> {
 
             let credentials = extract_all_credentials(&options);
             let prefix = if args.export { "export " } else { "" };
-
-            if let Some(cred) = &credentials.anthropic {
-                write_stdout_line(&format!("{}ANTHROPIC_API_KEY={}", prefix, cred.api_key))?;
-                write_stdout_line(&format!("{}CLAUDE_API_KEY={}", prefix, cred.api_key))?;
-            }
-            if let Some(cred) = &credentials.openai {
-                write_stdout_line(&format!("{}OPENAI_API_KEY={}", prefix, cred.api_key))?;
-                write_stdout_line(&format!("{}CODEX_API_KEY={}", prefix, cred.api_key))?;
-            }
-            for (provider, cred) in &credentials.other {
-                let var_name = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
-                write_stdout_line(&format!("{}{}={}", prefix, var_name, cred.api_key))?;
+            for line in credentials_env_lines(&credentials, prefix) {
+                write_stdout_line(&line)?;
             }
 
             Ok(())
         }
     }
+}
+
+/// Renders `credentials extract-env` output. Credentials without a static key
+/// (Claude `apiKeyHelper`) produce a shell comment instead of an empty assignment,
+/// so `eval "$(sandbox-agent credentials extract-env --export)"` stays safe.
+fn credentials_env_lines(credentials: &ExtractedCredentials, prefix: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(cred) = &credentials.anthropic {
+        if cred.auth_type == AuthType::ApiKeyHelper {
+            lines.push(
+                "# anthropic: Claude Code apiKeyHelper is configured; no static key to export"
+                    .to_string(),
+            );
+        } else {
+            lines.push(format!("{}ANTHROPIC_API_KEY={}", prefix, cred.api_key));
+            lines.push(format!("{}CLAUDE_API_KEY={}", prefix, cred.api_key));
+        }
+    }
+    if let Some(cred) = &credentials.openai {
+        lines.push(format!("{}OPENAI_API_KEY={}", prefix, cred.api_key));
+        lines.push(format!("{}CODEX_API_KEY={}", prefix, cred.api_key));
+    }
+    for (provider, cred) in &credentials.other {
+        let var_name = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
+        lines.push(format!("{}{}={}", prefix, var_name, cred.api_key));
+    }
+    lines
 }
 
 fn run_mock_agent_process() -> Result<(), CliError> {
@@ -1192,6 +1209,7 @@ fn summarize_credential(credential: &ProviderCredentials, reveal: bool) -> Crede
         auth_type: match credential.auth_type {
             AuthType::ApiKey => "api_key".to_string(),
             AuthType::Oauth => "oauth".to_string(),
+            AuthType::ApiKeyHelper => "api_key_helper".to_string(),
         },
         api_key,
         redacted: !reveal,
@@ -1244,7 +1262,11 @@ fn select_token_for_agent(
             if let Some(openai) = credentials.openai.as_ref() {
                 return Ok(openai.api_key.clone());
             }
-            if let Some(anthropic) = credentials.anthropic.as_ref() {
+            if let Some(anthropic) = credentials
+                .anthropic
+                .as_ref()
+                .filter(|cred| cred.auth_type != AuthType::ApiKeyHelper)
+            {
                 return Ok(anthropic.api_key.clone());
             }
             if credentials.other.len() == 1 {
@@ -1272,6 +1294,11 @@ fn select_token_for_provider(
     provider: &str,
 ) -> Result<String, CliError> {
     if let Some(cred) = provider_credential(credentials, provider) {
+        if cred.auth_type == AuthType::ApiKeyHelper {
+            return Err(CliError::Server(format!(
+                "provider {provider} uses Claude Code apiKeyHelper; there is no static token to print"
+            )));
+        }
         Ok(cred.api_key.clone())
     } else {
         Err(CliError::Server(format!(
@@ -1579,6 +1606,59 @@ fn write_stderr_line(text: &str) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn helper_credentials() -> ExtractedCredentials {
+        ExtractedCredentials {
+            anthropic: Some(ProviderCredentials {
+                api_key: String::new(),
+                source: "claude-code-api-key-helper".to_string(),
+                auth_type: AuthType::ApiKeyHelper,
+                provider: "anthropic".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn credentials_env_lines_skips_api_key_helper() {
+        let lines = credentials_env_lines(&helper_credentials(), "export ");
+        assert!(
+            lines.iter().all(|line| line.starts_with('#')),
+            "apiKeyHelper must not emit key assignments: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn credentials_env_lines_emits_static_keys() {
+        let credentials = ExtractedCredentials {
+            anthropic: Some(ProviderCredentials {
+                api_key: "fake-anthropic".to_string(),
+                source: "environment".to_string(),
+                auth_type: AuthType::ApiKey,
+                provider: "anthropic".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            credentials_env_lines(&credentials, "export "),
+            vec![
+                "export ANTHROPIC_API_KEY=fake-anthropic".to_string(),
+                "export CLAUDE_API_KEY=fake-anthropic".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_token_rejects_api_key_helper() {
+        assert!(select_token_for_provider(&helper_credentials(), "anthropic").is_err());
+    }
+
+    #[test]
+    fn summarize_credential_reports_api_key_helper() {
+        let credentials = helper_credentials();
+        let summary = summarize_credential(credentials.anthropic.as_ref().unwrap(), false);
+        assert_eq!(summary.auth_type, "api_key_helper");
+    }
 
     #[test]
     fn resolve_install_agents_expands_all() {
