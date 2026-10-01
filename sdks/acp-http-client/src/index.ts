@@ -270,6 +270,12 @@ class StreamableHttpAcpTransport {
   // True while an SSE response is open. Only then is it safe to ask the server
   // to deliver prompt responses exclusively over SSE.
   private sseConnected = false;
+  // Set after the first successful SSE connect. Before that, 404 can just mean
+  // the bootstrap POST has not created the server yet, so it is retryable.
+  private sseEverConnected = false;
+  // Prompts sent with the async header: their result only arrives over SSE, so
+  // they must be failed explicitly if SSE is given up.
+  private readonly asyncPendingIds = new Map<string, number | string | null>();
   private readonly seenResponseIds = new Set<string>();
   private readonly seenResponseIdOrder: string[] = [];
 
@@ -378,6 +384,10 @@ class StreamableHttpAcpTransport {
       // The server acknowledges with 202 and delivers the result over SSE, so a
       // long-running prompt does not depend on HTTP response-header timeouts.
       headers.set(ASYNC_PROMPT_HEADER, "1");
+      const id = requestIdFromMessage(message);
+      if (id !== undefined) {
+        this.asyncPendingIds.set(String(id), id);
+      }
     }
 
     const url = this.buildUrl(this.bootstrapQueryIfNeeded());
@@ -442,6 +452,7 @@ class StreamableHttpAcpTransport {
   }
 
   private async runSseLoop(): Promise<void> {
+    let failures = 0;
     while (!this.closed) {
       this.sseAbortController = new AbortController();
 
@@ -468,6 +479,8 @@ class StreamableHttpAcpTransport {
         }
 
         this.sseConnected = true;
+        this.sseEverConnected = true;
+        failures = 0;
         try {
           await this.consumeSse(response.body);
         } finally {
@@ -483,9 +496,36 @@ class StreamableHttpAcpTransport {
         }
 
         // Prompt responses can be delivered exclusively over SSE after a 202.
-        // Reconnect without waiting for another POST, replaying from Last-Event-ID.
-        await delay(150);
+        // Reconnect without waiting for another POST, replaying from
+        // Last-Event-ID, with capped exponential backoff. Give up on terminal
+        // statuses (server gone or unauthorized) or after repeated failures;
+        // the next POST restarts the loop.
+        failures += 1;
+        if (isTerminalSseError(error, this.sseEverConnected) || failures >= SSE_MAX_CONSECUTIVE_FAILURES) {
+          this.failAsyncPending(error);
+          return;
+        }
+        await delay(Math.min(SSE_RECONNECT_BASE_MS * 2 ** (failures - 1), SSE_RECONNECT_MAX_MS));
       }
+    }
+  }
+
+  private failAsyncPending(cause: unknown): void {
+    if (this.asyncPendingIds.size === 0) {
+      return;
+    }
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    const ids = [...this.asyncPendingIds.values()];
+    this.asyncPendingIds.clear();
+    for (const id of ids) {
+      this.pushInbound({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32603,
+          message: `ACP event stream unavailable; the prompt result could not be delivered (${reason})`,
+        },
+      } as AnyMessage);
     }
   }
 
@@ -569,6 +609,7 @@ class StreamableHttpAcpTransport {
 
     const responseId = responseEnvelopeId(envelope);
     if (responseId) {
+      this.asyncPendingIds.delete(responseId);
       if (this.seenResponseIds.has(responseId)) {
         return;
       }
@@ -706,6 +747,18 @@ function responseEnvelopeId(message: AnyMessage): string | null {
 }
 
 const ASYNC_PROMPT_HEADER = "x-sandboxagent-async-prompt";
+const SSE_RECONNECT_BASE_MS = 150;
+const SSE_RECONNECT_MAX_MS = 5_000;
+const SSE_MAX_CONSECUTIVE_FAILURES = 8;
+const TERMINAL_SSE_STATUSES = new Set([401, 403, 410]);
+
+function isTerminalSseError(error: unknown, everConnected: boolean): boolean {
+  if (!(error instanceof AcpHttpError)) {
+    return false;
+  }
+  // 404 after a successful connect means the server was deleted.
+  return TERMINAL_SSE_STATUSES.has(error.status) || (error.status === 404 && everConnected);
+}
 
 function isAsyncPromptRequest(message: AnyMessage): boolean {
   return (

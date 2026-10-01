@@ -301,6 +301,46 @@ async fn acp_async_prompt_delete_delivers_error_over_sse() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn acp_delete_closes_open_sse_stream() {
+    let test_app = TestApp::with_setup(AuthConfig::disabled(), |install_dir| {
+        setup_stub_artifacts(install_dir, "codex");
+    });
+
+    bootstrap_server(&test_app.app, "server-delete-sse", "codex").await;
+
+    let response = reqwest::Client::new()
+        .get(test_app.app.http_url("/v1/acp/server-delete-sse"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("sse response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.bytes_stream();
+
+    let (status, _, _) = send_request(
+        &test_app.app,
+        Method::DELETE,
+        "/v1/acp/server-delete-sse",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Drain replayed events; the stream must end once the runtime is gone.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = stream.next().await {
+            if chunk.is_err() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("SSE stream should close after DELETE");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn acp_delete_during_pending_prompt_returns_promptly() {
     let test_app = TestApp::with_setup(AuthConfig::disabled(), |install_dir| {
         setup_stub_artifacts(install_dir, "codex");

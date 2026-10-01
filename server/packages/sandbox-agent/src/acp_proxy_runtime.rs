@@ -62,12 +62,18 @@ impl ProxyInstance {
     async fn annotated_payload_stream(&self, last_event_id: Option<u64>) -> PinBoxPayloadStream {
         let stream = self.runtime.clone().payload_stream(last_event_id).await;
         let agent = self.agent;
-        let runtime = self.runtime.clone();
+        // Hold only a weak reference: a strong one would keep the runtime (and
+        // its broadcast sender) alive, so the stream would never close after
+        // DELETE/shutdown and the runtime would leak.
+        let runtime = Arc::downgrade(&self.runtime);
         Box::pin(stream.then(move |(sequence, value)| {
-            let runtime = runtime.clone();
+            let runtime = runtime.upgrade();
             async move {
                 let value = annotate_agent_error(agent, value);
-                let value = annotate_agent_stderr(value, &runtime).await;
+                let value = match runtime {
+                    Some(runtime) => annotate_agent_stderr(value, &runtime).await,
+                    None => value,
+                };
                 (sequence, value)
             }
         }))

@@ -388,4 +388,138 @@ describe("AcpHttpClient integration", () => {
 
     await client.disconnect();
   });
+
+  it("stops reconnecting SSE after the server is deleted", async () => {
+    const serverId = `acp-http-client-deleted-${Date.now().toString(36)}`;
+    const path = `/v1/acp/${encodeURIComponent(serverId)}`;
+    let sseConnected = false;
+    let getCount = 0;
+    const countingFetch: typeof fetch = async (input, init) => {
+      if (init?.method === "GET") {
+        getCount += 1;
+      }
+      const response = await globalThis.fetch(input, init);
+      if (init?.method === "GET" && response.ok) {
+        sseConnected = true;
+      }
+      return response;
+    };
+
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: countingFetch,
+      transport: { path, bootstrapQuery: { agent: "mock" } },
+    });
+
+    await client.initialize();
+    await waitFor(() => (sseConnected ? true : undefined));
+
+    // Delete the server behind the client's back: the SSE stream ends and every
+    // reconnect gets 404, which is terminal.
+    const deleted = await globalThis.fetch(`${baseUrl}${path}`, {
+      method: "DELETE",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    expect(deleted.status).toBe(204);
+
+    const getsAtDelete = getCount;
+    await sleep(2_000);
+    expect(getCount - getsAtDelete).toBeLessThanOrEqual(2);
+
+    await client.disconnect();
+  });
+
+  it("rejects an in-flight async prompt when the event stream cannot be restored", async () => {
+    const serverId = `acp-http-client-sse-lost-${Date.now().toString(36)}`;
+    let sseConnected = false;
+    let sseBroken = false;
+    const activeSse: { close: (() => void) | null } = { close: null };
+    const breakingFetch: typeof fetch = async (input, init) => {
+      if (init?.method === "GET" && sseBroken) {
+        return new Response(JSON.stringify({ status: 404, title: "Not Found" }), {
+          status: 404,
+          headers: { "content-type": "application/problem+json" },
+        });
+      }
+      const response = await globalThis.fetch(input, init);
+      if (init?.method !== "GET" || !response.ok || !response.body) {
+        return response;
+      }
+      sseConnected = true;
+      // Pass the real SSE body through a stream the test can end on demand.
+      const reader = response.body.getReader();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          activeSse.close = () => {
+            try {
+              controller.close();
+            } catch {}
+            reader.cancel().catch(() => {});
+          };
+        },
+        async pull(controller) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              controller.close();
+            } else {
+              controller.enqueue(value);
+            }
+          } catch {
+            try {
+              controller.close();
+            } catch {}
+          }
+        },
+        cancel() {
+          reader.cancel().catch(() => {});
+        },
+      });
+      return new Response(body, { status: response.status, headers: response.headers });
+    };
+
+    let permissionSeen = false;
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: breakingFetch,
+      transport: {
+        path: `/v1/acp/${encodeURIComponent(serverId)}`,
+        bootstrapQuery: { agent: "mock" },
+      },
+      client: {
+        // Never answer, so the prompt stays pending on the server.
+        requestPermission: () => {
+          permissionSeen = true;
+          return new Promise(() => {});
+        },
+      },
+    });
+
+    await client.initialize();
+    const session = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await waitFor(() => (sseConnected ? true : undefined));
+    await sleep(25);
+
+    const prompt = client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "please trigger permission" }],
+    });
+    const outcome = prompt.then(
+      () => "resolved",
+      (error: unknown) => error,
+    );
+
+    await waitFor(() => (permissionSeen ? true : undefined));
+    sseBroken = true;
+    activeSse.close?.();
+
+    const result = await Promise.race([outcome, sleep(5_000).then(() => "timed out")]);
+    expect(result).not.toBe("timed out");
+    expect(result).not.toBe("resolved");
+    expect(String((result as { message?: unknown }).message)).toMatch(/event stream/i);
+
+    await client.disconnect();
+  });
 });
