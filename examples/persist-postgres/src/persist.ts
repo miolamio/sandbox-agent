@@ -37,7 +37,7 @@ export class PostgresSessionPersistDriver implements SessionPersistDriver {
     await this.ready();
 
     const result = await this.pool.query<SessionRow>(
-      `SELECT id, agent, agent_session_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
+      `SELECT id, agent, agent_session_id, server_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
        FROM ${this.table("sessions")}
        WHERE id = $1`,
       [id],
@@ -57,7 +57,7 @@ export class PostgresSessionPersistDriver implements SessionPersistDriver {
     const limit = normalizeLimit(request.limit);
 
     const rowsResult = await this.pool.query<SessionRow>(
-      `SELECT id, agent, agent_session_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
+      `SELECT id, agent, agent_session_id, server_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
        FROM ${this.table("sessions")}
        ORDER BY created_at ASC, id ASC
        LIMIT $1 OFFSET $2`,
@@ -79,11 +79,12 @@ export class PostgresSessionPersistDriver implements SessionPersistDriver {
 
     await this.pool.query(
       `INSERT INTO ${this.table("sessions")} (
-        id, agent, agent_session_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        id, agent, agent_session_id, server_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       ON CONFLICT(id) DO UPDATE SET
         agent = EXCLUDED.agent,
         agent_session_id = EXCLUDED.agent_session_id,
+        server_id = EXCLUDED.server_id,
         last_connection_id = EXCLUDED.last_connection_id,
         created_at = EXCLUDED.created_at,
         destroyed_at = EXCLUDED.destroyed_at,
@@ -95,6 +96,7 @@ export class PostgresSessionPersistDriver implements SessionPersistDriver {
         session.id,
         session.agent,
         session.agentSessionId,
+        session.serverId ?? null,
         session.lastConnectionId,
         session.createdAt,
         session.destroyedAt ?? null,
@@ -174,6 +176,7 @@ export class PostgresSessionPersistDriver implements SessionPersistDriver {
         id TEXT PRIMARY KEY,
         agent TEXT NOT NULL,
         agent_session_id TEXT NOT NULL,
+        server_id TEXT,
         last_connection_id TEXT NOT NULL,
         created_at BIGINT NOT NULL,
         destroyed_at BIGINT,
@@ -187,6 +190,11 @@ export class PostgresSessionPersistDriver implements SessionPersistDriver {
     await this.pool.query(`
       ALTER TABLE ${this.table("sessions")}
       ADD COLUMN IF NOT EXISTS sandbox_id TEXT
+    `);
+
+    await this.pool.query(`
+      ALTER TABLE ${this.table("sessions")}
+      ADD COLUMN IF NOT EXISTS server_id TEXT
     `);
 
     await this.pool.query(`
@@ -249,6 +257,7 @@ type SessionRow = {
   id: string;
   agent: string;
   agent_session_id: string;
+  server_id: string | null;
   last_connection_id: string;
   created_at: string | number;
   destroyed_at: string | number | null;
@@ -273,6 +282,7 @@ function decodeSessionRow(row: SessionRow): SessionRecord {
     id: row.id,
     agent: row.agent,
     agentSessionId: row.agent_session_id,
+    serverId: row.server_id ?? undefined,
     lastConnectionId: row.last_connection_id,
     createdAt: parseInteger(row.created_at),
     destroyedAt: row.destroyed_at === null ? undefined : parseInteger(row.destroyed_at),

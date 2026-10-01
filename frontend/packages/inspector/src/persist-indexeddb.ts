@@ -136,6 +136,7 @@ type SessionRow = {
   id: string;
   agent: string;
   agentSessionId: string;
+  serverId?: string;
   lastConnectionId: string;
   createdAt: number;
   destroyedAt?: number;
@@ -160,6 +161,7 @@ function encodeSessionRow(session: SessionRecord): SessionRow {
     id: session.id,
     agent: session.agent,
     agentSessionId: session.agentSessionId,
+    serverId: session.serverId,
     lastConnectionId: session.lastConnectionId,
     createdAt: session.createdAt,
     destroyedAt: session.destroyedAt,
@@ -175,6 +177,7 @@ function decodeSessionRow(row: SessionRow): SessionRecord {
     id: row.id,
     agent: row.agent,
     agentSessionId: row.agentSessionId,
+    serverId: row.serverId,
     lastConnectionId: row.lastConnectionId,
     createdAt: row.createdAt,
     destroyedAt: row.destroyedAt,

@@ -10,8 +10,15 @@ With persistence enabled, sessions can be restored after runtime/session loss. S
 
 Each driver stores:
 
-- `SessionRecord` (`id`, `agent`, `agentSessionId`, `lastConnectionId`, `createdAt`, optional `destroyedAt`, optional `sandboxId`, optional `sessionInit`, optional `configOptions`, optional `modes`)
+- `SessionRecord` (`id`, `agent`, `agentSessionId`, optional `serverId`, `lastConnectionId`, `createdAt`, optional `destroyedAt`, optional `sandboxId`, optional `sessionInit`, optional `configOptions`, optional `modes`)
 - `SessionEvent` (`id`, `eventIndex`, `sessionId`, `connectionId`, `sender`, `payload`, `createdAt`)
+
+Store every `SessionRecord` field the SDK gives you and return it unchanged:
+
+- `serverId` is the agent server the session last ran on. Restoring a session reattaches to that server when it is still running, so the agent session continues without replaying history.
+- `configOptions` and `modes` hold the selected model, mode, and other settings. They are applied again when a session has to be recreated.
+
+`serverId` is optional, so records written by older SDK versions still load. Without it, a restored session is recreated. If your driver uses a fixed schema, add a nullable column for it. The SQLite and Postgres examples do this with an `ALTER TABLE ... ADD COLUMN` migration on startup.
 
 ## Persistence drivers
 
@@ -113,7 +120,7 @@ class MyDriver implements SessionPersistDriver {
 - `replayMaxEvents` (default `50`)
 - `replayMaxChars` (default `12000`)
 
-These cap replay size when restoring sessions.
+These cap replay size when a restored session has to be recreated. Reattached sessions do not replay history.
 
 ## Related docs
 

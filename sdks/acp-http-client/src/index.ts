@@ -53,6 +53,12 @@ export type QueryValue = string | number | boolean | null | undefined;
 export interface AcpHttpTransportOptions {
   path?: string;
   bootstrapQuery?: Record<string, QueryValue>;
+  /**
+   * Start the event stream after the events the server buffered before this
+   * client connected. Use it when attaching to a server another client already
+   * used, so that client's past notifications and requests are not replayed.
+   */
+  skipBufferedEvents?: boolean;
 }
 
 export interface AcpHttpClientOptions {
@@ -275,9 +281,15 @@ class StreamableHttpAcpTransport {
   private sseEverConnected = false;
   // Prompts sent with the async header: their result only arrives over SSE, so
   // they must be failed explicitly if SSE is given up.
-  private readonly asyncPendingIds = new Map<string, number | string | null>();
-  private readonly seenResponseIds = new Set<string>();
-  private readonly seenResponseIdOrder: string[] = [];
+  private readonly asyncPendingIds = new Map<string, string>();
+  // Several clients can share one server, and the server broadcasts every
+  // response to every event stream. Outbound request ids are therefore sent with
+  // a per-transport prefix; only responses to ids in this map are delivered,
+  // mapped back to the id the connection used. A response is delivered once:
+  // its entry is removed on delivery, so a copy arriving over both the POST
+  // body and the event stream is dropped.
+  private readonly wireIdPrefix = `c${Math.random().toString(36).slice(2, 10)}-`;
+  private readonly pendingRequestIds = new Map<string, number | string>();
 
   constructor(options: StreamableHttpAcpTransportOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
@@ -287,6 +299,11 @@ class StreamableHttpAcpTransport {
     this.defaultHeaders = options.defaultHeaders;
     this.onEnvelope = options.onEnvelope;
     this.bootstrapQuery = options.transport?.bootstrapQuery ? buildQueryParams(options.transport.bootstrapQuery) : null;
+    if (options.transport?.skipBufferedEvents) {
+      // Last-Event-ID asks for events after the given id. The largest id the
+      // server accepts matches no buffered event, so only live events follow.
+      this.lastEventId = MAX_SSE_EVENT_ID;
+    }
 
     this.stream = {
       readable: new ReadableStream<AnyMessage>({
@@ -380,20 +397,33 @@ class StreamableHttpAcpTransport {
       Accept: "application/json",
     });
 
-    if (this.sseConnected && isAsyncPromptRequest(message)) {
+    const wireMessage = this.toWireMessage(message);
+
+    if (this.sseConnected && isAsyncPromptRequest(wireMessage)) {
       // The server acknowledges with 202 and delivers the result over SSE, so a
       // long-running prompt does not depend on HTTP response-header timeouts.
       headers.set(ASYNC_PROMPT_HEADER, "1");
-      const id = requestIdFromMessage(message);
-      if (id !== undefined) {
-        this.asyncPendingIds.set(String(id), id);
+      const id = requestIdFromMessage(wireMessage);
+      if (typeof id === "string") {
+        this.asyncPendingIds.set(id, id);
       }
     }
 
     const url = this.buildUrl(this.bootstrapQueryIfNeeded());
     this.postedOnce = true;
     this.ensureSseLoop();
-    void this.postMessage(url, headers, message);
+    void this.postMessage(url, headers, wireMessage);
+  }
+
+  private toWireMessage(message: AnyMessage): AnyMessage {
+    const record = message as Record<string, unknown>;
+    const id = record.id;
+    if (typeof record.method !== "string" || (typeof id !== "string" && typeof id !== "number")) {
+      return message;
+    }
+    const wireId = `${this.wireIdPrefix}${String(id)}`;
+    this.pendingRequestIds.set(wireId, id);
+    return { ...record, id: wireId } as AnyMessage;
   }
 
   private async postMessage(url: string, headers: Headers, message: AnyMessage): Promise<void> {
@@ -609,18 +639,14 @@ class StreamableHttpAcpTransport {
 
     const responseId = responseEnvelopeId(envelope);
     if (responseId) {
-      this.asyncPendingIds.delete(responseId);
-      if (this.seenResponseIds.has(responseId)) {
+      const originalId = this.pendingRequestIds.get(responseId);
+      if (originalId === undefined) {
+        // Another client's response, or a duplicate of one already delivered.
         return;
       }
-      this.seenResponseIds.add(responseId);
-      this.seenResponseIdOrder.push(responseId);
-      if (this.seenResponseIdOrder.length > 2048) {
-        const oldest = this.seenResponseIdOrder.shift();
-        if (oldest) {
-          this.seenResponseIds.delete(oldest);
-        }
-      }
+      this.pendingRequestIds.delete(responseId);
+      this.asyncPendingIds.delete(responseId);
+      envelope = { ...(envelope as Record<string, unknown>), id: originalId } as AnyMessage;
     }
 
     this.observeEnvelope(envelope, "inbound");
@@ -747,6 +773,7 @@ function responseEnvelopeId(message: AnyMessage): string | null {
 }
 
 const ASYNC_PROMPT_HEADER = "x-sandboxagent-async-prompt";
+const MAX_SSE_EVENT_ID = "18446744073709551615";
 const SSE_RECONNECT_BASE_MS = 150;
 const SSE_RECONNECT_MAX_MS = 5_000;
 const SSE_MAX_CONSECUTIVE_FAILURES = 8;

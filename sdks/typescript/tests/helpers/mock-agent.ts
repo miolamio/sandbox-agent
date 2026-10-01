@@ -31,6 +31,20 @@ const { createInterface } = require("node:readline");
 let nextSession = 0;
 let nextPermission = 0;
 const pendingPermissions = new Map();
+// Sessions this process created. Prompts and resume requests for any other
+// session id fail like a real agent that lost its session state.
+const knownSessions = new Set();
+
+function sessionNotFound(id, sessionId) {
+  emit({
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code: -32002,
+      message: "Session not found: " + String(sessionId),
+    },
+  });
+}
 
 function parseJsonEnv(name) {
   const raw = process.env[name];
@@ -114,6 +128,11 @@ rl.on("line", (line) => {
         },
       });
     }
+    return;
+  }
+
+  if (method === "session/prompt" && hasId && !knownSessions.has(msg?.params?.sessionId)) {
+    sessionNotFound(msg.id, msg?.params?.sessionId);
     return;
   }
 
@@ -209,6 +228,11 @@ rl.on("line", (line) => {
       result: {
         protocolVersion: 1,
         capabilities: {},
+        agentCapabilities: {
+          sessionCapabilities: {
+            resume: {},
+          },
+        },
         serverInfo: {
           name: "mock-acp-agent",
           version: "0.0.1",
@@ -244,12 +268,39 @@ rl.on("line", (line) => {
 
   if (method === "session/new") {
     nextSession += 1;
+    const sessionId = "mock-session-" + nextSession;
+    knownSessions.add(sessionId);
     emit({
       jsonrpc: "2.0",
       id: msg.id,
       result: {
-        sessionId: "mock-session-" + nextSession,
+        sessionId,
       },
+    });
+    return;
+  }
+
+  if (method === "session/resume") {
+    const sessionId = msg?.params?.sessionId;
+    if (!knownSessions.has(sessionId)) {
+      sessionNotFound(msg.id, sessionId);
+      return;
+    }
+    emit({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {},
+    });
+    return;
+  }
+
+  // Test hook: drop a session so the next request for it fails as unknown.
+  if (method === "_mock/forget_session") {
+    knownSessions.delete(msg?.params?.sessionId);
+    emit({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {},
     });
     return;
   }

@@ -328,3 +328,13 @@ Update this file continuously during the migration.
 - Owner: Unassigned.
 - Status: resolved
 - Links: `server/packages/sandbox-agent/src/acp_proxy_runtime.rs`, `server/packages/sandbox-agent/src/cli.rs`, `server/packages/sandbox-agent/src/router.rs`, `server/packages/sandbox-agent/tests/v1_api/acp_transport.rs`, `docs/cli.mdx`
+
+- Date: 2026-10-01
+- Area: Session resume and reattach in the TypeScript SDK (SBA-27)
+- Issue: `resumeSession` always created a new agent session on a new server and overwrote persisted `modes`/`configOptions` with the new session's defaults, so the selected mode and model were lost. Reattaching a second client to a running `/v1/acp/{server_id}` was also unsafe: the server buffers and broadcasts every response to every SSE stream and replays the whole ring buffer to a new stream, so the new client received the old client's responses (same numeric JSON-RPC ids) and history.
+- Impact: Restored sessions silently fell back to default permissions; a reattached client could resolve requests with another client's responses or drop its own as duplicates, and re-persisted old notifications.
+- Proposed direction: Persist `serverId`, reattach to that server when it still runs and resume via `session/resume` when the agent advertises `sessionCapabilities.resume`, otherwise recreate with replay; re-apply previous mode/config in both cases.
+- Decision: Accepted and implemented. `acp-http-client` prefixes outbound request ids per transport and only delivers responses to its own ids; `transport.skipBufferedEvents` starts SSE with `Last-Event-ID: u64::MAX` so only live events follow (no server change). Settings that cannot be re-applied throw `SessionConfigRestoreError` (carries the restored session). Requests that fail because the server is gone (checked via `GET /v1/acp`) or the agent reports an unknown session restore the session and retry once. The fork's synthesized `session/prompt` response (tiagoefreitas `b4cc750`) was not ported: every response that resolves a request passes the envelope observer first; the SDK now awaits per-session event persistence before `prompt()` resolves. Open: an agent-initiated permission request pending when the old client crashed is not replayed to the reattached client.
+- Owner: Unassigned.
+- Status: resolved
+- Links: `sdks/typescript/src/client.ts`, `sdks/acp-http-client/src/index.ts`, `sdks/typescript/tests/integration.test.ts`, `docs/session-restoration.mdx`

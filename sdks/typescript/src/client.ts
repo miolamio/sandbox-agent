@@ -360,6 +360,27 @@ export class UnsupportedPermissionReplyError extends Error {
   }
 }
 
+/**
+ * Thrown by `resumeSession` (and by calls that restore a session on demand) when
+ * the session was restored but some of its previous settings, such as the mode
+ * or a config option, could not be applied again. `session` is restored and
+ * usable; `failures` lists what was not applied.
+ */
+export class SessionConfigRestoreError extends Error {
+  readonly session: Session;
+  readonly failures: Array<{ category: string; configId: string; value: string; error: unknown }>;
+
+  constructor(session: Session, failures: Array<{ category: string; configId: string; value: string; error: unknown }>) {
+    const summary = failures
+      .map((failure) => `${failure.configId}=${failure.value}: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`)
+      .join("; ");
+    super(`Session '${session.id}' was restored, but some previous settings could not be applied again: ${summary}`);
+    this.name = "SessionConfigRestoreError";
+    this.session = session;
+    this.failures = failures;
+  }
+}
+
 export class Session {
   private record: SessionRecord;
   private readonly sandbox: SandboxAgent;
@@ -383,6 +404,11 @@ export class Session {
 
   get lastConnectionId(): string {
     return this.record.lastConnectionId;
+  }
+
+  /** Agent server the session was last attached to, if known. */
+  get serverId(): string | undefined {
+    return this.record.serverId;
   }
 
   get createdAt(): number {
@@ -473,6 +499,9 @@ export class Session {
 export class LiveAcpConnection {
   readonly connectionId: string;
   readonly agent: string;
+  readonly serverId: string;
+  /** Whether the agent advertised support for resuming an existing session. */
+  readonly supportsResume: boolean;
 
   private readonly acp: AcpHttpClient;
   private readonly sessionByLocalId = new Map<string, string>();
@@ -498,6 +527,8 @@ export class LiveAcpConnection {
 
   private constructor(
     agent: string,
+    serverId: string,
+    supportsResume: boolean,
     connectionId: string,
     acp: AcpHttpClient,
     onObservedEnvelope: (connection: LiveAcpConnection, envelope: AnyMessage, direction: AcpEnvelopeDirection, localSessionId: string | null) => void,
@@ -509,6 +540,8 @@ export class LiveAcpConnection {
     ) => Promise<RequestPermissionResponse>,
   ) {
     this.agent = agent;
+    this.serverId = serverId;
+    this.supportsResume = supportsResume;
     this.connectionId = connectionId;
     this.acp = acp;
     this.onObservedEnvelope = onObservedEnvelope;
@@ -523,6 +556,8 @@ export class LiveAcpConnection {
     auth?: SandboxAgentAuthOptions | false;
     agent: string;
     serverId: string;
+    /** Attach to a server that already exists without replaying its buffered events. */
+    attach?: boolean;
     onObservedEnvelope: (connection: LiveAcpConnection, envelope: AnyMessage, direction: AcpEnvelopeDirection, localSessionId: string | null) => void;
     onPermissionRequest: (
       connection: LiveAcpConnection,
@@ -542,6 +577,7 @@ export class LiveAcpConnection {
       transport: {
         path: `${API_PREFIX}/acp/${encodeURIComponent(options.serverId)}`,
         bootstrapQuery: { agent: options.agent },
+        skipBufferedEvents: options.attach === true,
       },
       client: {
         requestPermission: async (request: RequestPermissionRequest) => {
@@ -566,8 +602,6 @@ export class LiveAcpConnection {
       },
     });
 
-    live = new LiveAcpConnection(options.agent, connectionId, acp, options.onObservedEnvelope, options.onPermissionRequest);
-
     const initResult = await acp.initialize({
       protocolVersion: PROTOCOL_VERSION,
       clientInfo: {
@@ -575,6 +609,9 @@ export class LiveAcpConnection {
         version: "v1",
       },
     });
+    const supportsResume = initResult.agentCapabilities?.sessionCapabilities?.resume != null;
+    live = new LiveAcpConnection(options.agent, options.serverId, supportsResume, connectionId, acp, options.onObservedEnvelope, options.onPermissionRequest);
+
     if (initResult.authMethods && initResult.authMethods.length > 0) {
       try {
         await autoAuthenticate(acp, options.agent, initResult.authMethods, options.auth);
@@ -602,8 +639,21 @@ export class LiveAcpConnection {
   }
 
   bindSession(localSessionId: string, agentSessionId: string): void {
+    const previousAgentSessionId = this.sessionByLocalId.get(localSessionId);
+    if (previousAgentSessionId && previousAgentSessionId !== agentSessionId) {
+      this.localByAgentSessionId.delete(previousAgentSessionId);
+    }
     this.sessionByLocalId.set(localSessionId, agentSessionId);
     this.localByAgentSessionId.set(agentSessionId, localSessionId);
+  }
+
+  unbindSession(localSessionId: string): void {
+    const agentSessionId = this.sessionByLocalId.get(localSessionId);
+    if (agentSessionId && this.localByAgentSessionId.get(agentSessionId) === localSessionId) {
+      this.localByAgentSessionId.delete(agentSessionId);
+    }
+    this.sessionByLocalId.delete(localSessionId);
+    this.pendingReplayByLocalSessionId.delete(localSessionId);
   }
 
   queueReplay(localSessionId: string, replayText: string | null): void {
@@ -632,6 +682,29 @@ export class LiveAcpConnection {
         const suffix = adapterExit.code == null ? "" : ` (code ${adapterExit.code})`;
         throw new Error(`Agent process exited while creating session${suffix}`);
       }
+      throw error;
+    }
+  }
+
+  /**
+   * Reattach an agent session that already exists (in this server process or in
+   * the agent's own storage). The session is bound first so notifications sent
+   * while resuming are attributed to it; it is unbound again if resuming fails.
+   */
+  async resumeRemoteSession(
+    localSessionId: string,
+    agentSessionId: string,
+    sessionInit: Omit<NewSessionRequest, "_meta">,
+  ): Promise<{ configOptions?: SessionConfigOption[] | null; modes?: SessionModeState | null }> {
+    this.bindSession(localSessionId, agentSessionId);
+    try {
+      return await this.acp.unstableResumeSession({
+        sessionId: agentSessionId,
+        cwd: sessionInit.cwd,
+        mcpServers: sessionInit.mcpServers,
+      });
+    } catch (error) {
+      this.unbindSession(localSessionId);
       throw error;
     }
   }
@@ -939,8 +1012,12 @@ export class SandboxAgent {
   private healthError?: Error;
   private disposed = false;
 
+  // Keyed by server id. One SDK instance can hold several connections for the
+  // same agent when it reattaches sessions that ran on other servers.
   private readonly liveConnections = new Map<string, LiveAcpConnection>();
   private readonly pendingLiveConnections = new Map<string, Promise<LiveAcpConnection>>();
+  private readonly pendingLiveConnectionsByAgent = new Map<string, Promise<LiveAcpConnection>>();
+  private readonly pendingSessionRestores = new Map<string, Promise<Session>>();
   private readonly sessionHandles = new Map<string, Session>();
   private readonly eventListeners = new Map<string, Set<SessionEventListener>>();
   private readonly permissionListeners = new Map<string, Set<PermissionRequestListener>>();
@@ -1068,6 +1145,7 @@ export class SandboxAgent {
     this.liveConnections.clear();
     const pending = [...this.pendingLiveConnections.values()];
     this.pendingLiveConnections.clear();
+    this.pendingLiveConnectionsByAgent.clear();
     this.pendingObservedEnvelopePersistenceBySession.clear();
 
     const pendingSettled = await Promise.allSettled(pending);
@@ -1181,6 +1259,7 @@ export class SandboxAgent {
       id: localSessionId,
       agent: request.agent.trim(),
       agentSessionId: response.sessionId,
+      serverId: live.serverId,
       lastConnectionId: live.connectionId,
       createdAt: nowMs(),
       sandboxId: this.sandboxProviderId,
@@ -1221,19 +1300,84 @@ export class SandboxAgent {
       throw new Error(`session '${id}' not found`);
     }
 
-    const live = await this.getLiveConnection(existing.agent);
-    if (existing.lastConnectionId === live.connectionId && live.hasBoundSession(id, existing.agentSessionId)) {
+    const bound = this.findBoundLiveConnection(existing);
+    if (bound && existing.lastConnectionId === bound.connectionId) {
       return this.upsertSessionHandle(existing);
     }
 
+    return this.restoreSession(existing);
+  }
+
+  /**
+   * Attach a persisted session to a live agent connection. Prefers the server
+   * the session last ran on; when the agent supports resume, the existing agent
+   * session is reattached without replaying history. Otherwise a new agent
+   * session is created and history is replayed on the next prompt. Either way,
+   * the previous mode and config options are applied again.
+   */
+  private restoreSession(existing: SessionRecord): Promise<Session> {
+    const pending = this.pendingSessionRestores.get(existing.id);
+    if (pending) {
+      return pending;
+    }
+
+    const restoring = (async () => {
+      const live = await this.getLiveConnection(existing.agent, existing.serverId);
+      const sessionInit = normalizeSessionInit(existing.sessionInit, undefined, this.sandboxProvider?.defaultCwd);
+
+      const resumed = live.supportsResume ? await this.tryResumeRemoteSession(existing, live, sessionInit) : null;
+      const restored = resumed ?? (await this.recreateRemoteSession(existing, live, sessionInit));
+
+      return this.reapplySessionSettings(existing, restored);
+    })();
+
+    this.pendingSessionRestores.set(existing.id, restoring);
+    return restoring.finally(() => {
+      if (this.pendingSessionRestores.get(existing.id) === restoring) {
+        this.pendingSessionRestores.delete(existing.id);
+      }
+    });
+  }
+
+  private async tryResumeRemoteSession(
+    existing: SessionRecord,
+    live: LiveAcpConnection,
+    sessionInit: Omit<NewSessionRequest, "_meta">,
+  ): Promise<SessionRecord | null> {
+    let response: { configOptions?: SessionConfigOption[] | null; modes?: SessionModeState | null };
+    try {
+      response = await live.resumeRemoteSession(existing.id, existing.agentSessionId, sessionInit);
+    } catch (error) {
+      if (error instanceof AcpRpcError) {
+        // The agent cannot resume this session (unknown, expired, or not
+        // supported here). Fall back to creating a new one.
+        return null;
+      }
+      throw error;
+    }
+
+    const updated: SessionRecord = {
+      ...existing,
+      serverId: live.serverId,
+      lastConnectionId: live.connectionId,
+      destroyedAt: undefined,
+      configOptions: cloneConfigOptions(response.configOptions) ?? existing.configOptions,
+      modes: cloneModes(response.modes) ?? existing.modes,
+    };
+    await this.persist.updateSession(updated);
+    return updated;
+  }
+
+  private async recreateRemoteSession(existing: SessionRecord, live: LiveAcpConnection, sessionInit: Omit<NewSessionRequest, "_meta">): Promise<SessionRecord> {
     const replaySource = await this.collectReplayEvents(existing.id, this.replayMaxEvents);
     const replayText = buildReplayText(replaySource, this.replayMaxChars);
 
-    const recreated = await live.createRemoteSession(existing.id, normalizeSessionInit(existing.sessionInit, undefined, this.sandboxProvider?.defaultCwd));
+    const recreated = await live.createRemoteSession(existing.id, sessionInit);
 
     const updated: SessionRecord = {
       ...existing,
       agentSessionId: recreated.sessionId,
+      serverId: live.serverId,
       lastConnectionId: live.connectionId,
       destroyedAt: undefined,
       configOptions: cloneConfigOptions(recreated.configOptions),
@@ -1243,8 +1387,78 @@ export class SandboxAgent {
     await this.persist.updateSession(updated);
     live.bindSession(updated.id, updated.agentSessionId);
     live.queueReplay(updated.id, replayText);
+    return updated;
+  }
 
-    return this.upsertSessionHandle(updated);
+  /**
+   * Apply the mode and config option values the session had before it was
+   * restored, where the agent now reports something different. Every value is
+   * attempted; failures are collected and thrown together as
+   * SessionConfigRestoreError, which still carries the restored session.
+   */
+  private async reapplySessionSettings(previous: SessionRecord, current: SessionRecord): Promise<Session> {
+    let session = this.upsertSessionHandle(current);
+
+    const previousModeOption = findConfigOptionByCategory(previous.configOptions ?? [], "mode");
+    const previousModeId = nonEmptyString(previous.modes?.currentModeId) ?? nonEmptyString(previousModeOption?.currentValue);
+    const previousValues = (previous.configOptions ?? []).flatMap((option) => {
+      const value = nonEmptyString(option.currentValue);
+      return option.category !== "mode" && value ? [{ option, value }] : [];
+    });
+    if (!previousModeId && previousValues.length === 0) {
+      return session;
+    }
+
+    const currentOptions = await this.getSessionConfigOptions(current.id);
+    const currentModeId = (await this.getSessionModes(current.id))?.currentModeId;
+    const failures: SessionConfigRestoreError["failures"] = [];
+
+    if (previousModeId && previousModeId !== currentModeId) {
+      const modeConfigId = findConfigOptionByCategory(currentOptions, "mode")?.id;
+      try {
+        session = await this.reapplySessionMode(current.id, previousModeId, modeConfigId);
+      } catch (error) {
+        failures.push({ category: "mode", configId: modeConfigId ?? "mode", value: previousModeId, error });
+      }
+    }
+
+    for (const { option, value } of previousValues) {
+      const now = currentOptions.find((candidate) => candidate.id === option.id);
+      if (now?.currentValue === value) {
+        continue;
+      }
+      try {
+        session = (await this.sendSessionMethodInternal(current.id, "session/set_config_option", { configId: option.id, value }, {}, false, false)).session;
+      } catch (error) {
+        failures.push({ category: option.category ?? "uncategorized", configId: option.id, value, error });
+      }
+    }
+
+    if (failures.length > 0) {
+      const error = new SessionConfigRestoreError(session, failures);
+      console.warn(error.message);
+      throw error;
+    }
+    return session;
+  }
+
+  private async reapplySessionMode(sessionId: string, modeId: string, modeConfigId: string | undefined): Promise<Session> {
+    try {
+      return (await this.sendSessionMethodInternal(sessionId, "session/set_mode", { modeId }, {}, false, false)).session;
+    } catch (error) {
+      if (!(error instanceof AcpRpcError) || error.code !== -32601 || !modeConfigId) {
+        throw error;
+      }
+      const fallback = await this.sendSessionMethodInternal(
+        sessionId,
+        "session/set_config_option",
+        { configId: modeConfigId, value: modeId },
+        {},
+        false,
+        false,
+      );
+      return fallback.session;
+    }
   }
 
   async resumeOrCreateSession(request: SessionResumeOrCreateRequest): Promise<Session> {
@@ -1455,6 +1669,7 @@ export class SandboxAgent {
     params: Record<string, unknown>,
     options: SessionSendOptions,
     allowManagedCancel: boolean,
+    recover = true,
   ): Promise<{ session: Session; response: unknown }> {
     if (method === SESSION_CANCEL_METHOD && !allowManagedCancel) {
       throw new Error(MANUAL_CANCEL_ERROR);
@@ -1465,20 +1680,99 @@ export class SandboxAgent {
       throw new Error(`session '${sessionId}' not found`);
     }
 
-    const live = await this.getLiveConnection(record.agent);
-    if (!live.hasBoundSession(record.id, record.agentSessionId)) {
+    const live = this.findBoundLiveConnection(record);
+    if (!live) {
       // The persisted session points at a stale connection; restore lazily.
-      const restored = await this.resumeSession(record.id);
-      return this.sendSessionMethodInternal(restored.id, method, params, options, allowManagedCancel);
+      const restored = await this.restoreSession(record);
+      return this.sendSessionMethodInternal(restored.id, method, params, options, allowManagedCancel, false);
     }
 
-    const response = await live.sendSessionMethod(record.id, method, params, options);
+    let response: unknown;
+    try {
+      response = await live.sendSessionMethod(record.id, method, params, options);
+    } catch (error) {
+      if (!recover || method === SESSION_CANCEL_METHOD || !(await this.prepareSessionRecovery(live, record, error))) {
+        throw error;
+      }
+      const restored = await this.restoreSession(record);
+      return this.sendSessionMethodInternal(restored.id, method, params, options, allowManagedCancel, false);
+    }
+
+    if (method === "session/prompt") {
+      // Make sure the prompt response event is persisted and delivered to
+      // listeners before the prompt resolves.
+      await this.flushObservedEnvelopePersistence(record.id);
+    }
     await this.persistSessionStateFromMethod(record.id, method, params, response);
     const refreshed = await this.requireSessionRecord(record.id);
     return {
       session: this.upsertSessionHandle(refreshed),
       response,
     };
+  }
+
+  /**
+   * Decide whether a failed session request can be retried after restoring the
+   * session. Returns true when the agent server is gone (the connection is
+   * dropped) or the agent no longer knows the session (it is unbound).
+   */
+  private async prepareSessionRecovery(live: LiveAcpConnection, record: SessionRecord, error: unknown): Promise<boolean> {
+    if (!(error instanceof AcpRpcError)) {
+      return false;
+    }
+
+    if (isMissingRemoteSessionError(error)) {
+      live.unbindSession(record.id);
+      return true;
+    }
+
+    if (error.code !== ACP_HTTP_TRANSPORT_ERROR_CODE) {
+      return false;
+    }
+
+    // The request failed at the HTTP level. Retry only if the agent server no
+    // longer exists; then nothing was delivered to the agent.
+    let servers: AcpServerListResponse;
+    try {
+      servers = await this.listAcpServers();
+    } catch {
+      return false;
+    }
+    if (servers.servers.some((server) => server.serverId === live.serverId)) {
+      return false;
+    }
+
+    await this.discardLiveConnection(live);
+    return true;
+  }
+
+  private async discardLiveConnection(live: LiveAcpConnection): Promise<void> {
+    if (this.liveConnections.get(live.serverId) === live) {
+      this.liveConnections.delete(live.serverId);
+    }
+    await live.close().catch(() => {});
+  }
+
+  private async flushObservedEnvelopePersistence(sessionId: string): Promise<void> {
+    // Persistence is chained per session, so waiting for the current tail also
+    // covers every envelope observed before it.
+    const pending = this.pendingObservedEnvelopePersistenceBySession.get(sessionId);
+    if (pending) {
+      await pending.catch(() => {});
+    }
+  }
+
+  private findBoundLiveConnection(record: SessionRecord): LiveAcpConnection | undefined {
+    const preferred = record.serverId ? this.liveConnections.get(record.serverId) : undefined;
+    if (preferred?.hasBoundSession(record.id, record.agentSessionId)) {
+      return preferred;
+    }
+    for (const connection of this.liveConnections.values()) {
+      if (connection.hasBoundSession(record.id, record.agentSessionId)) {
+        return connection;
+      }
+    }
+    return undefined;
   }
 
   private async persistSessionStateFromMethod(sessionId: string, method: string, params: Record<string, unknown>, response: unknown): Promise<void> {
@@ -2054,21 +2348,55 @@ export class SandboxAgent {
     return new DesktopStreamSession(this.connectDesktopStreamWebSocket(options));
   }
 
-  private async getLiveConnection(agent: string): Promise<LiveAcpConnection> {
+  /**
+   * Live connection for an agent. With `preferredServerId` (the server a
+   * persisted session last ran on), attach to that server if it still exists so
+   * its agent process and sessions are reused. Otherwise reuse any connection
+   * for the agent, or start a new server.
+   */
+  private async getLiveConnection(agent: string, preferredServerId?: string): Promise<LiveAcpConnection> {
     await this.awaitHealthy();
 
-    const existing = this.liveConnections.get(agent);
-    if (existing) {
-      return existing;
+    const preferred = preferredServerId?.trim();
+    if (preferred) {
+      const existing = this.liveConnections.get(preferred) ?? (await this.pendingLiveConnections.get(preferred)?.catch(() => undefined));
+      if (existing && existing.agent === agent) {
+        return existing;
+      }
+      if (await this.isAcpServerRunning(preferred, agent)) {
+        return this.openLiveConnection(agent, preferred, true);
+      }
     }
 
-    const pending = this.pendingLiveConnections.get(agent);
+    for (const connection of this.liveConnections.values()) {
+      if (connection.agent === agent) {
+        return connection;
+      }
+    }
+    const pendingForAgent = this.pendingLiveConnectionsByAgent.get(agent);
+    if (pendingForAgent) {
+      return pendingForAgent;
+    }
+
+    return this.openLiveConnection(agent, `sdk-${agent}-${randomId()}`, false);
+  }
+
+  private async isAcpServerRunning(serverId: string, agent: string): Promise<boolean> {
+    try {
+      const { servers } = await this.listAcpServers();
+      return servers.some((server) => server.serverId === serverId && server.agent === agent);
+    } catch {
+      return false;
+    }
+  }
+
+  private async openLiveConnection(agent: string, serverId: string, attach: boolean): Promise<LiveAcpConnection> {
+    const pending = this.pendingLiveConnections.get(serverId);
     if (pending) {
       return pending;
     }
 
     const creating = (async () => {
-      const serverId = `sdk-${agent}-${randomId()}`;
       const created = await LiveAcpConnection.create({
         baseUrl: this.baseUrl,
         token: this.token,
@@ -2077,6 +2405,7 @@ export class SandboxAgent {
         auth: this.auth,
         agent,
         serverId,
+        attach,
         onObservedEnvelope: (connection, envelope, direction, localSessionId) => {
           void this.enqueueObservedEnvelopePersistence(connection, envelope, direction, localSessionId).catch((error) => {
             console.error("Failed to persist observed sandbox-agent envelope", error);
@@ -2086,22 +2415,28 @@ export class SandboxAgent {
           this.enqueuePermissionRequest(connection, localSessionId, agentSessionId, request),
       });
 
-      const raced = this.liveConnections.get(agent);
+      const raced = this.liveConnections.get(serverId);
       if (raced) {
         await created.close();
         return raced;
       }
 
-      this.liveConnections.set(agent, created);
+      this.liveConnections.set(serverId, created);
       return created;
     })();
 
-    this.pendingLiveConnections.set(agent, creating);
+    this.pendingLiveConnections.set(serverId, creating);
+    if (!attach) {
+      this.pendingLiveConnectionsByAgent.set(agent, creating);
+    }
     try {
       return await creating;
     } finally {
-      if (this.pendingLiveConnections.get(agent) === creating) {
-        this.pendingLiveConnections.delete(agent);
+      if (this.pendingLiveConnections.get(serverId) === creating) {
+        this.pendingLiveConnections.delete(serverId);
+      }
+      if (this.pendingLiveConnectionsByAgent.get(agent) === creating) {
+        this.pendingLiveConnectionsByAgent.delete(agent);
       }
     }
   }
@@ -2751,6 +3086,26 @@ function normalizeSessionInit(
     cwd: value.cwd ?? cwdShorthand ?? providerDefaultCwd ?? defaultCwd(),
     mcpServers: value.mcpServers ?? [],
   };
+}
+
+// acp-http-client reports HTTP-level request failures with this JSON-RPC code.
+const ACP_HTTP_TRANSPORT_ERROR_CODE = -32003;
+
+function nonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+/** The agent reports that it does not know the session (for example after it restarted). */
+function isMissingRemoteSessionError(error: AcpRpcError): boolean {
+  if (error.code === -32002) {
+    return true;
+  }
+  const message = error.message.toLowerCase();
+  return message.includes("session not found") || message.includes("unknown session") || message.includes("session does not exist");
 }
 
 function mapSessionParams(params: Record<string, unknown>, agentSessionId: string): Record<string, unknown> {

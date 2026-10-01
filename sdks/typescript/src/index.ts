@@ -6,6 +6,7 @@ export {
   SandboxDestroyedError,
   Session,
   UnsupportedPermissionReplyError,
+  SessionConfigRestoreError,
   UnsupportedSessionCategoryError,
   UnsupportedSessionConfigOptionError,
   UnsupportedSessionValueError,

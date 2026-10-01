@@ -159,6 +159,23 @@ await restored.prompt([{ type: "text", text: "Continue from previous context." }
 await sdk.destroySession(restored.id);
 ```
 
+`resumeSession` first tries to reattach to the agent server the session last ran on (`session.serverId`). If that server is still running and the agent supports resuming sessions, the same agent session continues without replaying history. Otherwise the SDK creates a new agent session and replays recent history on the next prompt. In both cases the previously selected mode and config options (model, thought level, and others) are applied again.
+
+If some of those settings can no longer be applied, `resumeSession` throws `SessionConfigRestoreError`. The session is still restored: use `error.session` to continue and `error.failures` to see which values were not applied.
+
+```ts
+import { SessionConfigRestoreError } from "sandbox-agent";
+
+let restored;
+try {
+  restored = await sdk.resumeSession(session.id);
+} catch (error) {
+  if (!(error instanceof SessionConfigRestoreError)) throw error;
+  console.warn(error.failures);
+  restored = error.session;
+}
+```
+
 ## Session configuration
 
 Set model, mode, or thought level at creation or on an existing session:

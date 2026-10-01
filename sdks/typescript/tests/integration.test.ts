@@ -546,6 +546,150 @@ describe("Integration: TypeScript SDK flat session API", () => {
     await second.dispose();
   });
 
+  it("resumeSession restores previously selected mode and model after recreation", async () => {
+    const persist = new InMemorySessionPersistDriver({
+      maxEventsPerSession: 500,
+    });
+
+    const first = await SandboxAgent.connect({ baseUrl, token, persist });
+    const created = await first.createSession({ agent: "mock" });
+    await created.setMode("plan");
+    await created.setModel("mock-fast");
+
+    // dispose() deletes the agent server, so resume has to recreate the session.
+    await first.dispose();
+
+    const second = await SandboxAgent.connect({ baseUrl, token, persist });
+    try {
+      const restored = await second.resumeSession(created.id);
+      expect(restored.lastConnectionId).not.toBe(created.lastConnectionId);
+
+      expect((await restored.getModes())?.currentModeId).toBe("plan");
+      const modelOption = (await restored.getConfigOptions()).find((option) => option.category === "model");
+      expect(modelOption?.currentValue).toBe("mock-fast");
+
+      const events = await second.getEvents({ sessionId: restored.id, limit: 500 });
+      const reapplied = events.items.filter((event) => event.sender === "client" && event.connectionId === restored.lastConnectionId);
+      const methodParams = (method: string) =>
+        reapplied
+          .map((event) => event.payload as { method?: string; params?: Record<string, unknown> })
+          .filter((payload) => payload.method === method && payload.params?.sessionId === restored.agentSessionId)
+          .map((payload) => payload.params);
+
+      expect(methodParams("session/set_mode")).toContainEqual(expect.objectContaining({ modeId: "plan" }));
+      expect(methodParams("session/set_config_option")).toContainEqual(expect.objectContaining({ value: "mock-fast" }));
+    } finally {
+      await second.dispose();
+    }
+  });
+
+  it("resumeSession reattaches to a live server without replaying history", async () => {
+    const persist = new InMemorySessionPersistDriver({
+      maxEventsPerSession: 500,
+    });
+
+    // The first client never disposes, which is what a crashed client looks like:
+    // its agent server keeps running.
+    const first = await SandboxAgent.connect({ baseUrl, token, persist });
+    const second = await SandboxAgent.connect({ baseUrl, token, persist });
+    try {
+      const created = await first.createSession({ agent: "mock" });
+      await created.prompt([{ type: "text", text: "first run" }]);
+
+      const before = await persist.getSession(created.id);
+      expect(before?.serverId).toBeTruthy();
+
+      const restored = await second.resumeSession(created.id);
+      expect(restored.agentSessionId).toBe(created.agentSessionId);
+      expect(restored.lastConnectionId).not.toBe(created.lastConnectionId);
+      expect(restored.serverId).toBe(before?.serverId);
+
+      const after = await persist.getSession(created.id);
+      expect(after?.serverId).toBe(before?.serverId);
+      expect(after?.agentSessionId).toBe(created.agentSessionId);
+
+      const prompt = await withTimeout(restored.prompt([{ type: "text", text: "second run" }]), "reattached prompt");
+      expect(prompt.stopReason).toBe("end_turn");
+
+      const events = await second.getEvents({ sessionId: restored.id, limit: 500 });
+      const replayed = events.items.some((event) => {
+        const payload = event.payload as { method?: string; params?: { prompt?: Array<{ text?: unknown }> } };
+        const text = payload.params?.prompt?.[0]?.text;
+        return payload.method === "session/prompt" && typeof text === "string" && text.includes("Previous session history is replayed below");
+      });
+      expect(replayed).toBe(false);
+    } finally {
+      await second.dispose();
+      await first.dispose();
+    }
+  });
+
+  it("recovers a session when its agent server was deleted", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      await session.prompt([{ type: "text", text: "before delete" }]);
+
+      const serverId = (await sdk.getSession(session.id))?.serverId;
+      expect(serverId).toBeTruthy();
+
+      const response = await fetch(`${baseUrl}/v1/acp/${encodeURIComponent(serverId!)}`, {
+        method: "DELETE",
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      });
+      expect(response.ok).toBe(true);
+
+      const prompt = await withTimeout(session.prompt([{ type: "text", text: "after delete" }]), "prompt after server delete");
+      expect(prompt.stopReason).toBe("end_turn");
+
+      const servers = await sdk.listAcpServers();
+      expect(servers.servers.some((server) => server.agent === "mock")).toBe(true);
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("recovers a session the agent no longer knows", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      await session.setMode("plan");
+      const forgottenAgentSessionId = session.agentSessionId;
+      await session.rawSend("_mock/forget_session", {});
+
+      const prompt = await withTimeout(session.prompt([{ type: "text", text: "after forget" }]), "prompt after forgotten session");
+      expect(prompt.stopReason).toBe("end_turn");
+
+      const refreshed = await sdk.getSession(session.id);
+      expect(refreshed?.agentSessionId).not.toBe(forgottenAgentSessionId);
+      expect((await refreshed!.getModes())?.currentModeId).toBe("plan");
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("persists the prompt response event before prompt resolves", async () => {
+    const persist = new StrictUniqueSessionPersistDriver();
+    const sdk = await SandboxAgent.connect({ baseUrl, token, persist });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const observed: SessionEvent[] = [];
+      session.onEvent((event) => observed.push(event));
+
+      await session.prompt([{ type: "text", text: "persist response" }]);
+
+      const isPromptResult = (event: SessionEvent) => {
+        const payload = event.payload as { result?: { stopReason?: unknown } };
+        return event.sender === "agent" && payload.result?.stopReason === "end_turn";
+      };
+      const events = await sdk.getEvents({ sessionId: session.id, limit: 200 });
+      expect(events.items.filter(isPromptResult)).toHaveLength(1);
+      expect(observed.filter(isPromptResult)).toHaveLength(1);
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
   it("enforces in-memory event cap to avoid leaks", async () => {
     const persist = new InMemorySessionPersistDriver({
       maxEventsPerSession: 8,

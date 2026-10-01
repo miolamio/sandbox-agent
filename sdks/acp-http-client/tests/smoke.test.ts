@@ -37,6 +37,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> {
+  return await Promise.race([
+    promise,
+    sleep(timeoutMs).then(() => {
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    }),
+  ]);
+}
+
 async function waitFor<T>(fn: () => T | undefined | null, timeoutMs = 5000, stepMs = 25): Promise<T> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
@@ -521,5 +530,69 @@ describe("AcpHttpClient integration", () => {
     expect(String((result as { message?: unknown }).message)).toMatch(/event stream/i);
 
     await client.disconnect();
+  });
+  it("ignores responses addressed to another client on the same server", async () => {
+    const serverId = `acp-http-client-shared-${Date.now().toString(36)}`;
+    const transport = { path: `/v1/acp/${encodeURIComponent(serverId)}`, bootstrapQuery: { agent: "mock" } };
+
+    const first = new AcpHttpClient({ baseUrl, token, transport });
+    await first.initialize();
+    const firstSession = await first.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await first.prompt({ sessionId: firstSession.sessionId, prompt: [{ type: "text", text: "first client" }] });
+
+    // A second client on the same server sends requests with the same JSON-RPC
+    // ids the first client already used. The server buffers and broadcasts every
+    // response, so each client must only accept responses to its own requests.
+    const second = new AcpHttpClient({ baseUrl, token, transport });
+    try {
+      await second.initialize();
+      const secondSession = await withTimeout(second.newSession({ cwd: process.cwd(), mcpServers: [] }), "second newSession");
+      expect(secondSession.sessionId).not.toBe(firstSession.sessionId);
+
+      const prompt = await withTimeout(
+        second.prompt({ sessionId: secondSession.sessionId, prompt: [{ type: "text", text: "second client" }] }),
+        "second prompt",
+      );
+      expect(prompt.stopReason).toBe("end_turn");
+    } finally {
+      await second.disconnect();
+      await first.disconnect();
+    }
+  });
+
+  it("skips events buffered before the client attached when asked to", async () => {
+    const serverId = `acp-http-client-attach-${Date.now().toString(36)}`;
+    const path = `/v1/acp/${encodeURIComponent(serverId)}`;
+
+    const first = new AcpHttpClient({ baseUrl, token, transport: { path, bootstrapQuery: { agent: "mock" } } });
+    await first.initialize();
+    const session = await first.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await first.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "before attach" }] });
+
+    const updates: SessionNotification[] = [];
+    const attached = new AcpHttpClient({
+      baseUrl,
+      token,
+      transport: { path, bootstrapQuery: { agent: "mock" }, skipBufferedEvents: true },
+      client: {
+        sessionUpdate: async (notification) => {
+          updates.push(notification);
+        },
+      },
+    });
+    try {
+      await attached.initialize();
+      await attached.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "after attach" }] });
+
+      const texts = () =>
+        updates.flatMap((entry) =>
+          entry.update.sessionUpdate === "agent_message_chunk" && entry.update.content.type === "text" ? [entry.update.content.text] : [],
+        );
+      await waitFor(() => (texts().includes("mock: after attach") ? true : undefined));
+      expect(texts()).not.toContain("mock: before attach");
+    } finally {
+      await attached.disconnect();
+      await first.disconnect();
+    }
   });
 });

@@ -11,11 +11,18 @@ This is driven by the configured `SessionPersistDriver` (`inMemory`, IndexedDB, 
 
 When you call `session.prompt(...)` (or `resumeSession(...)`) and the saved session points to a stale connection, the SDK:
 
-1. Recreates a fresh session for the same local session id.
-2. Rebinds the local session to the new runtime session id.
-3. Replays recent persisted events into the next prompt as context.
+1. Reattaches to the agent server the session last ran on (`serverId`) if it is still running, for example after your client process restarted.
+2. Resumes the existing agent session when the agent supports it. The conversation continues as is and nothing is replayed.
+3. Otherwise, creates a fresh session for the same local session id, rebinds the local session to the new runtime session id, and replays recent persisted events into the next prompt as context.
+4. Applies the previously selected mode and config options (model, thought level, and others) again where the agent reports different values.
+
+The same restore runs when a request fails because the agent server was removed or the agent no longer knows the session. The request is then sent once more on the restored session.
 
 This happens automatically; you do not need to manually rebuild the session.
+
+## Restoring settings
+
+If a previous mode or config option cannot be applied again (for example, a model is no longer offered), the SDK still tries every other value, logs a warning, and throws `SessionConfigRestoreError`. Its `session` property holds the restored session and `failures` lists each value that was not applied. When this happens during `session.prompt(...)`, the prompt is not sent; the session is already restored, so sending it again works.
 
 ## Replay Limits
 
@@ -24,7 +31,7 @@ Replay payload size is capped by:
 - `replayMaxEvents` (default `50`)
 - `replayMaxChars` (default `12000`)
 
-These controls limit prompt growth during restore while preserving recent context.
+These controls limit prompt growth during restore while preserving recent context. They only apply when a session is recreated.
 
 ## Related Docs
 

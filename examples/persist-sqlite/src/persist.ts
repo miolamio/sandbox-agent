@@ -18,7 +18,7 @@ export class SQLiteSessionPersistDriver implements SessionPersistDriver {
   async getSession(id: string): Promise<SessionRecord | undefined> {
     const row = this.db
       .prepare(
-        `SELECT id, agent, agent_session_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
+        `SELECT id, agent, agent_session_id, server_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
          FROM sessions WHERE id = ?`,
       )
       .get(id) as SessionRow | undefined;
@@ -36,7 +36,7 @@ export class SQLiteSessionPersistDriver implements SessionPersistDriver {
 
     const rows = this.db
       .prepare(
-        `SELECT id, agent, agent_session_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
+        `SELECT id, agent, agent_session_id, server_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
          FROM sessions
          ORDER BY created_at ASC, id ASC
          LIMIT ? OFFSET ?`,
@@ -56,11 +56,12 @@ export class SQLiteSessionPersistDriver implements SessionPersistDriver {
     this.db
       .prepare(
         `INSERT INTO sessions (
-          id, agent, agent_session_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, agent, agent_session_id, server_id, last_connection_id, created_at, destroyed_at, sandbox_id, session_init_json, config_options_json, modes_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           agent = excluded.agent,
           agent_session_id = excluded.agent_session_id,
+          server_id = excluded.server_id,
           last_connection_id = excluded.last_connection_id,
           created_at = excluded.created_at,
           destroyed_at = excluded.destroyed_at,
@@ -73,6 +74,7 @@ export class SQLiteSessionPersistDriver implements SessionPersistDriver {
         session.id,
         session.agent,
         session.agentSessionId,
+        session.serverId ?? null,
         session.lastConnectionId,
         session.createdAt,
         session.destroyedAt ?? null,
@@ -134,6 +136,7 @@ export class SQLiteSessionPersistDriver implements SessionPersistDriver {
         id TEXT PRIMARY KEY,
         agent TEXT NOT NULL,
         agent_session_id TEXT NOT NULL,
+        server_id TEXT,
         last_connection_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         destroyed_at INTEGER,
@@ -147,6 +150,9 @@ export class SQLiteSessionPersistDriver implements SessionPersistDriver {
     const sessionColumns = this.db.prepare(`PRAGMA table_info(sessions)`).all() as TableInfoRow[];
     if (!sessionColumns.some((column) => column.name === "sandbox_id")) {
       this.db.exec(`ALTER TABLE sessions ADD COLUMN sandbox_id TEXT`);
+    }
+    if (!sessionColumns.some((column) => column.name === "server_id")) {
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN server_id TEXT`);
     }
     if (!sessionColumns.some((column) => column.name === "config_options_json")) {
       this.db.exec(`ALTER TABLE sessions ADD COLUMN config_options_json TEXT`);
@@ -240,6 +246,7 @@ type SessionRow = {
   id: string;
   agent: string;
   agent_session_id: string;
+  server_id: string | null;
   last_connection_id: string;
   created_at: number;
   destroyed_at: number | null;
@@ -269,6 +276,7 @@ function decodeSessionRow(row: SessionRow): SessionRecord {
     id: row.id,
     agent: row.agent,
     agentSessionId: row.agent_session_id,
+    serverId: row.server_id ?? undefined,
     lastConnectionId: row.last_connection_id,
     createdAt: row.created_at,
     destroyedAt: row.destroyed_at ?? undefined,
