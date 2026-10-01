@@ -381,6 +381,28 @@ export class SessionConfigRestoreError extends Error {
   }
 }
 
+/**
+ * Thrown when a request such as a prompt failed because the agent server went
+ * away while it was being sent. The session has been restored (`session`), but
+ * the request is not repeated automatically because the agent may already have
+ * run it. Send it again if that is what you want.
+ */
+export class SessionRequestInterruptedError extends Error {
+  readonly session: Session;
+  readonly method: string;
+  readonly cause: unknown;
+
+  constructor(session: Session, method: string, cause: unknown) {
+    super(
+      `Session '${session.id}' lost its agent server during '${method}' and was restored; the request was not repeated because the agent may already have run it`,
+    );
+    this.name = "SessionRequestInterruptedError";
+    this.session = session;
+    this.method = method;
+    this.cause = cause;
+  }
+}
+
 export class Session {
   private record: SessionRecord;
   private readonly sandbox: SandboxAgent;
@@ -1691,10 +1713,16 @@ export class SandboxAgent {
     try {
       response = await live.sendSessionMethod(record.id, method, params, options);
     } catch (error) {
-      if (!recover || method === SESSION_CANCEL_METHOD || !(await this.prepareSessionRecovery(live, record, error))) {
+      const recovery = recover && method !== SESSION_CANCEL_METHOD ? await this.prepareSessionRecovery(live, record, error) : null;
+      if (!recovery) {
         throw error;
       }
       const restored = await this.restoreSession(record);
+      if (recovery === "server_gone" && !RETRY_SAFE_SESSION_METHODS.has(method)) {
+        // The agent may have received and run the request before its server
+        // went away, so repeating it could run it twice. Let the caller decide.
+        throw new SessionRequestInterruptedError(restored, method, error);
+      }
       return this.sendSessionMethodInternal(restored.id, method, params, options, allowManagedCancel, false);
     }
 
@@ -1712,38 +1740,40 @@ export class SandboxAgent {
   }
 
   /**
-   * Decide whether a failed session request can be retried after restoring the
-   * session. Returns true when the agent server is gone (the connection is
-   * dropped) or the agent no longer knows the session (it is unbound).
+   * Decide whether a failed session request calls for restoring the session.
+   * - "session_missing": the agent rejected the request because it does not
+   *   know the session, so it did not run it; the session is unbound and the
+   *   request can be repeated after restoring.
+   * - "server_gone": the request failed at the HTTP level and the agent server
+   *   no longer exists; the connection is dropped. The agent may still have
+   *   received the request before the server went away.
    */
-  private async prepareSessionRecovery(live: LiveAcpConnection, record: SessionRecord, error: unknown): Promise<boolean> {
+  private async prepareSessionRecovery(live: LiveAcpConnection, record: SessionRecord, error: unknown): Promise<"session_missing" | "server_gone" | null> {
     if (!(error instanceof AcpRpcError)) {
-      return false;
+      return null;
     }
 
-    if (isMissingRemoteSessionError(error)) {
+    if (isMissingRemoteSessionError(error, record.agentSessionId)) {
       live.unbindSession(record.id);
-      return true;
+      return "session_missing";
     }
 
     if (error.code !== ACP_HTTP_TRANSPORT_ERROR_CODE) {
-      return false;
+      return null;
     }
 
-    // The request failed at the HTTP level. Retry only if the agent server no
-    // longer exists; then nothing was delivered to the agent.
     let servers: AcpServerListResponse;
     try {
       servers = await this.listAcpServers();
     } catch {
-      return false;
+      return null;
     }
     if (servers.servers.some((server) => server.serverId === live.serverId)) {
-      return false;
+      return null;
     }
 
     await this.discardLiveConnection(live);
-    return true;
+    return "server_gone";
   }
 
   private async discardLiveConnection(live: LiveAcpConnection): Promise<void> {
@@ -3099,13 +3129,29 @@ function nonEmptyString(value: unknown): string | undefined {
   return trimmed || undefined;
 }
 
-/** The agent reports that it does not know the session (for example after it restarted). */
-function isMissingRemoteSessionError(error: AcpRpcError): boolean {
-  if (error.code === -32002) {
+// Requests that only set state, so repeating one after the session was
+// restored has the same effect as sending it once.
+const RETRY_SAFE_SESSION_METHODS = new Set(["session/set_mode", "session/set_config_option"]);
+
+/**
+ * The agent reports that it does not know this session (for example after it
+ * restarted). -32002 alone only means "resource not found", so the error must
+ * also point at the session: by session id in its data or message, or by a
+ * session-specific message.
+ */
+function isMissingRemoteSessionError(error: AcpRpcError, agentSessionId: string): boolean {
+  const message = error.message.toLowerCase();
+  if (message.includes("session not found") || message.includes("unknown session") || message.includes("session does not exist")) {
     return true;
   }
-  const message = error.message.toLowerCase();
-  return message.includes("session not found") || message.includes("unknown session") || message.includes("session does not exist");
+  if (error.code !== -32002) {
+    return false;
+  }
+  const data = error.data as { sessionId?: unknown; uri?: unknown } | null | undefined;
+  if (data && typeof data === "object" && (data.sessionId === agentSessionId || data.uri === agentSessionId)) {
+    return true;
+  }
+  return error.message.includes(agentSessionId);
 }
 
 function mapSessionParams(params: Record<string, unknown>, agentSessionId: string): Record<string, unknown> {

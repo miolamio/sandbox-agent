@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import {
   InMemorySessionPersistDriver,
   SandboxAgent,
+  SessionRequestInterruptedError,
   type ListEventsRequest,
   type ListPage,
   type SessionEvent,
@@ -624,7 +625,7 @@ describe("Integration: TypeScript SDK flat session API", () => {
     }
   });
 
-  it("recovers a session when its agent server was deleted", async () => {
+  it("restores a session whose agent server was deleted without sending the prompt twice", async () => {
     const sdk = await SandboxAgent.connect({ baseUrl, token });
     try {
       const session = await sdk.createSession({ agent: "mock" });
@@ -639,11 +640,56 @@ describe("Integration: TypeScript SDK flat session API", () => {
       });
       expect(response.ok).toBe(true);
 
-      const prompt = await withTimeout(session.prompt([{ type: "text", text: "after delete" }]), "prompt after server delete");
-      expect(prompt.stopReason).toBe("end_turn");
+      // The agent may have run a prompt before its server went away, so the SDK
+      // restores the session but does not send the prompt again by itself.
+      const interrupted = await withTimeout(
+        session.prompt([{ type: "text", text: "after delete" }]).then(
+          () => null,
+          (error: unknown) => error,
+        ),
+        "prompt after server delete",
+      );
+      expect(interrupted).toBeInstanceOf(SessionRequestInterruptedError);
+      expect((interrupted as SessionRequestInterruptedError).session.id).toBe(session.id);
+
+      const promptsWithText = async (text: string) => {
+        const events = await sdk.getEvents({ sessionId: session.id, limit: 500 });
+        return events.items.filter((event) => {
+          const payload = event.payload as { method?: string; params?: { prompt?: Array<{ text?: unknown }> } };
+          return (
+            event.sender === "client" &&
+            payload.method === "session/prompt" &&
+            (payload.params?.prompt ?? []).some((block) => typeof block.text === "string" && block.text.includes(text))
+          );
+        });
+      };
+      expect(await promptsWithText("after delete")).toHaveLength(1);
 
       const servers = await sdk.listAcpServers();
       expect(servers.servers.some((server) => server.agent === "mock")).toBe(true);
+
+      const prompt = await withTimeout(session.prompt([{ type: "text", text: "resent by caller" }]), "prompt on restored session");
+      expect(prompt.stopReason).toBe("end_turn");
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("does not restore a session for unrelated not-found errors", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const agentSessionId = session.agentSessionId;
+
+      await expect(session.rawSend("_mock/missing_resource", {})).rejects.toThrow("Resource not found");
+
+      const record = await sdk.getSession(session.id);
+      expect(record?.agentSessionId).toBe(agentSessionId);
+      const events = await sdk.getEvents({ sessionId: session.id, limit: 500 });
+      const sessionCreates = events.items.filter((event) => (event.payload as { method?: string }).method === "session/new");
+      expect(sessionCreates).toHaveLength(1);
+      const missingResourceCalls = events.items.filter((event) => (event.payload as { method?: string }).method === "_mock/missing_resource");
+      expect(missingResourceCalls).toHaveLength(1);
     } finally {
       await sdk.dispose();
     }

@@ -16,7 +16,10 @@ When you call `session.prompt(...)` (or `resumeSession(...)`) and the saved sess
 3. Otherwise, creates a fresh session for the same local session id, rebinds the local session to the new runtime session id, and replays recent persisted events into the next prompt as context.
 4. Applies the previously selected mode and config options (model, thought level, and others) again where the agent reports different values.
 
-The same restore runs when a request fails because the agent server was removed or the agent no longer knows the session. The request is then sent once more on the restored session.
+The same restore runs when a request fails because the agent server was removed or the agent no longer knows the session:
+
+- If the agent rejected the request because it does not know the session, the request is sent once more on the restored session.
+- If the agent server went away, mode and config changes are sent again, but prompts and other requests are not, because the agent may already have run them. The SDK throws `SessionRequestInterruptedError` instead. Its `session` property holds the restored session, so you can send the prompt again if you want to.
 
 This happens automatically; you do not need to manually rebuild the session.
 

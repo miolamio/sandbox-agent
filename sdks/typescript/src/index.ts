@@ -7,6 +7,7 @@ export {
   Session,
   UnsupportedPermissionReplyError,
   SessionConfigRestoreError,
+  SessionRequestInterruptedError,
   UnsupportedSessionCategoryError,
   UnsupportedSessionConfigOptionError,
   UnsupportedSessionValueError,

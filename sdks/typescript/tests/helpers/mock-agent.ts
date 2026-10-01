@@ -294,6 +294,20 @@ rl.on("line", (line) => {
     return;
   }
 
+  // Test hook: a not-found error about something other than the session.
+  if (method === "_mock/missing_resource") {
+    emit({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32002,
+        message: "Resource not found: /tmp/missing.txt",
+        data: { uri: "/tmp/missing.txt" },
+      },
+    });
+    return;
+  }
+
   // Test hook: drop a session so the next request for it fails as unknown.
   if (method === "_mock/forget_session") {
     knownSessions.delete(msg?.params?.sessionId);
