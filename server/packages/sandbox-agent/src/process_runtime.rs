@@ -466,6 +466,59 @@ impl ProcessRuntime {
         Ok(process.snapshot().await)
     }
 
+    /// Stops every running process on server shutdown: SIGTERM, wait up to
+    /// `grace` for all of them to exit, then SIGKILL whatever is left. Without
+    /// this they outlive the server as orphans when it runs outside a container.
+    pub async fn shutdown_all(&self, grace: std::time::Duration) {
+        let running: Vec<Arc<ManagedProcess>> = {
+            let processes = self.inner.processes.read().await;
+            let mut running = Vec::new();
+            for process in processes.values() {
+                if process.status.read().await.status == ProcessStatus::Running {
+                    running.push(process.clone());
+                }
+            }
+            running
+        };
+        if running.is_empty() {
+            return;
+        }
+        tracing::info!(count = running.len(), "stopping running processes");
+
+        for process in &running {
+            process.stop_requested.store(true, Ordering::SeqCst);
+            let _ = process.send_signal(SIGTERM).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            let mut all_exited = true;
+            for process in &running {
+                if process.status.read().await.status == ProcessStatus::Running {
+                    all_exited = false;
+                    break;
+                }
+            }
+            if all_exited {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+
+        for process in &running {
+            if process.status.read().await.status == ProcessStatus::Running {
+                tracing::warn!(id = %process.id, "process ignored SIGTERM; sending SIGKILL");
+                let _ = process.send_signal(SIGKILL).await;
+            }
+        }
+        for process in running {
+            maybe_wait_for_exit(process, 500).await;
+        }
+    }
+
     pub async fn write_input(&self, id: &str, data: &[u8]) -> Result<usize, SandboxError> {
         self.lookup_process(id).await?.write_input(data).await
     }
@@ -1148,5 +1201,110 @@ pub fn decode_input_bytes(data: &str, encoding: &str) -> Result<Vec<u8>, Sandbox
         _ => Err(SandboxError::InvalidRequest {
             message: "encoding must be one of: base64, utf8, text".to_string(),
         }),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn sh_spec(script: &str) -> ProcessStartSpec {
+        ProcessStartSpec {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: None,
+            env: HashMap::new(),
+            tty: false,
+            interactive: false,
+            owner: ProcessOwner::User,
+            restart_policy: None,
+        }
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    async fn wait_until_gone(pid: u32, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if !pid_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        !pid_alive(pid)
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_terminates_running_processes() {
+        let runtime = ProcessRuntime::new();
+        let first = runtime
+            .start_process(sh_spec("exec sleep 60"))
+            .await
+            .unwrap();
+        let second = runtime
+            .start_process(sh_spec("exec sleep 60"))
+            .await
+            .unwrap();
+        let pids = [first.pid.unwrap(), second.pid.unwrap()];
+
+        let started = std::time::Instant::now();
+        runtime.shutdown_all(Duration::from_secs(2)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "SIGTERM should be enough"
+        );
+
+        for pid in pids {
+            assert!(
+                wait_until_gone(pid, Duration::from_millis(500)).await,
+                "pid {pid} still alive"
+            );
+        }
+        for snapshot in runtime.list_processes(None).await {
+            assert_eq!(snapshot.status, ProcessStatus::Exited);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_kills_processes_that_ignore_sigterm() {
+        let runtime = ProcessRuntime::new();
+        let snapshot = runtime
+            .start_process(sh_spec(
+                "trap '' TERM; echo ready; while :; do sleep 0.05; done",
+            ))
+            .await
+            .unwrap();
+        let pid = snapshot.pid.unwrap();
+        // Let the shell install its trap before it is signalled.
+        let filter = ProcessLogFilter {
+            stream: ProcessLogFilterStream::Stdout,
+            tail: None,
+            since: None,
+        };
+        for _ in 0..100 {
+            if !runtime.logs(&snapshot.id, filter).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let started = std::time::Instant::now();
+        runtime.shutdown_all(Duration::from_millis(300)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "must wait the grace period, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must not overrun the grace period, took {elapsed:?}"
+        );
+        assert!(
+            wait_until_gone(pid, Duration::from_millis(500)).await,
+            "pid {pid} survived SIGKILL"
+        );
     }
 }

@@ -407,6 +407,85 @@ async fn sigint_kills_agent_processes_and_second_signal_exits_immediately() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let process = parse_json(&body);
+    let process_id = process["id"].as_str().expect("process id").to_string();
+    let process_pid = process["pid"].as_u64().expect("process pid") as u32;
+    assert_eq!(agent_alive(&container_id, process_pid), Some(true));
+    let logs = reqwest::Client::new()
+        .get(test_app.app.http_url(&format!(
+            "/v1/processes/{process_id}/logs?stream=stdout&follow=true"
+        )))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("logs sse response");
+    assert_eq!(logs.status(), StatusCode::OK);
+    let _logs_stream = logs.bytes_stream();
+
+    let output = docker(&["kill", "--signal", "INT", &container_id]);
+    assert!(output.status.success(), "docker kill INT failed");
+
+    // Agent and user processes must be gone while the server is still draining.
+    assert_eq!(
+        wait_until_dead(&container_id, pid, Duration::from_secs(5)).await,
+        Some(false),
+        "agent process must be killed during shutdown while the server drains"
+    );
+    assert_eq!(
+        wait_until_dead(&container_id, process_pid, Duration::from_secs(5)).await,
+        Some(false),
+        "user process must be killed during shutdown while the server drains"
+    );
+    assert!(
+        container_running(&container_id),
+        "server should still be draining the open log stream"
+    );
+
+    let exit_code = spawn_container_wait(&container_id);
+    let output = docker(&["kill", "--signal", "TERM", &container_id]);
+    assert!(output.status.success(), "docker kill TERM failed");
+    let exited = wait_for_container_exit(&container_id, Duration::from_secs(5)).await;
+    assert!(
+        exited.is_some_and(|elapsed| elapsed < Duration::from_secs(3)),
+        "second signal must exit immediately, waited {exited:?}"
+    );
+    assert_eq!(
+        exit_code.await.expect("docker wait task"),
+        Some(1),
+        "second signal must exit with code 1"
+    );
+}
+
+/// The whole shutdown, from the first signal to exit, fits in one
+/// `--shutdown-timeout-ms` budget, even with a never-ending log stream open.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_shutdown_fits_in_one_total_budget() {
+    let options = docker_support::TestAppOptions {
+        env: BTreeMap::from([(
+            "SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS".to_string(),
+            "2000".to_string(),
+        )]),
+        ..Default::default()
+    };
+    let test_app = TestApp::with_options(AuthConfig::disabled(), options, setup_pid_recording_stub);
+    let container_id = test_app.container_id().to_string();
+    bootstrap_server(&test_app.app, "s1", "codex").await;
+
+    let (status, _, body) = send_request(
+        &test_app.app,
+        Method::POST,
+        "/v1/processes",
+        Some(json!({
+            "command": "sh",
+            "args": ["-c", "trap '' TERM; echo started; while :; do sleep 0.1; done"],
+            "tty": false,
+            "interactive": false
+        })),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let process_id = parse_json(&body)["id"]
         .as_str()
         .expect("process id")
@@ -422,34 +501,45 @@ async fn sigint_kills_agent_processes_and_second_signal_exits_immediately() {
     assert_eq!(logs.status(), StatusCode::OK);
     let _logs_stream = logs.bytes_stream();
 
-    let output = docker(&["kill", "--signal", "INT", &container_id]);
-    assert!(output.status.success(), "docker kill INT failed");
+    let exit_code = spawn_container_wait(&container_id);
+    let output = docker(&["kill", "--signal", "TERM", &container_id]);
+    assert!(output.status.success(), "docker kill TERM failed");
+    let exited = wait_for_container_exit(&container_id, Duration::from_secs(10)).await;
+    assert!(
+        exited.is_some_and(|elapsed| elapsed >= Duration::from_millis(1500)
+            && elapsed < Duration::from_millis(3500)),
+        "shutdown must end when the 2 s budget runs out, took {exited:?}"
+    );
+    assert_eq!(
+        exit_code.await.expect("docker wait task"),
+        Some(0),
+        "budget expiry is a clean exit"
+    );
+}
 
-    // The agent process must be gone while the server is still draining.
+/// Polls until `pid` is gone in the container; returns the last state seen.
+async fn wait_until_dead(container_id: &str, pid: u32, limit: Duration) -> Option<bool> {
     let mut state = Some(true);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + limit;
     while std::time::Instant::now() < deadline {
-        state = agent_alive(&container_id, pid);
+        state = agent_alive(container_id, pid);
         if state != Some(true) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(
-        state,
-        Some(false),
-        "agent process must be killed during shutdown while the server drains"
-    );
-    assert!(
-        container_running(&container_id),
-        "server should still be draining the open log stream"
-    );
+    state
+}
 
-    let output = docker(&["kill", "--signal", "TERM", &container_id]);
-    assert!(output.status.success(), "docker kill TERM failed");
-    let exited = wait_for_container_exit(&container_id, Duration::from_secs(5)).await;
-    assert!(
-        exited.is_some_and(|elapsed| elapsed < Duration::from_secs(3)),
-        "second signal must exit immediately, waited {exited:?}"
-    );
+/// Starts `docker wait` before the container exits (it runs with `--rm`, so
+/// the exit code cannot be inspected afterwards) and resolves to the code.
+fn spawn_container_wait(container_id: &str) -> tokio::task::JoinHandle<Option<i32>> {
+    let container_id = container_id.to_string();
+    let handle = tokio::task::spawn_blocking(move || {
+        let output = docker(&["wait", &container_id]);
+        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    });
+    // Give `docker wait` a moment to attach before the signal is sent.
+    std::thread::sleep(Duration::from_millis(300));
+    handle
 }

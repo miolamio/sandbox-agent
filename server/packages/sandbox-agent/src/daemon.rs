@@ -15,6 +15,18 @@ pub use build_id::BUILD_ID;
 const DAEMON_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_CHECK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Slack on top of the server's shutdown budget before `daemon stop` gives up
+/// and sends SIGKILL.
+const DAEMON_STOP_MARGIN: Duration = Duration::from_secs(2);
+
+/// How long `daemon stop` waits after SIGTERM before SIGKILL: the server's
+/// total shutdown budget plus a margin. The daemon inherits its environment
+/// from `daemon start`, so `SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS` resolves the
+/// same way on both sides.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn daemon_stop_wait(shutdown_timeout_env: Option<&str>) -> Duration {
+    crate::cli::shutdown_timeout_from_env_or_flag(None, shutdown_timeout_env) + DAEMON_STOP_MARGIN
+}
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -437,8 +449,14 @@ fn stop_process(pid: u32, host: &str, port: u16, pid_path: &Path) -> Result<(), 
         libc::kill(pid as i32, libc::SIGTERM);
     }
 
-    // Wait up to 5 seconds for graceful exit
-    for _ in 0..50 {
+    // Wait for the server's shutdown budget plus a margin.
+    let wait = daemon_stop_wait(
+        std::env::var(crate::cli::SHUTDOWN_TIMEOUT_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
         if !is_process_running(pid) {
             let _ = remove_pid(pid_path);
@@ -579,4 +597,27 @@ pub fn ensure_running(
     }
 
     start(cli, host, port, token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_stop_waits_for_default_budget_plus_margin() {
+        assert_eq!(daemon_stop_wait(None), Duration::from_millis(5000 + 2000));
+    }
+
+    #[test]
+    fn daemon_stop_waits_for_configured_budget_plus_margin() {
+        assert_eq!(
+            daemon_stop_wait(Some("12000")),
+            Duration::from_millis(12000 + 2000)
+        );
+    }
+
+    #[test]
+    fn daemon_stop_wait_with_invalid_env_uses_default_budget() {
+        assert_eq!(daemon_stop_wait(Some("soon")), Duration::from_millis(7000));
+    }
 }

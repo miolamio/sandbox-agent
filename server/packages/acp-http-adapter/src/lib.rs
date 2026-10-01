@@ -45,6 +45,25 @@ pub async fn run_server_with_runtime(
 }
 
 async fn shutdown_signal(runtime: Arc<AdapterRuntime>) {
-    let _ = tokio::signal::ctrl_c().await;
+    wait_for_termination().await;
     runtime.shutdown().await;
+}
+
+/// Waits for Ctrl+C, or on unix also SIGTERM (`docker stop`, `kill`).
+async fn wait_for_termination() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+                return;
+            }
+            Err(err) => tracing::warn!(error = %err, "failed to install SIGTERM handler"),
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }

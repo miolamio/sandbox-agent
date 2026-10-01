@@ -421,10 +421,17 @@ async fn opencode_unavailable() -> Response {
         .into_response()
 }
 
-pub async fn shutdown_servers(state: &Arc<AppState>) {
-    state.acp_proxy().shutdown_all().await;
-    state.opencode_server_manager().shutdown().await;
-    state.desktop_runtime().shutdown().await;
+/// Stops agents, sidecars and the desktop, and in parallel the processes
+/// started through `/v1/processes` (SIGTERM, then SIGKILL after
+/// `process_grace`).
+pub async fn shutdown_servers(state: &Arc<AppState>, process_grace: std::time::Duration) {
+    let services = async {
+        state.acp_proxy().shutdown_all().await;
+        state.opencode_server_manager().shutdown().await;
+        state.desktop_runtime().shutdown().await;
+    };
+    let process_runtime = state.process_runtime();
+    tokio::join!(services, process_runtime.shutdown_all(process_grace));
 }
 
 #[derive(OpenApi)]

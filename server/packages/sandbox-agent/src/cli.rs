@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
@@ -115,8 +115,9 @@ pub struct ServerArgs {
     #[arg(long = "no-telemetry")]
     no_telemetry: bool,
 
-    /// Max time (ms) for each shutdown phase: stopping agents, then draining
-    /// connections. Overrides SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS. Default 3000.
+    /// Total time budget (ms) from the first SIGTERM/SIGINT to process exit,
+    /// covering stopping agents and processes and draining connections.
+    /// Overrides SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS. Default 5000.
     #[arg(long = "shutdown-timeout-ms")]
     shutdown_timeout_ms: Option<u64>,
 
@@ -509,7 +510,12 @@ fn run_server(cli: &CliConfig, server: &ServerArgs) -> Result<(), CliError> {
         std::env::var(SHUTDOWN_TIMEOUT_ENV).ok().as_deref(),
     );
 
-    runtime.block_on(async move {
+    // Set once the first shutdown signal arrives; bounds the runtime teardown
+    // below so the whole shutdown stays inside one budget.
+    let shutdown_deadline = Arc::new(OnceLock::new());
+    let deadline_for_signal = shutdown_deadline.clone();
+
+    let result = runtime.block_on(async move {
         if telemetry_enabled {
             telemetry::log_enabled_message();
             telemetry::spawn_telemetry_task();
@@ -523,19 +529,39 @@ fn run_server(cli: &CliConfig, server: &ServerArgs) -> Result<(), CliError> {
 
         let signals = TerminationSignals::new()?;
         axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal(state.clone(), signals, shutdown_timeout))
+            .with_graceful_shutdown(shutdown_signal(
+                state.clone(),
+                signals,
+                shutdown_timeout,
+                deadline_for_signal,
+            ))
             .await
             .map_err(|err| CliError::Server(err.to_string()))
-    })
+    });
+
+    // Dropping the runtime waits for every `spawn_blocking` task, and by then
+    // nothing listens for a second signal any more. Cap that wait at whatever
+    // is left of the shutdown budget.
+    let remaining = shutdown_deadline
+        .get()
+        .map(|deadline: &std::time::Instant| {
+            deadline.saturating_duration_since(std::time::Instant::now())
+        })
+        .unwrap_or(Duration::ZERO);
+    runtime.shutdown_timeout(remaining);
+    result
 }
 
-const SHUTDOWN_TIMEOUT_ENV: &str = "SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS";
-const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(3000);
+pub(crate) const SHUTDOWN_TIMEOUT_ENV: &str = "SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS";
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(5000);
+/// Upper bound on how long `/v1/processes` children get between SIGTERM and
+/// SIGKILL during shutdown (never more than half the budget).
+const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_millis(1000);
 
-/// Resolves the per-phase shutdown timeout: `--shutdown-timeout-ms` wins, then
+/// Resolves the total shutdown budget: `--shutdown-timeout-ms` wins, then
 /// `SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS`, then the default. An unparsable env
 /// value falls back to the default.
-fn shutdown_timeout_from_env_or_flag(flag: Option<u64>, env: Option<&str>) -> Duration {
+pub(crate) fn shutdown_timeout_from_env_or_flag(flag: Option<u64>, env: Option<&str>) -> Duration {
     if let Some(ms) = flag {
         return Duration::from_millis(ms);
     }
@@ -553,16 +579,25 @@ fn shutdown_timeout_from_env_or_flag(flag: Option<u64>, env: Option<&str>) -> Du
     }
 }
 
-/// Graceful shutdown on SIGINT/SIGTERM:
-/// 1. stop agent processes and sidecars (`shutdown_servers`), bounded by `timeout`;
-/// 2. let axum drain in-flight connections, bounded by `timeout` again, since
+/// Graceful shutdown on SIGINT/SIGTERM, all inside one `budget` counted from
+/// the first signal:
+/// 1. stop agent processes, sidecars and `/v1/processes` children
+///    (`shutdown_servers`);
+/// 2. let axum drain in-flight connections until the budget runs out, since
 ///    long-lived streams (process log follows) never finish on their own.
 ///
-/// A second signal at any point exits the process immediately.
-async fn shutdown_signal(state: Arc<AppState>, mut signals: TerminationSignals, timeout: Duration) {
+/// A second signal at any point exits the process immediately with code 1.
+async fn shutdown_signal(
+    state: Arc<AppState>,
+    mut signals: TerminationSignals,
+    budget: Duration,
+    deadline_slot: Arc<OnceLock<std::time::Instant>>,
+) {
     signals.recv().await;
+    let deadline = tokio::time::Instant::now() + budget;
+    let _ = deadline_slot.set(deadline.into_std());
     tracing::info!(
-        timeout_ms = timeout.as_millis() as u64,
+        budget_ms = budget.as_millis() as u64,
         "shutdown signal received; stopping agent processes"
     );
 
@@ -572,22 +607,23 @@ async fn shutdown_signal(state: Arc<AppState>, mut signals: TerminationSignals, 
         std::process::exit(1);
     });
 
-    if tokio::time::timeout(timeout, shutdown_servers(&state))
+    let process_grace = PROCESS_SHUTDOWN_GRACE.min(budget / 2);
+    if tokio::time::timeout_at(deadline, shutdown_servers(&state, process_grace))
         .await
         .is_err()
     {
         tracing::warn!(
-            timeout_ms = timeout.as_millis() as u64,
-            "agent shutdown timed out"
+            budget_ms = budget.as_millis() as u64,
+            "agent shutdown used up the shutdown budget"
         );
     }
 
     tracing::info!("draining open connections");
     tokio::spawn(async move {
-        tokio::time::sleep(timeout).await;
+        tokio::time::sleep_until(deadline).await;
         tracing::warn!(
-            timeout_ms = timeout.as_millis() as u64,
-            "connection drain timed out; exiting"
+            budget_ms = budget.as_millis() as u64,
+            "shutdown budget exhausted while draining connections; exiting"
         );
         std::process::exit(0);
     });
@@ -1741,6 +1777,11 @@ mod tests {
             shutdown_timeout_from_env_or_flag(None, None),
             DEFAULT_SHUTDOWN_TIMEOUT
         );
+    }
+
+    #[test]
+    fn shutdown_budget_defaults_to_five_seconds_total() {
+        assert_eq!(DEFAULT_SHUTDOWN_TIMEOUT, Duration::from_millis(5000));
     }
 
     #[test]
