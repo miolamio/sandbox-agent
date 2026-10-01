@@ -26,6 +26,7 @@ sandbox-agent server [OPTIONS]
 | `-A, --cors-allow-header <HEADER>` | all | Allowed CORS header (repeatable) |
 | `-C, --cors-allow-credentials` | false | Enable CORS credentials |
 | `--no-telemetry` | false | Disable anonymous telemetry |
+| `--shutdown-timeout-ms <MS>` | `3000` | Max time for each shutdown phase (stopping agents, then draining connections) |
 
 ```bash
 sandbox-agent server --port 3000
@@ -36,6 +37,7 @@ Notes:
 - Server logs are redirected to files by default.
 - Set `SANDBOX_AGENT_LOG_STDOUT=1` to force stdout/stderr logging.
 - Use `SANDBOX_AGENT_LOG_DIR` to override log directory.
+- `SIGTERM` and `SIGINT` (Ctrl+C) trigger a graceful shutdown: running agent processes are stopped first, then open connections are drained. Each phase is bounded by `--shutdown-timeout-ms` (or `SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS`; the flag wins). Long-lived streams such as followed process logs are cut off when the drain timeout expires. A second signal exits immediately.
 
 ## install
 

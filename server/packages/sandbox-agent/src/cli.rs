@@ -113,6 +113,11 @@ pub struct ServerArgs {
 
     #[arg(long = "no-telemetry")]
     no_telemetry: bool,
+
+    /// Max time (ms) for each shutdown phase: stopping agents, then draining
+    /// connections. Overrides SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS. Default 3000.
+    #[arg(long = "shutdown-timeout-ms")]
+    shutdown_timeout_ms: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -480,6 +485,10 @@ fn run_server(cli: &CliConfig, server: &ServerArgs) -> Result<(), CliError> {
         .map_err(|err| CliError::Server(err.to_string()))?;
 
     let telemetry_enabled = telemetry::telemetry_enabled(server.no_telemetry);
+    let shutdown_timeout = shutdown_timeout_from_env_or_flag(
+        server.shutdown_timeout_ms,
+        std::env::var(SHUTDOWN_TIMEOUT_ENV).ok().as_deref(),
+    );
 
     runtime.block_on(async move {
         if telemetry_enabled {
@@ -493,15 +502,115 @@ fn run_server(cli: &CliConfig, server: &ServerArgs) -> Result<(), CliError> {
             tracing::info!(url = %inspector_url, "inspector ui available");
         }
 
-        let shutdown_state = state.clone();
+        let signals = TerminationSignals::new()?;
         axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                shutdown_servers(&shutdown_state).await;
-            })
+            .with_graceful_shutdown(shutdown_signal(state.clone(), signals, shutdown_timeout))
             .await
             .map_err(|err| CliError::Server(err.to_string()))
     })
+}
+
+const SHUTDOWN_TIMEOUT_ENV: &str = "SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS";
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(3000);
+
+/// Resolves the per-phase shutdown timeout: `--shutdown-timeout-ms` wins, then
+/// `SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS`, then the default. An unparsable env
+/// value falls back to the default.
+fn shutdown_timeout_from_env_or_flag(flag: Option<u64>, env: Option<&str>) -> Duration {
+    if let Some(ms) = flag {
+        return Duration::from_millis(ms);
+    }
+    match env.map(|raw| raw.trim().parse::<u64>()) {
+        Some(Ok(ms)) => Duration::from_millis(ms),
+        Some(Err(_)) => {
+            tracing::warn!(
+                env = SHUTDOWN_TIMEOUT_ENV,
+                value = env.unwrap_or_default(),
+                "invalid shutdown timeout; using default"
+            );
+            DEFAULT_SHUTDOWN_TIMEOUT
+        }
+        None => DEFAULT_SHUTDOWN_TIMEOUT,
+    }
+}
+
+/// Graceful shutdown on SIGINT/SIGTERM:
+/// 1. stop agent processes and sidecars (`shutdown_servers`), bounded by `timeout`;
+/// 2. let axum drain in-flight connections, bounded by `timeout` again, since
+///    long-lived streams (process log follows) never finish on their own.
+///
+/// A second signal at any point exits the process immediately.
+async fn shutdown_signal(state: Arc<AppState>, mut signals: TerminationSignals, timeout: Duration) {
+    signals.recv().await;
+    tracing::info!(
+        timeout_ms = timeout.as_millis() as u64,
+        "shutdown signal received; stopping agent processes"
+    );
+
+    tokio::spawn(async move {
+        signals.recv().await;
+        tracing::warn!("second shutdown signal received; exiting immediately");
+        std::process::exit(1);
+    });
+
+    if tokio::time::timeout(timeout, shutdown_servers(&state))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_ms = timeout.as_millis() as u64,
+            "agent shutdown timed out"
+        );
+    }
+
+    tracing::info!("draining open connections");
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        tracing::warn!(
+            timeout_ms = timeout.as_millis() as u64,
+            "connection drain timed out; exiting"
+        );
+        std::process::exit(0);
+    });
+}
+
+/// Listens for SIGINT and SIGTERM (Ctrl+C only on non-unix). Handlers are
+/// registered once up front so a signal is never lost between waits, and so
+/// PID 1 in a container stops ignoring SIGTERM.
+struct TerminationSignals {
+    #[cfg(unix)]
+    sigint: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    sigterm: tokio::signal::unix::Signal,
+}
+
+impl TerminationSignals {
+    #[cfg(unix)]
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            sigint: signal(SignalKind::interrupt())?,
+            sigterm: signal(SignalKind::terminate())?,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+
+    #[cfg(unix)]
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.sigint.recv() => {}
+            _ = self.sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn recv(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn run_api(command: &ApiCommand, cli: &CliConfig) -> Result<(), CliError> {
@@ -1606,6 +1715,56 @@ fn write_stderr_line(text: &str) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_timeout_defaults_without_flag_or_env() {
+        assert_eq!(
+            shutdown_timeout_from_env_or_flag(None, None),
+            DEFAULT_SHUTDOWN_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_reads_env() {
+        assert_eq!(
+            shutdown_timeout_from_env_or_flag(None, Some(" 7500 ")),
+            Duration::from_millis(7500)
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_invalid_env_falls_back_to_default() {
+        for raw in ["", "abc", "-5", "1.5"] {
+            assert_eq!(
+                shutdown_timeout_from_env_or_flag(None, Some(raw)),
+                DEFAULT_SHUTDOWN_TIMEOUT,
+                "env value {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_timeout_flag_overrides_env() {
+        assert_eq!(
+            shutdown_timeout_from_env_or_flag(Some(250), Some("7500")),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn server_parses_shutdown_timeout_flag() {
+        let cli = SandboxAgentCli::try_parse_from([
+            "sandbox-agent",
+            "server",
+            "--shutdown-timeout-ms",
+            "1200",
+        ])
+        .expect("parse server args");
+        match cli.command {
+            Command::Server(args) => assert_eq!(args.shutdown_timeout_ms, Some(1200)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 
     fn helper_credentials() -> ExtractedCredentials {
         ExtractedCredentials {

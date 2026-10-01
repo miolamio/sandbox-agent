@@ -82,7 +82,7 @@ done
     write_executable(path, script);
 }
 
-fn setup_stub_artifacts(install_dir: &Path, agent: &str) {
+pub(super) fn setup_stub_artifacts(install_dir: &Path, agent: &str) {
     let native = install_dir.join(agent);
     write_stub_native(&native, agent);
 

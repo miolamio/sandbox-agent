@@ -104,6 +104,10 @@ impl TestApp {
     pub fn root_path(&self) -> &Path {
         self._root.path()
     }
+
+    pub fn container_id(&self) -> &str {
+        &self.container_id
+    }
 }
 
 impl Drop for TestApp {
@@ -534,7 +538,7 @@ fn repo_root() -> PathBuf {
         .expect("repo root")
 }
 
-fn docker_bin() -> &'static Path {
+pub fn docker_bin() -> &'static Path {
     DOCKER_BIN
         .get_or_init(|| {
             if let Some(value) = std::env::var_os("SANDBOX_AGENT_TEST_DOCKER_BIN") {
