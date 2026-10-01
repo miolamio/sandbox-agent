@@ -22,7 +22,12 @@ export type {
   DesktopStreamStatusMessage,
 } from "./desktop-stream.ts";
 
+export type { AuthMethod } from "acp-http-client";
+
 export type {
+  AuthMethodSelectionContext,
+  AuthMethodSelector,
+  SandboxAgentAuthOptions,
   SandboxAgentHealthWaitOptions,
   AgentQueryOptions,
   DesktopStreamSessionOptions,

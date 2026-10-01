@@ -287,3 +287,13 @@ Update this file continuously during the migration.
 - Owner: Unassigned.
 - Status: resolved
 - Links: `server/packages/sandbox-agent/src/router.rs`, `server/packages/sandbox-agent/src/desktop_runtime.rs`, `sdks/typescript/src/client.ts`, `frontend/packages/inspector/src/components/debug/DesktopTab.tsx`
+
+- Date: 2026-10-01
+- Area: TypeScript SDK agent authentication (`authMethods` / `authenticate`)
+- Issue: `autoAuthenticate` only called `authenticate` for three hardcoded ids (`codex-api-key`, `openai-api-key`, `anthropic-api-key`), silently skipped every other advertised method, and swallowed `authenticate` errors. This broke the API-key flow of `codex-acp` 1.x and gateway-style custom auth (upstream issue #313).
+- Impact: Clients could not pick an agent-advertised auth method, and a failed sign-in surfaced later as a confusing prompt failure instead of at session creation.
+- Proposed direction: Let SDK callers choose the method from the agent's `initialize.authMethods`, keeping the legacy heuristic as the default.
+- Decision: Accepted and implemented. New `auth` option on `SandboxAgent.connect/start`: `{ methodId }`, `{ selectMethod(methods, { agent }) }` (receives full `AuthMethod[]` including `_meta`; returns an id, `false` to skip, or `undefined` for the default), or `false` to disable. Order: `methodId`, then `selectMethod`, then the legacy heuristic. An explicitly chosen method must be advertised and its `authenticate` errors propagate from `createSession`; the legacy heuristic stays best-effort. No HTTP contract change. Still to verify live which ids `codex-acp` 1.x advertises for API keys and whether they belong in the default heuristic.
+- Owner: Unassigned.
+- Status: resolved
+- Links: `sdks/typescript/src/client.ts`, `sdks/typescript/tests/integration.test.ts`, `sdks/typescript/tests/helpers/mock-agent.ts`, `docs/sdk-overview.mdx`

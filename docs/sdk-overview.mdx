@@ -90,6 +90,37 @@ const sdk = await SandboxAgent.start({
 await sdk.destroySandbox(); // provider-defined cleanup + disposes client
 ```
 
+### Agent authentication
+
+When the SDK first connects to an agent, the agent may list the sign-in methods it supports. By default the SDK picks an API key method it recognizes (`codex-api-key`, `openai-api-key`, or `anthropic-api-key`) and ignores any failure, because the agent may already have credentials from environment variables or credential files.
+
+Pass `auth` to `SandboxAgent.connect(...)` or `SandboxAgent.start(...)` to choose the method yourself:
+
+```ts
+// Always use one method id.
+const sdk = await SandboxAgent.connect({
+  baseUrl: "http://127.0.0.1:2468",
+  auth: { methodId: "gateway-token" },
+});
+
+// Or pick per agent from the methods the agent lists.
+const sdk2 = await SandboxAgent.connect({
+  baseUrl: "http://127.0.0.1:2468",
+  auth: {
+    selectMethod: (methods, { agent }) => {
+      if (agent !== "codex") return undefined; // use the default selection
+      return methods.find((method) => method.id.includes("api-key"))?.id;
+    },
+  },
+});
+```
+
+- `methodId`: used for every agent. Takes precedence over `selectMethod`.
+- `selectMethod(methods, { agent })`: receives the full `AuthMethod[]` list (including `description` and `_meta`). Return a method id to use it, `false` to skip sign-in for that agent, or `undefined` to fall back to the default selection.
+- `auth: false`: never sign in automatically.
+
+A method chosen through `methodId` or `selectMethod` must be one the agent lists, otherwise `createSession(...)` rejects. If the agent refuses the chosen method, `createSession(...)` rejects with an error naming the agent and the method instead of continuing unauthenticated. Agents that list no sign-in methods are used as is, whatever `auth` says.
+
 `SandboxAgent.start(...)` requires a `sandbox` provider. Built-in providers:
 
 | Import | Provider |

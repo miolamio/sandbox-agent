@@ -1082,3 +1082,134 @@ describe("Integration: TypeScript SDK flat session API", () => {
     }
   });
 });
+
+describe("Integration: agent auth method selection", { timeout: 120_000 }, () => {
+  let handle: DockerSandboxAgentHandle | undefined;
+  let layout: ReturnType<typeof createDockerTestLayout> | undefined;
+
+  async function startWithAuthMethods(methods: Array<Record<string, unknown>>, rejected: string[] = []): Promise<string> {
+    layout = createDockerTestLayout();
+    prepareMockAgentDataHome(layout.xdgDataHome);
+    handle = await startDockerSandboxAgent(layout, {
+      timeoutMs: 30000,
+      env: {
+        MOCK_ACP_AUTH_METHODS: JSON.stringify(methods),
+        MOCK_ACP_AUTH_REJECT: JSON.stringify(rejected),
+      },
+    });
+    return handle.baseUrl;
+  }
+
+  async function promptAuthMarker(sdk: SandboxAgent): Promise<string> {
+    const session = await sdk.createSession({ agent: "mock" });
+    const texts: string[] = [];
+    const off = session.onEvent((event) => {
+      const text = (event.payload as any)?.params?.update?.content?.text;
+      if (typeof text === "string") {
+        texts.push(text);
+      }
+    });
+    const prompt = await session.prompt([{ type: "text", text: "which auth" }]);
+    expect(prompt.stopReason).toBe("end_turn");
+    const marker = await waitFor(() => texts.find((text) => text.startsWith("auth:")));
+    off();
+    return marker;
+  }
+
+  afterEach(async () => {
+    await handle?.dispose?.();
+    handle = undefined;
+    if (layout) {
+      disposeDockerTestLayout(layout);
+      layout = undefined;
+    }
+  });
+
+  it("authenticates with an explicitly selected agent-advertised auth method", async () => {
+    const baseUrl = await startWithAuthMethods([{ id: "gateway-token", name: "Gateway token" }]);
+    const sdk = await SandboxAgent.connect({ baseUrl, auth: { methodId: "gateway-token" } });
+    try {
+      expect(await promptAuthMarker(sdk)).toBe("auth:gateway-token");
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("passes full advertised auth methods to a selectMethod callback", async () => {
+    const baseUrl = await startWithAuthMethods([
+      { id: "claude-login", name: "Log in" },
+      { id: "gateway-token", name: "Gateway", _meta: { "sandboxagent.dev": { kind: "gateway" } } },
+    ]);
+    const seen: Array<{ agent: string; ids: string[] }> = [];
+    const sdk = await SandboxAgent.connect({
+      baseUrl,
+      auth: {
+        selectMethod: (methods, context) => {
+          seen.push({ agent: context.agent, ids: methods.map((method) => method.id) });
+          return methods.find((method) => (method._meta as any)?.["sandboxagent.dev"]?.kind === "gateway")?.id;
+        },
+      },
+    });
+    try {
+      expect(await promptAuthMarker(sdk)).toBe("auth:gateway-token");
+      expect(seen).toEqual([{ agent: "mock", ids: ["claude-login", "gateway-token"] }]);
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("surfaces authenticate errors for an explicitly selected method", async () => {
+    const baseUrl = await startWithAuthMethods([{ id: "gateway-token", name: "Gateway token" }], ["gateway-token"]);
+    const sdk = await SandboxAgent.connect({ baseUrl, auth: { methodId: "gateway-token" } });
+    try {
+      await expect(sdk.createSession({ agent: "mock" })).rejects.toThrow(
+        /Failed to authenticate agent 'mock' with auth method 'gateway-token'.*mock authentication rejected/,
+      );
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("rejects an explicitly selected auth method the agent does not advertise", async () => {
+    const baseUrl = await startWithAuthMethods([{ id: "claude-login", name: "Log in" }]);
+    const sdk = await SandboxAgent.connect({ baseUrl, auth: { methodId: "gateway-token" } });
+    try {
+      await expect(sdk.createSession({ agent: "mock" })).rejects.toThrow(/does not advertise auth method 'gateway-token'/);
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("keeps legacy env-based auth method selection by default", async () => {
+    const baseUrl = await startWithAuthMethods([
+      { id: "claude-login", name: "Log in" },
+      { id: "openai-api-key", name: "OpenAI API key" },
+    ]);
+    const sdk = await SandboxAgent.connect({ baseUrl });
+    try {
+      expect(await promptAuthMarker(sdk)).toBe("auth:openai-api-key");
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("does not authenticate with unknown methods by default and keeps an already-authenticated agent working", async () => {
+    const baseUrl = await startWithAuthMethods([{ id: "claude-login", name: "Log in" }]);
+    const sdk = await SandboxAgent.connect({ baseUrl });
+    try {
+      expect(await promptAuthMarker(sdk)).toBe("auth:none");
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("skips authentication entirely when auth is false", async () => {
+    const baseUrl = await startWithAuthMethods([{ id: "openai-api-key", name: "OpenAI API key" }]);
+    const sdk = await SandboxAgent.connect({ baseUrl, auth: false });
+    try {
+      expect(await promptAuthMarker(sdk)).toBe("auth:none");
+    } finally {
+      await sdk.dispose();
+    }
+  });
+});

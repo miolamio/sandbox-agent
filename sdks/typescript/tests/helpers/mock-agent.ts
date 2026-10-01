@@ -32,6 +32,24 @@ let nextSession = 0;
 let nextPermission = 0;
 const pendingPermissions = new Map();
 
+function parseJsonEnv(name) {
+  const raw = process.env[name];
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+// Auth behavior is opt-in so tests that do not set MOCK_ACP_AUTH_METHODS see
+// the original mock output.
+const authMethods = parseJsonEnv("MOCK_ACP_AUTH_METHODS");
+const rejectedAuthMethods = new Set(parseJsonEnv("MOCK_ACP_AUTH_REJECT") ?? []);
+let authenticatedMethodId = null;
+
 function emit(value) {
   process.stdout.write(JSON.stringify(value) + "\n");
 }
@@ -117,6 +135,23 @@ rl.on("line", (line) => {
       },
     });
 
+    if (Array.isArray(authMethods)) {
+      emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: "auth:" + (authenticatedMethodId ?? "none"),
+            },
+          },
+        },
+      });
+    }
+
     if (text.includes("permission")) {
       nextPermission += 1;
       const permissionId = "permission-" + nextPermission;
@@ -178,7 +213,31 @@ rl.on("line", (line) => {
           name: "mock-acp-agent",
           version: "0.0.1",
         },
+        ...(Array.isArray(authMethods) ? { authMethods } : {}),
       },
+    });
+    return;
+  }
+
+  if (method === "authenticate") {
+    const methodId = msg?.params?.methodId;
+    const known = Array.isArray(authMethods) && authMethods.some((entry) => entry && entry.id === methodId);
+    if (!known || rejectedAuthMethods.has(methodId)) {
+      emit({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: {
+          code: -32000,
+          message: "mock authentication rejected for method " + String(methodId),
+        },
+      });
+      return;
+    }
+    authenticatedMethodId = methodId;
+    emit({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {},
     });
     return;
   }

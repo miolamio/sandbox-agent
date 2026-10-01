@@ -130,7 +130,39 @@ export interface SandboxAgentHealthWaitOptions {
   timeoutMs?: number;
 }
 
+/** Context passed to {@link SandboxAgentAuthOptions.selectMethod}. */
+export interface AuthMethodSelectionContext {
+  /** Agent the connection is being opened for (for example `"codex"`). */
+  agent: string;
+}
+
+/**
+ * Chooses which agent-advertised auth method to use.
+ * Return a method id to use it, `false` to skip authentication for this agent,
+ * or `null`/`undefined` to fall back to the default heuristic.
+ */
+export type AuthMethodSelector = (
+  methods: AuthMethod[],
+  context: AuthMethodSelectionContext,
+) => string | false | null | undefined | Promise<string | false | null | undefined>;
+
+/**
+ * Controls how the SDK authenticates with an agent after connecting to it.
+ * An explicitly chosen method must be advertised by the agent, and its errors are thrown.
+ */
+export interface SandboxAgentAuthOptions {
+  /** Auth method id to use. Takes precedence over `selectMethod`. */
+  methodId?: string;
+  /** Picks a method from the full list the agent advertises (including `_meta`). */
+  selectMethod?: AuthMethodSelector;
+}
+
 interface SandboxAgentConnectCommonOptions {
+  /**
+   * Agent auth method selection. Omit to keep the default heuristic
+   * (env-var based API key methods only, errors ignored). `false` disables it.
+   */
+  auth?: SandboxAgentAuthOptions | false;
   headers?: HeadersInit;
   persist?: SessionPersistDriver;
   replayMaxEvents?: number;
@@ -154,6 +186,8 @@ export type SandboxAgentConnectOptions =
 
 export interface SandboxAgentStartOptions {
   sandbox: SandboxProvider;
+  /** See {@link SandboxAgentConnectOptions} `auth`. */
+  auth?: SandboxAgentAuthOptions | false;
   sandboxId?: string;
   skipHealthCheck?: boolean;
   fetch?: typeof fetch;
@@ -486,6 +520,7 @@ export class LiveAcpConnection {
     token?: string;
     fetcher: typeof fetch;
     headers?: HeadersInit;
+    auth?: SandboxAgentAuthOptions | false;
     agent: string;
     serverId: string;
     onObservedEnvelope: (connection: LiveAcpConnection, envelope: AnyMessage, direction: AcpEnvelopeDirection, localSessionId: string | null) => void;
@@ -541,7 +576,12 @@ export class LiveAcpConnection {
       },
     });
     if (initResult.authMethods && initResult.authMethods.length > 0) {
-      await autoAuthenticate(acp, initResult.authMethods);
+      try {
+        await autoAuthenticate(acp, options.agent, initResult.authMethods, options.auth);
+      } catch (error) {
+        await acp.disconnect().catch(() => {});
+        throw error;
+      }
     }
     return live;
   }
@@ -883,6 +923,7 @@ export class SandboxAgent {
   private readonly token?: string;
   private readonly fetcher: typeof fetch;
   private readonly defaultHeaders?: HeadersInit;
+  private readonly auth?: SandboxAgentAuthOptions | false;
   private readonly healthWait: NormalizedHealthWaitOptions;
   private readonly healthWaitAbortController = new AbortController();
   private sandboxProvider?: SandboxProvider;
@@ -921,6 +962,7 @@ export class SandboxAgent {
     }
     this.fetcher = resolvedFetch;
     this.defaultHeaders = options.headers;
+    this.auth = options.auth;
     this.healthWait = normalizeHealthWaitOptions(options.skipHealthCheck, options.waitForHealth, options.signal);
     this.persist = options.persist ?? new InMemorySessionPersistDriver();
 
@@ -963,6 +1005,7 @@ export class SandboxAgent {
       const inspectorUrl = provider.getInspectorUrl ? await provider.getInspectorUrl(rawSandboxId, baseUrl) : undefined;
       const providerFetch = options.fetch ?? fetcher;
       const commonConnectOptions = {
+        auth: options.auth,
         headers: options.headers,
         persist: options.persist,
         replayMaxEvents: options.replayMaxEvents,
@@ -2031,6 +2074,7 @@ export class SandboxAgent {
         token: this.token,
         fetcher: this.fetcher,
         headers: this.defaultHeaders,
+        auth: this.auth,
         agent,
         serverId,
         onObservedEnvelope: (connection, envelope, direction, localSessionId) => {
@@ -2627,16 +2671,47 @@ function bytesToBase64(bytes: Uint8Array): string {
   throw new Error("Base64 encoding is not available in this environment.");
 }
 
-/**
- * Auto-select and call `authenticate` based on the agent's advertised auth methods.
- * Prefers env-var-based methods that the server process already has configured.
- */
-async function autoAuthenticate(acp: AcpHttpClient, methods: AuthMethod[]): Promise<void> {
-  // Only attempt env-var-based methods that the server process can satisfy
-  // automatically.  Interactive methods (e.g. "claude-login") cannot be
-  // fulfilled programmatically and must be skipped.
-  const envBased = methods.find((m) => m.id === "codex-api-key" || m.id === "openai-api-key" || m.id === "anthropic-api-key");
+// Env-var based methods that the server process can satisfy automatically.
+// Interactive methods (e.g. "claude-login") cannot be fulfilled programmatically.
+const DEFAULT_AUTH_METHOD_IDS = new Set(["codex-api-key", "openai-api-key", "anthropic-api-key"]);
 
+/**
+ * Select and call `authenticate` based on the agent's advertised auth methods.
+ *
+ * Order: explicit `methodId`, then `selectMethod`, then the default heuristic.
+ * An explicitly chosen method must be advertised and its errors propagate.
+ * The default heuristic stays best-effort: its errors are ignored because the
+ * agent may already have credentials from env vars or credential files.
+ */
+async function autoAuthenticate(acp: AcpHttpClient, agent: string, methods: AuthMethod[], auth: SandboxAgentAuthOptions | false | undefined): Promise<void> {
+  if (auth === false) {
+    return;
+  }
+
+  let explicit: string | false | null | undefined = auth?.methodId;
+  if (explicit === undefined && auth?.selectMethod) {
+    explicit = await auth.selectMethod(methods, { agent });
+  }
+
+  if (explicit === false) {
+    return;
+  }
+
+  if (typeof explicit === "string") {
+    if (!methods.some((method) => method.id === explicit)) {
+      const advertised = methods.map((method) => method.id).join(", ");
+      throw new Error(`Agent '${agent}' does not advertise auth method '${explicit}' (advertised: ${advertised}).`);
+    }
+    try {
+      await acp.authenticate({ methodId: explicit });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to authenticate agent '${agent}' with auth method '${explicit}': ${message}`, { cause: error });
+    }
+    return;
+  }
+
+  const envBased = methods.find((method) => DEFAULT_AUTH_METHOD_IDS.has(method.id));
   if (!envBased) {
     return;
   }
@@ -2644,8 +2719,7 @@ async function autoAuthenticate(acp: AcpHttpClient, methods: AuthMethod[]): Prom
   try {
     await acp.authenticate({ methodId: envBased.id });
   } catch {
-    // Authentication is best-effort; the agent may already have credentials
-    // from env vars or credential files configured on the server side.
+    // Best-effort; see function docs.
   }
 }
 
