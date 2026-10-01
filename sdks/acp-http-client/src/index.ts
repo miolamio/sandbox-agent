@@ -279,6 +279,13 @@ class StreamableHttpAcpTransport {
   // Set after the first successful SSE connect. Before that, 404 can just mean
   // the bootstrap POST has not created the server yet, so it is retryable.
   private sseEverConnected = false;
+  // Consecutive failed connect attempts of the current SSE loop.
+  private sseFailures = 0;
+  // True when the last SSE attempt failed without an HTTP response (network
+  // error): the server is most likely unreachable.
+  private sseUnreachable = false;
+  // Woken whenever the SSE loop connects, fails an attempt, or stops.
+  private readonly sseStateWaiters = new Set<() => void>();
   // Prompts sent with the async header: their result only arrives over SSE, so
   // they must be failed explicitly if SSE is given up.
   private readonly asyncPendingIds = new Map<string, string>();
@@ -343,6 +350,7 @@ class StreamableHttpAcpTransport {
     }
 
     this.closed = true;
+    this.notifySseStateChange();
 
     if (this.sseAbortController) {
       this.sseAbortController.abort();
@@ -398,6 +406,17 @@ class StreamableHttpAcpTransport {
     });
 
     const wireMessage = this.toWireMessage(message);
+
+    if (isAsyncPromptRequest(wireMessage) && this.postedOnce && !this.sseConnected) {
+      // A synchronous prompt POST would wait for the whole turn and be cut off
+      // by HTTP response-header timeouts (undici: 300 s), so give a connecting
+      // or reconnecting event stream a chance to come up first.
+      this.ensureSseLoop();
+      await this.waitForSseConnected(SSE_CONNECT_WAIT_MS);
+      if (this.closed) {
+        throw new Error("ACP client is closed");
+      }
+    }
 
     if (this.sseConnected && isAsyncPromptRequest(wireMessage)) {
       // The server acknowledges with 202 and delivers the result over SSE, so a
@@ -476,13 +495,48 @@ class StreamableHttpAcpTransport {
       return;
     }
 
+    this.sseFailures = 0;
+    this.sseUnreachable = false;
     this.sseLoop = this.runSseLoop().finally(() => {
       this.sseLoop = null;
+      this.notifySseStateChange();
     });
   }
 
+  /**
+   * Waits until the event stream is connected, the loop reports a failed
+   * attempt without an HTTP response or stops, the transport closes, or the
+   * timeout passes. A network error means the server is most likely
+   * unreachable, so the caller is not delayed then. HTTP errors (such as 404
+   * before the bootstrap request created the server) keep the wait going.
+   */
+  private async waitForSseConnected(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (!this.sseConnected && this.sseLoop && !this.sseUnreachable && !this.closed) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        break;
+      }
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          this.sseStateWaiters.delete(done);
+          resolve();
+        };
+        const timer = setTimeout(done, remaining);
+        this.sseStateWaiters.add(done);
+      });
+    }
+    return this.sseConnected;
+  }
+
+  private notifySseStateChange(): void {
+    for (const waiter of [...this.sseStateWaiters]) {
+      waiter();
+    }
+  }
+
   private async runSseLoop(): Promise<void> {
-    let failures = 0;
     while (!this.closed) {
       this.sseAbortController = new AbortController();
 
@@ -510,7 +564,9 @@ class StreamableHttpAcpTransport {
 
         this.sseConnected = true;
         this.sseEverConnected = true;
-        failures = 0;
+        this.sseFailures = 0;
+        this.sseUnreachable = false;
+        this.notifySseStateChange();
         try {
           await this.consumeSse(response.body);
         } finally {
@@ -530,12 +586,14 @@ class StreamableHttpAcpTransport {
         // Last-Event-ID, with capped exponential backoff. Give up on terminal
         // statuses (server gone or unauthorized) or after repeated failures;
         // the next POST restarts the loop.
-        failures += 1;
-        if (isTerminalSseError(error, this.sseEverConnected) || failures >= SSE_MAX_CONSECUTIVE_FAILURES) {
+        this.sseFailures += 1;
+        this.sseUnreachable = !(error instanceof AcpHttpError);
+        this.notifySseStateChange();
+        if (isTerminalSseError(error, this.sseEverConnected) || this.sseFailures >= SSE_MAX_CONSECUTIVE_FAILURES) {
           this.failAsyncPending(error);
           return;
         }
-        await delay(Math.min(SSE_RECONNECT_BASE_MS * 2 ** (failures - 1), SSE_RECONNECT_MAX_MS));
+        await delay(Math.min(SSE_RECONNECT_BASE_MS * 2 ** (this.sseFailures - 1), SSE_RECONNECT_MAX_MS));
       }
     }
   }
@@ -664,6 +722,7 @@ class StreamableHttpAcpTransport {
     }
 
     this.closed = true;
+    this.notifySseStateChange();
 
     try {
       this.readableController?.error(error);
@@ -777,6 +836,9 @@ const MAX_SSE_EVENT_ID = "18446744073709551615";
 const SSE_RECONNECT_BASE_MS = 150;
 const SSE_RECONNECT_MAX_MS = 5_000;
 const SSE_MAX_CONSECUTIVE_FAILURES = 8;
+// How long a prompt waits for a connecting event stream before it falls back
+// to a synchronous POST.
+const SSE_CONNECT_WAIT_MS = 10_000;
 const TERMINAL_SSE_STATUSES = new Set([401, 403, 410]);
 
 function isTerminalSseError(error: unknown, everConnected: boolean): boolean {

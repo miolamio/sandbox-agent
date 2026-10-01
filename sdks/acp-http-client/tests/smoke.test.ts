@@ -58,6 +58,90 @@ async function waitFor<T>(fn: () => T | undefined | null, timeoutMs = 5000, step
   throw new Error("timed out waiting for condition");
 }
 
+// A fetch that behaves like Node's default one but with a short undici
+// headersTimeout, so a request whose response headers take longer fails like a
+// real long turn does after 300 s. The SSE GET can be held back and its stream
+// ended on demand, to model the moments when the event stream is not connected.
+function shortHeadersTimeoutFetch(headersTimeoutMs: number) {
+  const globalDispatcher = (globalThis as Record<symbol, unknown>)[Symbol.for("undici.globalDispatcher.1")];
+  if (!globalDispatcher) {
+    throw new Error("undici global dispatcher is not initialized");
+  }
+  const Agent = (globalDispatcher as { constructor: new (options: { headersTimeout: number }) => unknown }).constructor;
+  const dispatcher = new Agent({ headersTimeout: headersTimeoutMs });
+
+  const state = {
+    // GETs wait until this returns true.
+    sseAllowed: () => true,
+    sseConnects: 0,
+    endSse: null as (() => void) | null,
+    promptPosts: [] as Array<{ asyncHeader: string | null; status: number | string }>,
+  };
+
+  const fetcher: typeof fetch = async (input, init) => {
+    const withDispatcher = { ...init, dispatcher } as RequestInit;
+    if (init?.method === "GET") {
+      while (!state.sseAllowed()) {
+        if (init.signal?.aborted) {
+          throw new DOMException("aborted", "AbortError");
+        }
+        await sleep(10);
+      }
+      const response = await globalThis.fetch(input, withDispatcher);
+      if (!response.ok || !response.body) {
+        return response;
+      }
+      state.sseConnects += 1;
+      const reader = response.body.getReader();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          state.endSse = () => {
+            try {
+              controller.close();
+            } catch {}
+            reader.cancel().catch(() => {});
+          };
+        },
+        async pull(controller) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              controller.close();
+            } else {
+              controller.enqueue(value);
+            }
+          } catch {
+            try {
+              controller.close();
+            } catch {}
+          }
+        },
+        cancel() {
+          reader.cancel().catch(() => {});
+        },
+      });
+      return new Response(body, { status: response.status, headers: response.headers });
+    }
+
+    const isPrompt = init?.method === "POST" && typeof init.body === "string" && (JSON.parse(init.body) as { method?: string }).method === "session/prompt";
+    const asyncHeader = new Headers(init?.headers).get("x-sandboxagent-async-prompt");
+    try {
+      const response = await globalThis.fetch(input, withDispatcher);
+      if (isPrompt) {
+        state.promptPosts.push({ asyncHeader, status: response.status });
+      }
+      return response;
+    } catch (error) {
+      if (isPrompt) {
+        state.promptPosts.push({ asyncHeader, status: String((error as { cause?: { code?: string } }).cause?.code ?? error) });
+      }
+      throw error;
+    }
+  };
+
+  return { fetch: fetcher, state };
+}
+
 describe("AcpHttpClient integration", () => {
   let handle: SandboxAgentSpawnHandle;
   let baseUrl: string;
@@ -593,6 +677,76 @@ describe("AcpHttpClient integration", () => {
     } finally {
       await attached.disconnect();
       await first.disconnect();
+    }
+  });
+
+  it("completes the first prompt of a new session that outlasts headersTimeout while the event stream is still connecting", async () => {
+    const serverId = `acp-http-client-first-long-${Date.now().toString(36)}`;
+    const { fetch: fetcher, state } = shortHeadersTimeoutFetch(500);
+    // The event stream connects only 300 ms after the prompt is issued.
+    let sseReleaseAt: number | null = null;
+    state.sseAllowed = () => sseReleaseAt !== null && Date.now() >= sseReleaseAt;
+
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: fetcher,
+      transport: { path: `/v1/acp/${encodeURIComponent(serverId)}`, bootstrapQuery: { agent: "mock" } },
+    });
+    try {
+      await client.initialize();
+      const session = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(state.sseConnects).toBe(0);
+
+      sseReleaseAt = Date.now() + 300;
+      const prompt = await withTimeout(
+        client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "long turn delay:1500" }] }),
+        "first long prompt",
+        10_000,
+      );
+      expect(prompt.stopReason).toBe("end_turn");
+      await waitFor(() => (state.promptPosts.length > 0 ? true : undefined));
+      expect(state.promptPosts).toEqual([{ asyncHeader: "1", status: 202 }]);
+    } finally {
+      await client.disconnect();
+    }
+  });
+
+  it("completes a prompt that outlasts headersTimeout when it is sent while the event stream reconnects", async () => {
+    const serverId = `acp-http-client-reconnect-long-${Date.now().toString(36)}`;
+    const { fetch: fetcher, state } = shortHeadersTimeoutFetch(500);
+
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: fetcher,
+      transport: { path: `/v1/acp/${encodeURIComponent(serverId)}`, bootstrapQuery: { agent: "mock" } },
+    });
+    try {
+      await client.initialize();
+      const session = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await waitFor(() => (state.sseConnects > 0 ? true : undefined));
+
+      // Drop the event stream and keep the reconnect pending until 300 ms
+      // after the prompt is issued.
+      let sseReleaseAt: number | null = null;
+      state.sseAllowed = () => sseReleaseAt !== null && Date.now() >= sseReleaseAt;
+      state.endSse?.();
+      await sleep(250);
+      expect(state.sseConnects).toBe(1);
+
+      sseReleaseAt = Date.now() + 300;
+      const prompt = await withTimeout(
+        client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "long turn delay:1500" }] }),
+        "long prompt during reconnect",
+        10_000,
+      );
+      expect(prompt.stopReason).toBe("end_turn");
+      expect(state.sseConnects).toBe(2);
+      await waitFor(() => (state.promptPosts.length > 0 ? true : undefined));
+      expect(state.promptPosts).toEqual([{ asyncHeader: "1", status: 202 }]);
+    } finally {
+      await client.disconnect();
     }
   });
 });

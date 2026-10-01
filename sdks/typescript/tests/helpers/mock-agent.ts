@@ -324,13 +324,21 @@ rl.on("line", (line) => {
     if (text.includes("permission")) {
       return;
     }
-    emit({
-      jsonrpc: "2.0",
-      id: msg.id,
-      result: {
-        stopReason: "end_turn",
-      },
-    });
+    const finish = () =>
+      emit({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          stopReason: "end_turn",
+        },
+      });
+    // Test hook: "delay:<ms>" in the prompt text holds the turn open that long.
+    const delayMatch = /delay:(\d+)/.exec(text);
+    if (delayMatch) {
+      setTimeout(finish, Number(delayMatch[1]));
+    } else {
+      finish();
+    }
     return;
   }
 

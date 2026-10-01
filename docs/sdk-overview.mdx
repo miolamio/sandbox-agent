@@ -150,6 +150,8 @@ const prompt = await session.prompt([
 console.log(prompt.stopReason);
 ```
 
+`session.prompt(...)` resolves when the whole turn ends, which can take as long as the server's agent request timeout (2 hours by default, see `--acp-request-timeout-ms` in the [CLI reference](/cli)). The SDK receives the result over the session's event stream, so a long turn is not cut off by HTTP client timeouts such as the 300 second response-header timeout of Node.js `fetch`. If the event stream is still connecting or reconnecting, the prompt waits up to 10 seconds for it. If the stream cannot connect (for example, the server is unreachable), the prompt is sent as a plain request whose result comes in the HTTP response, and HTTP client timeouts apply again.
+
 Load and destroy:
 
 ```ts

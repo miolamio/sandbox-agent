@@ -338,3 +338,13 @@ Update this file continuously during the migration.
 - Owner: Unassigned.
 - Status: resolved
 - Links: `sdks/typescript/src/client.ts`, `sdks/acp-http-client/src/index.ts`, `sdks/typescript/tests/integration.test.ts`, `docs/session-restoration.mdx`
+
+- Date: 2026-10-01
+- Area: `acp-http-client` prompt delivery vs. HTTP client timeouts (SBA-35)
+- Issue: The client only sent `session/prompt` with `x-sandboxagent-async-prompt: 1` when SSE was already connected. A prompt issued while SSE was still connecting (first prompt right after `session/new`) or reconnecting went as a synchronous POST, and Node's `fetch` (undici `headersTimeout`, 300 s) cut the turn off long before the server's 2 h request timeout (SBA-22).
+- Impact: Long turns failed client-side with `HeadersTimeoutError` while the agent was still working.
+- Proposed direction: Either always wait for SSE and send async, or give the synchronous POST a dispatcher without `headersTimeout`.
+- Decision: Implemented the first option. Before posting a prompt (and only after the first POST, so the bootstrap is never blocked), the transport starts the SSE loop if needed and waits up to `SSE_CONNECT_WAIT_MS` (10 s) for it to connect, then sends the prompt async. It stops waiting early when an SSE attempt fails with a network error (no HTTP response), the loop gives up (terminal status or too many failures), or the transport closes; HTTP errors such as the 404 before the bootstrap POST created the server keep it waiting. After that it falls back to the old synchronous POST, so an unreachable server still fails fast and the SBA-27 server-loss path (`SessionRequestInterruptedError`, no prompt retry) is unchanged. The wait happens inside the writable stream's `write`, which the ACP connection serializes, so a later `session/cancel` cannot overtake its prompt. A dispatcher without `headersTimeout` was rejected: it needs `undici` as a runtime dependency and only works in Node. Residual risk: if SSE stays down for the whole wait, the synchronous fallback is still subject to the HTTP client's timeouts.
+- Owner: Unassigned.
+- Status: resolved
+- Links: `sdks/acp-http-client/src/index.ts`, `sdks/acp-http-client/tests/smoke.test.ts`, `sdks/typescript/tests/helpers/mock-agent.ts`, `docs/sdk-overview.mdx`
