@@ -60,6 +60,8 @@ pub struct TestAppOptions {
     pub env: BTreeMap<String, String>,
     pub extra_paths: Vec<PathBuf>,
     pub replace_path: bool,
+    /// Extra arguments appended to `sandbox-agent server ...` in the container.
+    pub extra_server_args: Vec<String>,
 }
 
 impl TestApp {
@@ -87,7 +89,14 @@ impl TestApp {
         let image = ensure_test_image();
         let env = build_env(&layout, &auth, &options);
         let mounts = build_mounts(root.path(), &env);
-        let base_url = run_container(&container_id, &image, &mounts, &env, &auth);
+        let base_url = run_container(
+            &container_id,
+            &image,
+            &mounts,
+            &env,
+            &auth,
+            &options.extra_server_args,
+        );
 
         Self {
             app: DockerApp { base_url },
@@ -343,6 +352,7 @@ fn run_container(
     mounts: &[PathBuf],
     env: &BTreeMap<String, String>,
     auth: &AuthConfig,
+    extra_server_args: &[String],
 ) -> String {
     let mut args = vec![
         "run".to_string(),
@@ -390,6 +400,7 @@ fn run_container(
         }
         None => args.push("--no-token".to_string()),
     }
+    args.extend(extra_server_args.iter().cloned());
 
     let output = Command::new(docker_bin())
         .args(&args)

@@ -14,7 +14,37 @@ use sandbox_agent_opencode_adapter::{AcpDispatch, AcpDispatchResult, AcpPayloadS
 use serde_json::{Number, Value};
 use tokio::sync::{Mutex, RwLock};
 
-const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
+/// Env var for the ACP request timeout. `--acp-request-timeout-ms` overrides it.
+pub const REQUEST_TIMEOUT_ENV: &str = "SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS";
+
+/// How long one ACP request (including a whole `session/prompt` turn, sync or
+/// async) may wait for the agent's response. 2 hours (raised from 120 s, SBA-22)
+/// so long delegated turns are not cut off. Single source of truth for the
+/// default: change it here only.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(7_200_000);
+
+/// Resolves the ACP request timeout: the `--acp-request-timeout-ms` flag wins,
+/// then `SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS`, then [`DEFAULT_REQUEST_TIMEOUT`].
+/// An unparsable or zero env value falls back to the default.
+pub fn resolve_request_timeout(flag_ms: Option<u64>, env: Option<&str>) -> Duration {
+    if let Some(ms) = flag_ms.filter(|ms| *ms > 0) {
+        return Duration::from_millis(ms);
+    }
+    match env {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => {
+                tracing::warn!(
+                    env = REQUEST_TIMEOUT_ENV,
+                    value = raw,
+                    "invalid ACP request timeout; using default"
+                );
+                DEFAULT_REQUEST_TIMEOUT
+            }
+        },
+        None => DEFAULT_REQUEST_TIMEOUT,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AcpProxyRuntime {
@@ -81,7 +111,8 @@ impl ProxyInstance {
 }
 
 impl AcpProxyRuntime {
-    pub fn new(agent_manager: Arc<AgentManager>) -> Self {
+    /// `request_timeout` bounds each ACP request; see [`resolve_request_timeout`].
+    pub fn new(agent_manager: Arc<AgentManager>, request_timeout: Duration) -> Self {
         let require_preinstall = std::env::var("SANDBOX_AGENT_REQUIRE_PREINSTALL")
             .ok()
             .is_some_and(|value| {
@@ -90,11 +121,6 @@ impl AcpProxyRuntime {
                     || trimmed.eq_ignore_ascii_case("true")
                     || trimmed.eq_ignore_ascii_case("yes")
             });
-
-        let request_timeout = duration_from_env_ms(
-            "SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS",
-            Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
-        );
 
         Self {
             inner: Arc::new(AcpProxyRuntimeInner {
@@ -671,22 +697,55 @@ fn annotate_agent_error(agent: AgentId, mut value: Value) -> Value {
     value
 }
 
-fn duration_from_env_ms(key: &str, default: Duration) -> Duration {
-    match std::env::var(key) {
-        Ok(raw) => raw
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .map(Duration::from_millis)
-            .unwrap_or(default),
-        Err(_) => default,
-    }
-}
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_timeout_defaults_without_flag_or_env() {
+        assert_eq!(resolve_request_timeout(None, None), DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(2 * 60 * 60));
+    }
+
+    #[test]
+    fn request_timeout_reads_env() {
+        assert_eq!(
+            resolve_request_timeout(None, Some(" 7500 ")),
+            Duration::from_millis(7500)
+        );
+    }
+
+    #[test]
+    fn request_timeout_invalid_or_zero_env_falls_back_to_default() {
+        for raw in ["", "0", "abc", "-5", "1.5"] {
+            assert_eq!(
+                resolve_request_timeout(None, Some(raw)),
+                DEFAULT_REQUEST_TIMEOUT,
+                "env {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_timeout_resolution_prefers_flag_over_env() {
+        assert_eq!(
+            resolve_request_timeout(Some(1500), Some("60000")),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            resolve_request_timeout(Some(1500), Some("garbage")),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            resolve_request_timeout(Some(1500), None),
+            Duration::from_millis(1500)
+        );
+    }
 }

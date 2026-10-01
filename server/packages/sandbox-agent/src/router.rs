@@ -36,6 +36,10 @@ use tower_http::trace::TraceLayer;
 use tracing::Span;
 use utoipa::{IntoParams, Modify, OpenApi, ToSchema};
 
+pub use crate::acp_proxy_runtime::{
+    resolve_request_timeout, DEFAULT_REQUEST_TIMEOUT as DEFAULT_ACP_REQUEST_TIMEOUT,
+    REQUEST_TIMEOUT_ENV as ACP_REQUEST_TIMEOUT_ENV,
+};
 use crate::acp_proxy_runtime::{AcpProxyRuntime, ProxyPostOutcome};
 use crate::desktop_errors::DesktopProblem;
 use crate::desktop_runtime::DesktopRuntime;
@@ -107,8 +111,24 @@ impl AppState {
         agent_manager: AgentManager,
         branding: BrandingMode,
     ) -> Self {
+        let acp_request_timeout =
+            resolve_request_timeout(None, std::env::var(ACP_REQUEST_TIMEOUT_ENV).ok().as_deref());
+        Self::with_acp_request_timeout(auth, agent_manager, branding, acp_request_timeout)
+    }
+
+    /// Like [`AppState::with_branding`], with an explicit ACP request timeout
+    /// (already resolved from `--acp-request-timeout-ms` / env / default).
+    pub fn with_acp_request_timeout(
+        auth: AuthConfig,
+        agent_manager: AgentManager,
+        branding: BrandingMode,
+        acp_request_timeout: Duration,
+    ) -> Self {
         let agent_manager = Arc::new(agent_manager);
-        let acp_proxy = Arc::new(AcpProxyRuntime::new(agent_manager.clone()));
+        let acp_proxy = Arc::new(AcpProxyRuntime::new(
+            agent_manager.clone(),
+            acp_request_timeout,
+        ));
         let opencode_server_manager = Arc::new(OpenCodeServerManager::new(
             agent_manager.clone(),
             OpenCodeServerManagerConfig {

@@ -13,7 +13,8 @@ mod build_version {
 
 use crate::desktop_install::{install_desktop, DesktopInstallRequest, DesktopPackageManager};
 use crate::router::{
-    build_router_with_state, shutdown_servers, AppState, AuthConfig, BrandingMode,
+    build_router_with_state, resolve_request_timeout, shutdown_servers, AppState, AuthConfig,
+    BrandingMode, ACP_REQUEST_TIMEOUT_ENV,
 };
 use crate::server_logs::ServerLogs;
 use crate::telemetry;
@@ -118,6 +119,15 @@ pub struct ServerArgs {
     /// connections. Overrides SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS. Default 3000.
     #[arg(long = "shutdown-timeout-ms")]
     shutdown_timeout_ms: Option<u64>,
+
+    /// Max time (ms) one agent request, including a whole prompt turn, may wait
+    /// for the agent's response before failing with a timeout. Overrides
+    /// SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS. Default 7200000 (2 hours).
+    #[arg(
+        long = "acp-request-timeout-ms",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    acp_request_timeout_ms: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -467,7 +477,16 @@ fn run_server(cli: &CliConfig, server: &ServerArgs) -> Result<(), CliError> {
 
     let agent_manager = AgentManager::new(default_install_dir())
         .map_err(|err| CliError::Server(err.to_string()))?;
-    let state = Arc::new(AppState::with_branding(auth, agent_manager, branding));
+    let acp_request_timeout = resolve_request_timeout(
+        server.acp_request_timeout_ms,
+        std::env::var(ACP_REQUEST_TIMEOUT_ENV).ok().as_deref(),
+    );
+    let state = Arc::new(AppState::with_acp_request_timeout(
+        auth,
+        agent_manager,
+        branding,
+        acp_request_timeout,
+    ));
     let (mut router, state) = build_router_with_state(state);
 
     let cors = build_cors_layer(server)?;
@@ -1764,6 +1783,42 @@ mod tests {
             Command::Server(args) => assert_eq!(args.shutdown_timeout_ms, Some(1200)),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn server_parses_acp_request_timeout_flag() {
+        let cli = SandboxAgentCli::try_parse_from([
+            "sandbox-agent",
+            "server",
+            "--acp-request-timeout-ms",
+            "7200000",
+        ])
+        .expect("parse server args");
+        match cli.command {
+            Command::Server(args) => assert_eq!(args.acp_request_timeout_ms, Some(7_200_000)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_acp_request_timeout_flag_defaults_to_none() {
+        let cli = SandboxAgentCli::try_parse_from(["sandbox-agent", "server"])
+            .expect("parse server args");
+        match cli.command {
+            Command::Server(args) => assert_eq!(args.acp_request_timeout_ms, None),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_rejects_zero_acp_request_timeout() {
+        let result = SandboxAgentCli::try_parse_from([
+            "sandbox-agent",
+            "server",
+            "--acp-request-timeout-ms",
+            "0",
+        ]);
+        assert!(result.is_err(), "0 ms must be rejected");
     }
 
     fn helper_credentials() -> ExtractedCredentials {

@@ -25,6 +25,11 @@ while IFS= read -r line; do
     continue
   fi
 
+  sleep_s=$(printf '%s\n' "$line" | sed -n 's/.*__stub_sleep_\([0-9][0-9]*\)__.*/\1/p')
+  if [ -n "$sleep_s" ]; then
+    sleep "$sleep_s"
+  fi
+
   if [ -n "$method" ] && [ -n "$id" ]; then
     printf '{{"jsonrpc":"2.0","id":%s,"result":{{"ok":true,"echoedMethod":"%s"}}}}\n' "$id" "$method"
   elif [ -z "$method" ] && [ -n "$id" ]; then
@@ -384,6 +389,160 @@ async fn acp_delete_during_pending_prompt_returns_promptly() {
     assert!(
         !prompt_status.is_success(),
         "pending prompt should fail after DELETE, got {prompt_status}"
+    );
+}
+
+/// Starts a stub-agent server with `SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS` and/or
+/// `--acp-request-timeout-ms` set.
+fn timeout_test_app(env_ms: Option<&str>, flag_ms: Option<&str>) -> TestApp {
+    let mut options = docker_support::TestAppOptions::default();
+    if let Some(ms) = env_ms {
+        options.env.insert(
+            "SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS".to_string(),
+            ms.to_string(),
+        );
+    }
+    if let Some(ms) = flag_ms {
+        options.extra_server_args = vec!["--acp-request-timeout-ms".to_string(), ms.to_string()];
+    }
+    TestApp::with_options(AuthConfig::disabled(), options, |install_dir| {
+        setup_stub_artifacts(install_dir, "codex");
+    })
+}
+
+/// Sends a synchronous prompt and asserts it fails with the timeout problem
+/// after `min..max`.
+async fn assert_sync_prompt_times_out(
+    app: &docker_support::DockerApp,
+    server_id: &str,
+    id: u64,
+    text: &str,
+    min: Duration,
+    max: Duration,
+) {
+    let started = std::time::Instant::now();
+    let (status, _, body) = send_request(
+        app,
+        Method::POST,
+        &format!("/v1/acp/{server_id}"),
+        Some(prompt_payload(id, text)),
+        &[],
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "body: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(parse_json(&body)["type"], "urn:sandbox-agent:error:timeout");
+    assert!(
+        elapsed >= min && elapsed < max,
+        "timeout after {elapsed:?}, expected {min:?}..{max:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_request_timeout_env_is_honored() {
+    let test_app = timeout_test_app(Some("1500"), None);
+    bootstrap_server(&test_app.app, "server-timeout-env", "codex").await;
+    assert_sync_prompt_times_out(
+        &test_app.app,
+        "server-timeout-env",
+        2,
+        "__stub_never_respond__",
+        Duration::from_millis(1400),
+        Duration::from_secs(10),
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_request_timeout_flag_overrides_env() {
+    // The env says 60 s; the flag must win with 2.5 s.
+    let test_app = timeout_test_app(Some("60000"), Some("2500"));
+    bootstrap_server(&test_app.app, "server-timeout-flag", "codex").await;
+
+    // A prompt that finishes under the limit succeeds.
+    let (status, _, body) = send_request(
+        &test_app.app,
+        Method::POST,
+        "/v1/acp/server-timeout-flag",
+        Some(prompt_payload(2, "__stub_sleep_1__")),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        parse_json(&body)["result"]["echoedMethod"],
+        "session/prompt"
+    );
+
+    // A prompt that outlives the limit fails with the timeout problem.
+    assert_sync_prompt_times_out(
+        &test_app.app,
+        "server-timeout-flag",
+        3,
+        "__stub_sleep_8__",
+        Duration::from_millis(2400),
+        Duration::from_secs(8),
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_request_timeout_flag_applies_to_async_prompt() {
+    let test_app = timeout_test_app(Some("60000"), Some("2500"));
+    bootstrap_server(&test_app.app, "server-timeout-async", "codex").await;
+
+    // Under the limit: 202, then the agent's result over SSE.
+    let (status, _, _) = send_request(
+        &test_app.app,
+        Method::POST,
+        "/v1/acp/server-timeout-async",
+        Some(prompt_payload(2, "__stub_sleep_1__")),
+        &[(ASYNC_PROMPT_HEADER, "1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let response = read_sse_event_matching(&test_app.app, "server-timeout-async", 0, |event| {
+        event["id"] == 2 && event.get("method").is_none()
+    })
+    .await;
+    assert_eq!(response["result"]["echoedMethod"], "session/prompt");
+
+    // Over the limit: 202, then a JSON-RPC timeout error with the same id over SSE.
+    let started = std::time::Instant::now();
+    let (status, _, _) = send_request(
+        &test_app.app,
+        Method::POST,
+        "/v1/acp/server-timeout-async",
+        Some(prompt_payload(3, "__stub_sleep_8__")),
+        &[(ASYNC_PROMPT_HEADER, "1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let error_event = read_sse_event_matching(&test_app.app, "server-timeout-async", 0, |event| {
+        event["id"] == 3 && event.get("error").is_some()
+    })
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        error_event["error"]["message"],
+        "timed out waiting for agent response"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(2400) && elapsed < Duration::from_secs(8),
+        "async timeout after {elapsed:?}"
     );
 }
 
