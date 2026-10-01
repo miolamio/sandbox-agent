@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 const CONTAINER_PORT: u16 = 3000;
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const DEFAULT_IMAGE_TAG: &str = "sandbox-agent-test:dev";
+const IMAGE_REPO: &str = "sandbox-agent-test";
 const STANDARD_PATHS: &[&str] = &[
     "/usr/local/sbin",
     "/usr/local/bin",
@@ -186,7 +186,7 @@ fn ensure_test_image() -> String {
         .get_or_init(|| {
             let repo_root = repo_root();
             let image_tag = std::env::var("SANDBOX_AGENT_TEST_IMAGE")
-                .unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_string());
+                .unwrap_or_else(|_| format!("{IMAGE_REPO}:{}", repo_image_suffix(&repo_root)));
             let output = Command::new(docker_bin())
                 .args(["build", "--tag", &image_tag, "--file"])
                 .arg(
@@ -513,6 +513,18 @@ fn unique_container_id() -> String {
         "sandbox-agent-test-{}-{millis}-{counter}",
         std::process::id()
     )
+}
+
+/// Per-checkout image tag suffix (FNV-1a 64 of the repo root path), so runs
+/// from different worktrees never overwrite each other's image. Keep in sync
+/// with `docker_common_software.rs` and `sdks/typescript/tests/helpers/docker.ts`.
+fn repo_image_suffix(repo_root: &Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in repo_root.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn repo_root() -> PathBuf {

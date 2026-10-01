@@ -19,8 +19,8 @@ use tempfile::TempDir;
 
 const CONTAINER_PORT: u16 = 3000;
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const BASE_IMAGE_TAG: &str = "sandbox-agent-test:dev";
-const COMMON_SOFTWARE_IMAGE_TAG: &str = "sandbox-agent-test-common-software:dev";
+const BASE_IMAGE_REPO: &str = "sandbox-agent-test";
+const COMMON_SOFTWARE_IMAGE_REPO: &str = "sandbox-agent-test-common-software";
 
 static IMAGE_TAG: OnceLock<String> = OnceLock::new();
 static DOCKER_BIN: OnceLock<PathBuf> = OnceLock::new();
@@ -95,8 +95,8 @@ impl TestLayout {
 
 fn ensure_base_image() -> String {
     let repo_root = repo_root();
-    let image_tag =
-        std::env::var("SANDBOX_AGENT_TEST_IMAGE").unwrap_or_else(|_| BASE_IMAGE_TAG.to_string());
+    let image_tag = std::env::var("SANDBOX_AGENT_TEST_IMAGE")
+        .unwrap_or_else(|_| format!("{BASE_IMAGE_REPO}:{}", repo_image_suffix(&repo_root)));
     let output = Command::new(docker_bin())
         .args(["build", "--tag", &image_tag, "--file"])
         .arg(
@@ -123,7 +123,12 @@ fn ensure_common_software_image() -> String {
             let base_image = ensure_base_image();
             let repo_root = repo_root();
             let image_tag = std::env::var("SANDBOX_AGENT_TEST_COMMON_SOFTWARE_IMAGE")
-                .unwrap_or_else(|_| COMMON_SOFTWARE_IMAGE_TAG.to_string());
+                .unwrap_or_else(|_| {
+                    format!(
+                        "{COMMON_SOFTWARE_IMAGE_REPO}:{}",
+                        repo_image_suffix(&repo_root)
+                    )
+                });
             let output = Command::new(docker_bin())
                 .args([
                     "build",
@@ -296,6 +301,17 @@ fn unique_container_id() -> String {
         "sandbox-agent-common-sw-{}-{millis}-{counter}",
         std::process::id()
     )
+}
+
+/// Same per-checkout tag suffix as `repo_image_suffix` in support/docker.rs
+/// (duplicated because the two modules are compiled into separate test binaries).
+fn repo_image_suffix(repo_root: &Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in repo_root.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn repo_root() -> PathBuf {

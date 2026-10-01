@@ -82,6 +82,9 @@ pnpm --filter sandbox-agent generate
 
 - Docker-backed Rust and TypeScript tests build `docker/test-agent/Dockerfile` directly in-process and cache the image tag only in memory (`OnceLock` in Rust, module-level variable in TypeScript).
 - Do not add cross-process image-build scripts unless there is a concrete need for them.
+- The default image tag is per checkout: `sandbox-agent-test:<fnv1a64(repo root path)>` (common-software: `sandbox-agent-test-common-software:<same>`), so parallel runs from different worktrees never overwrite each other's image. Rust (`tests/support/docker.rs`, `docker_common_software.rs`) and TS (`sdks/typescript/tests/helpers/docker.ts`) compute the same tag; keep the hash in sync. `SANDBOX_AGENT_TEST_IMAGE` still overrides it. Old per-worktree images pile up; remove them with `docker images sandbox-agent-test` + `docker rmi`.
+- `docker/test-agent/Dockerfile` shares one cargo target cache mount (`id=sandbox-agent-test-target`, `sharing=locked`) across all checkouts. Cargo checks workspace crates by mtime and `COPY` keeps host mtimes, so the build `touch`es all copied sources first: workspace crates always rebuild, dependencies stay cached. Do not drop the `touch` or the lock, or one worktree can link another worktree's stale crates.
+- `Cargo.lock` is gitignored, so the Dockerfile copies it with a glob (`Cargo.lock*`). Without a lock, cargo resolves one in the build, limited to versions compatible with the image's rustc (`CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback`).
 
 ## Common Software Sync
 

@@ -1,7 +1,10 @@
 FROM rust:1.88.0-bookworm AS builder
 WORKDIR /build
 
-COPY Cargo.toml Cargo.lock ./
+# Cargo.lock is gitignored, so a fresh worktree may not have one. The glob
+# keeps the COPY valid either way; without a lock, cargo resolves one in the
+# build and the resolver env below picks versions that build on this rustc.
+COPY Cargo.toml Cargo.lock* ./
 COPY server/ ./server/
 COPY gigacode/ ./gigacode/
 COPY resources/agent-schemas/artifacts/ ./resources/agent-schemas/artifacts/
@@ -9,10 +12,18 @@ COPY scripts/agent-configs/ ./scripts/agent-configs/
 COPY scripts/audit-acp-deps/ ./scripts/audit-acp-deps/
 
 ENV SANDBOX_AGENT_SKIP_INSPECTOR=1
+ENV CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback
 
+# The target cache is shared by every checkout (worktrees included). Cargo
+# decides freshness of workspace crates by mtime, and COPY keeps host mtimes,
+# so a checkout whose sources are older than another checkout's cached
+# artifacts would silently link stale crates. Touching the sources first makes
+# every workspace crate rebuild (dependencies stay cached); sharing=locked
+# serializes concurrent builds so one cannot swap target/ under another.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
+    --mount=type=cache,id=sandbox-agent-test-target,sharing=locked,target=/build/target \
+    find . -path ./target -prune -o -type f -exec touch {} + && \
     cargo build -p sandbox-agent --release && \
     cp target/release/sandbox-agent /sandbox-agent
 

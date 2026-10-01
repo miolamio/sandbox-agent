@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -7,7 +7,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "../../../..");
 const CONTAINER_PORT = 3000;
 const DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const DEFAULT_IMAGE_TAG = "sandbox-agent-test:dev";
+const IMAGE_REPO = "sandbox-agent-test";
 const STANDARD_PATHS = new Set(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]);
 
 let cachedImage: string | undefined;
@@ -150,12 +150,26 @@ export async function startDockerSandboxAgent(layout: TestLayout, options: Docke
   }
 }
 
+/**
+ * Per-checkout image tag suffix (FNV-1a 64 of the repo root path), so runs from
+ * different worktrees never overwrite each other's image. Matches
+ * `repo_image_suffix` in server/packages/sandbox-agent/tests/support/docker.rs.
+ */
+function repoImageSuffix(repoRoot: string): string {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of Buffer.from(repoRoot, "utf8")) {
+    hash ^= BigInt(byte);
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
 function ensureImage(): string {
   if (cachedImage) {
     return cachedImage;
   }
 
-  cachedImage = process.env.SANDBOX_AGENT_TEST_IMAGE ?? DEFAULT_IMAGE_TAG;
+  cachedImage = process.env.SANDBOX_AGENT_TEST_IMAGE ?? `${IMAGE_REPO}:${repoImageSuffix(realpathSync(REPO_ROOT))}`;
   execFileSync("docker", ["build", "--tag", cachedImage, "--file", resolve(REPO_ROOT, "docker/test-agent/Dockerfile"), REPO_ROOT], {
     cwd: REPO_ROOT,
     stdio: ["ignore", "ignore", "pipe"],
