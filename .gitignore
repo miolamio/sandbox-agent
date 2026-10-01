@@ -60,3 +60,6 @@ sdks/cli/platforms/*/bin/
 foundry/packages/desktop/frontend-dist/
 foundry/packages/desktop/src-tauri/sidecars/
 .context/
+
+# Local working notes (never committed)
+.dev/

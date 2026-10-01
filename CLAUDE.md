@@ -1,4 +1,45 @@
-# Instructions
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+Subdirectory CLAUDE.md files carry area-specific rules: `server/`, `sdks/`, `frontend/`, `examples/`, `foundry/`. Read the relevant one before working in that area.
+
+## Commands
+
+Mixed Rust (Cargo workspace: `server/packages/*`, `gigacode`) + TypeScript (pnpm 9 + Turborepo) monorepo. Task runner is `just`.
+
+```bash
+just build                      # cargo build -p sandbox-agent
+just test                       # cargo test --all-targets
+just check                      # cargo check + cargo fmt --check + pnpm typecheck
+just fmt                        # cargo fmt --all
+just run-sa server              # run the server from source (skips inspector embed)
+just dev                        # daemon + inspector dev server
+pnpm build | pnpm typecheck     # all TS packages via turbo
+pnpm --filter sandbox-agent test   # TS SDK tests (vitest, needs real server)
+
+# Single Rust integration test file / single test
+cargo test -p sandbox-agent --test v1_api
+cargo test -p sandbox-agent --test v1_api <test_name>
+
+# Regenerate OpenAPI spec + TS types after HTTP contract changes
+pnpm --filter sandbox-agent generate
+```
+
+- Set `SANDBOX_AGENT_SKIP_INSPECTOR=1` for Rust builds unless the inspector must be embedded. `build.rs` embeds `frontend/packages/inspector/dist` when it exists; `just install` builds it first.
+- HTTP snapshot tests use `insta` (`server/packages/sandbox-agent/tests/http/snapshots`).
+- Pre-commit (lefthook) runs `biome format` on TS/JSON and `rustfmt` on staged files. Biome line width is 160.
+
+## Architecture
+
+- **Server** (`server/packages/sandbox-agent`): one Rust binary for the HTTP server, daemon, and CLI. `router.rs` defines the axum router: `/v1/*` (health, agents, fs, processes, desktop, config/mcp, config/skills, and ACP proxy at `/v1/acp/:server_id`), `/opencode/*` (OpenCode-compat adapter), and the inspector UI (`ui.rs`). Agent/session traffic goes over ACP JSON-RPC and is proxied to per-agent ACP processes by `acp_proxy_runtime.rs`. Everything else is a Sandbox Agent HTTP API.
+- **Supporting crates**: `agent-management` (installing and launching agents, credentials), `agent-credentials`, `acp-http-adapter`, `opencode-adapter` + `opencode-server-manager` (the `/opencode` surface Gigacode uses), `openapi-gen` (writes `docs/openapi.json` from utoipa annotations), and `error` (problem+json errors).
+- **Gigacode** (`gigacode/`): a separate Rust binary/client for the OpenCode-compatible surface.
+- **SDKs** (`sdks/`): `acp-http-client` (pure ACP over HTTP), `typescript` (the `sandbox-agent` npm SDK; `src/generated/openapi.ts` is generated from `docs/openapi.json`), `react` (unstyled shared components), `persist-*` (session persistence drivers), and `cli`/`gigacode` (npm wrappers that ship platform binaries).
+- **Frontend**: `frontend/packages/inspector` (debug UI served at `/ui/`) and `frontend/packages/website` (docs site; content lives in `docs/*.mdx`).
+- **Foundry** (`foundry/`): a separate product in the same pnpm workspace with its own CLAUDE.md and `just foundry-*` recipes.
+- **Examples** (`examples/*`): one per sandbox provider. Use `SANDBOX_AGENT_DEV=1` to build the server from local source through `docker/runtime/Dockerfile.full`.
+- The `mock` agent (`sandbox-agent mock-agent-process`) gives deterministic behavior for Rust and TS tests.
 
 ## Naming and Ownership
 
