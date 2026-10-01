@@ -4,7 +4,8 @@
 #
 # KEEP IN SYNC with docs/common-software.mdx
 
-ARG BASE_IMAGE=sandbox-agent-test:dev
+# BASE_IMAGE is required: the test passes the per-worktree sandbox-agent-test:<hash> tag.
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 USER root
