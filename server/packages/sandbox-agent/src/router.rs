@@ -46,6 +46,7 @@ use crate::process_runtime::{
     ProcessStartSpec, ProcessStatus, ProcessStream, RunSpec,
 };
 use crate::ui;
+use acp_http_adapter::process::PostMode;
 
 mod support;
 mod types;
@@ -3136,12 +3137,13 @@ async fn get_v1_acp_servers(
     tag = "v1",
     params(
         ("server_id" = String, Path, description = "Client-defined ACP server id"),
-        ("agent" = Option<String>, Query, description = "Agent id required for first POST")
+        ("agent" = Option<String>, Query, description = "Agent id required for first POST"),
+        ("x-sandboxagent-async-prompt" = Option<String>, Header, description = "Set to `1` to receive `session/prompt` responses over SSE (POST returns 202)")
     ),
     request_body = AcpEnvelope,
     responses(
         (status = 200, description = "JSON-RPC response envelope", body = AcpEnvelope),
-        (status = 202, description = "JSON-RPC notification accepted"),
+        (status = 202, description = "JSON-RPC notification accepted, or (with `x-sandboxagent-async-prompt: 1`) `session/prompt` accepted with its response delivered over SSE"),
         (status = 406, description = "Client does not accept JSON responses", body = ProblemDetails),
         (status = 415, description = "Unsupported media type", body = ProblemDetails),
         (status = 400, description = "Invalid ACP envelope", body = ProblemDetails),
@@ -3186,9 +3188,15 @@ async fn post_v1_acp(
         None => None,
     };
 
+    let mode = if async_prompt_requested(&headers) {
+        PostMode::AsyncPrompt
+    } else {
+        PostMode::Sync
+    };
+
     match state
         .acp_proxy()
-        .post(&server_id, bootstrap_agent, payload)
+        .post(&server_id, bootstrap_agent, payload, mode)
         .await?
     {
         ProxyPostOutcome::Response(value) => Ok((StatusCode::OK, Json(value)).into_response()),

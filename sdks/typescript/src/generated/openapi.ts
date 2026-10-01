@@ -1075,6 +1075,10 @@ export interface operations {
         /** @description Agent id required for first POST */
         agent?: string | null;
       };
+      header?: {
+        /** @description Set to `1` to receive `session/prompt` responses over SSE (POST returns 202) */
+        "x-sandboxagent-async-prompt"?: string | null;
+      };
       path: {
         /** @description Client-defined ACP server id */
         server_id: string;
@@ -1092,7 +1096,7 @@ export interface operations {
           "application/json": components["schemas"]["AcpEnvelope"];
         };
       };
-      /** @description JSON-RPC notification accepted */
+      /** @description JSON-RPC notification accepted, or (with `x-sandboxagent-async-prompt: 1`) `session/prompt` accepted with its response delivered over SSE */
       202: {
         content: never;
       };

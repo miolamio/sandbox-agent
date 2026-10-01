@@ -18,6 +18,26 @@ Update this file continuously during the migration.
 
 ## Entries
 
+- Date: 2026-06-22
+- Area: Agent process request timeout
+- Issue: The process exit watcher held the child-process mutex across an unbounded asynchronous wait. Request timeout and shutdown paths blocked on that mutex after their own timeout fired.
+- Impact: A timed-out prompt remained open until the agent process exited, potentially for hours, and runtime shutdown could also hang.
+- Proposed direction: Poll process status with short, non-blocking `try_wait` calls so timeout and shutdown paths can acquire the child-process mutex.
+- Decision: Accepted and implemented with a regression test covering a live agent that never responds.
+- Owner: Unassigned.
+- Status: resolved
+- Links: `server/packages/acp-http-adapter/src/process.rs`
+
+- Date: 2026-10-01
+- Area: Long-running ACP requests over streamable HTTP (async prompt, opt-in)
+- Issue: `session/prompt` kept its POST open until the agent completed the turn, so long turns (over ~5 min) failed on client/proxy response-header timeouts (Node/Undici, reverse proxies) even though an SSE response channel already exists. A failed detached POST in `acp-http-client` also closed the shared SSE stream for every request.
+- Impact: Long agent turns lost their result; one failed POST broke the whole client connection.
+- Proposed direction: Upstream PR #308 made every `session/prompt` return `202` and deliver its result over SSE. That silently changes the `/v1/acp` contract for Gigacode, the `/opencode/*` adapter (`AcpDispatch`), and third-party clients that read the POST body.
+- Decision: Accepted as opt-in. `POST /v1/acp/{server_id}` with header `x-sandboxagent-async-prompt: 1` (or `true`) returns `202` for `session/prompt` once it is written to the agent; the correlated result, the request timeout (`-32603 timed out waiting for agent response`), and process exit/`DELETE` (`-32603 agent process stopped before responding`) are delivered on SSE with the same `id`. Without the header the contract is unchanged (`200` + body); other methods always stay synchronous; `AcpDispatch` (`/opencode/*`) always uses the synchronous mode. Pending synchronous requests now wake on process exit/shutdown, which also fixes `DELETE` hanging behind an in-flight prompt (SBA-6). Late responses after timeout/shutdown are no longer re-broadcast. `acp-http-client` sends the header only while its SSE response is open, isolates detached POST failures to the matching request id (PR #306), and reconnects SSE with `Last-Event-ID` without waiting for another POST (PR #308). SSE errors carry the same agent diagnostics as POST errors. No server flag was added; the header is the only switch.
+- Owner: Unassigned.
+- Status: resolved
+- Links: `server/packages/acp-http-adapter/src/process.rs`, `server/packages/sandbox-agent/src/acp_proxy_runtime.rs`, `server/packages/sandbox-agent/src/router.rs`, `sdks/acp-http-client/src/index.ts`, upstream PRs #306 and #308, upstream issue #305 (closed not planned)
+
 - Date: 2026-02-10
 - Area: Agent process availability
 - Issue: Amp does not have a confirmed official ACP agent process in current ACP docs/research.

@@ -22,3 +22,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 reqwest.workspace = true
 bytes = "1.10"
+tempfile.workspace = true

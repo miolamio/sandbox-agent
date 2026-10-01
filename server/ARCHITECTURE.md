@@ -118,6 +118,7 @@ DELETE /v1/acp/{serverId}         Close ACP server
 - ACP envelopes are stored in memory per server and assigned a monotonically increasing SSE `id`.
 - `GET /v1/acp/{serverId}` replays buffered envelopes and then streams live updates.
 - Clients continue turns by POSTing ACP JSON-RPC requests to the same server id.
+- Async prompt (opt-in): a `session/prompt` POST with header `x-sandboxagent-async-prompt: 1` returns `202 Accepted` once the request reaches the agent. Its JSON-RPC result, request-timeout error, or "agent process stopped" error (process exit or `DELETE`) arrives on the SSE stream with the same `id`. Without the header the POST returns `200` with the response body. Clients should only opt in while an SSE stream is open (or reconnect with `Last-Event-ID`). `/opencode/*` always uses the synchronous mode.
 
 When a message is sent:
 

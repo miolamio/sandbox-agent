@@ -536,6 +536,19 @@ pub(super) fn content_type_is(headers: &HeaderMap, expected: &str) -> bool {
     media_type_eq(value, expected)
 }
 
+/// Opt-in header for asynchronous `session/prompt` delivery over SSE.
+pub(super) const ASYNC_PROMPT_HEADER: &str = "x-sandboxagent-async-prompt";
+
+/// True when the client opted in to receive `session/prompt` responses over SSE
+/// (`x-sandboxagent-async-prompt: 1` or `true`).
+pub(super) fn async_prompt_requested(headers: &HeaderMap) -> bool {
+    headers
+        .get(ASYNC_PROMPT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 pub(super) fn accept_allows(headers: &HeaderMap, expected: &str) -> bool {
     let values = headers.get_all(header::ACCEPT);
     if values.iter().next().is_none() {

@@ -21,6 +21,10 @@ while IFS= read -r line; do
     printf '{{"jsonrpc":"2.0","method":"server/echo","params":{{"method":"%s"}}}}\n' "$method"
   fi
 
+  if printf '%s\n' "$line" | grep -q '__stub_never_respond__'; then
+    continue
+  fi
+
   if [ -n "$method" ] && [ -n "$id" ]; then
     printf '{{"jsonrpc":"2.0","id":%s,"result":{{"ok":true,"echoedMethod":"%s"}}}}\n' "$id" "$method"
   elif [ -z "$method" ] && [ -n "$id" ]; then
@@ -169,6 +173,178 @@ async fn acp_round_trip_and_replay() {
         read_first_sse_data_with_last_id(&test_app.app, "server-replay", first_event_id).await;
     let second_event_id = parse_sse_event_id(&second_chunk);
     assert!(second_event_id > first_event_id);
+}
+
+const ASYNC_PROMPT_HEADER: &str = "x-sandboxagent-async-prompt";
+
+fn prompt_payload(id: u64, text: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s-1",
+            "prompt": [{"type": "text", "text": text}]
+        }
+    })
+}
+
+/// Reads SSE events (replaying from `last_event_id`) until one matches `predicate`.
+async fn read_sse_event_matching(
+    app: &docker_support::DockerApp,
+    server_id: &str,
+    last_event_id: u64,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(app.http_url(&format!("/v1/acp/{server_id}")))
+        .header("accept", "text/event-stream")
+        .header("last-event-id", last_event_id.to_string())
+        .send()
+        .await
+        .expect("sse response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut stream = response.bytes_stream();
+    tokio::time::timeout(Duration::from_secs(5), async move {
+        let mut buffer = String::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.expect("stream chunk");
+            buffer.push_str(&String::from_utf8_lossy(&bytes).replace("\r\n", "\n"));
+            while let Some(end) = buffer.find("\n\n") {
+                let event = buffer[..end].to_string();
+                buffer.drain(..end + 2);
+                if !event.contains("data:") {
+                    continue;
+                }
+                let payload = parse_sse_data(&event);
+                if predicate(&payload) {
+                    return payload;
+                }
+            }
+        }
+        panic!("SSE stream ended before matching event")
+    })
+    .await
+    .expect("timed out waiting for matching sse event")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_async_prompt_opt_in_returns_202_and_delivers_response_over_sse() {
+    let test_app = TestApp::with_setup(AuthConfig::disabled(), |install_dir| {
+        setup_stub_artifacts(install_dir, "codex");
+    });
+
+    bootstrap_server(&test_app.app, "server-async", "codex").await;
+
+    let (status, _, body) = send_request(
+        &test_app.app,
+        Method::POST,
+        "/v1/acp/server-async",
+        Some(prompt_payload(2, "hello")),
+        &[(ASYNC_PROMPT_HEADER, "1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(body.is_empty(), "202 body should be empty: {body:?}");
+
+    let response = read_sse_event_matching(&test_app.app, "server-async", 0, |event| {
+        event["id"] == 2 && event.get("method").is_none()
+    })
+    .await;
+    assert_eq!(response["result"]["echoedMethod"], "session/prompt");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_async_prompt_delete_delivers_error_over_sse() {
+    let test_app = TestApp::with_setup(AuthConfig::disabled(), |install_dir| {
+        setup_stub_artifacts(install_dir, "codex");
+    });
+
+    bootstrap_server(&test_app.app, "server-async-delete", "codex").await;
+
+    let (status, _, _) = send_request(
+        &test_app.app,
+        Method::POST,
+        "/v1/acp/server-async-delete",
+        Some(prompt_payload(3, "__stub_never_respond__")),
+        &[(ASYNC_PROMPT_HEADER, "1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // Subscribe before deleting so the terminal error is observed live.
+    let reader = read_sse_event_matching(&test_app.app, "server-async-delete", 0, |event| {
+        event["id"] == 3 && event.get("error").is_some()
+    });
+    let deleter = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        send_request(
+            &test_app.app,
+            Method::DELETE,
+            "/v1/acp/server-async-delete",
+            None,
+            &[],
+        )
+        .await
+    };
+    let (error_event, (status, _, _)) = tokio::join!(reader, deleter);
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        error_event["error"]["message"],
+        "agent process stopped before responding"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_delete_during_pending_prompt_returns_promptly() {
+    let test_app = TestApp::with_setup(AuthConfig::disabled(), |install_dir| {
+        setup_stub_artifacts(install_dir, "codex");
+    });
+
+    bootstrap_server(&test_app.app, "server-delete-pending", "codex").await;
+
+    let prompt = send_request(
+        &test_app.app,
+        Method::POST,
+        "/v1/acp/server-delete-pending",
+        Some(prompt_payload(4, "__stub_never_respond__")),
+        &[],
+    );
+    let deleter = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        let (status, _, _) = send_request(
+            &test_app.app,
+            Method::DELETE,
+            "/v1/acp/server-delete-pending",
+            None,
+            &[],
+        )
+        .await;
+        (status, started.elapsed())
+    };
+
+    let ((prompt_status, _, _), (delete_status, delete_elapsed)) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(prompt, deleter)
+        })
+        .await
+        .expect("DELETE and pending prompt should both complete");
+
+    assert_eq!(delete_status, StatusCode::NO_CONTENT);
+    assert!(
+        delete_elapsed < Duration::from_secs(5),
+        "DELETE took {delete_elapsed:?}"
+    );
+    assert!(
+        !prompt_status.is_success(),
+        "pending prompt should fail after DELETE, got {prompt_status}"
+    );
 }
 
 #[cfg(unix)]

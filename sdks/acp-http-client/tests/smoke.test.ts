@@ -181,4 +181,211 @@ describe("AcpHttpClient integration", () => {
 
     await client.disconnect();
   });
+
+  it("keeps the SSE connection usable after a request POST fails", async () => {
+    const serverId = `acp-http-client-post-failure-${Date.now().toString(36)}`;
+    let failNextPrompt = true;
+    const faultInjectingFetch: typeof fetch = async (input, init) => {
+      if (failNextPrompt && init?.method === "POST" && typeof init.body === "string") {
+        const envelope = JSON.parse(init.body) as { method?: string };
+        if (envelope.method === "session/prompt") {
+          failNextPrompt = false;
+          throw new TypeError("simulated request POST failure");
+        }
+      }
+      return globalThis.fetch(input, init);
+    };
+
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: faultInjectingFetch,
+      transport: {
+        path: `/v1/acp/${encodeURIComponent(serverId)}`,
+        bootstrapQuery: { agent: "mock" },
+      },
+    });
+
+    await client.initialize();
+    const session = await client.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+
+    await expect(
+      client.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "fail this request" }],
+      }),
+    ).rejects.toThrow("simulated request POST failure");
+
+    const prompt = await client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "connection still works" }],
+    });
+    expect(prompt.stopReason).toBe("end_turn");
+
+    await client.disconnect();
+  });
+
+  it("reconnects SSE without another POST while a prompt is in flight", async () => {
+    const serverId = `acp-http-client-reconnect-${Date.now().toString(36)}`;
+    let remainingSseFailures = 3;
+    let sseConnected = false;
+    let postCount = 0;
+    const promptStatuses: number[] = [];
+    const reconnectingFetch: typeof fetch = async (input, init) => {
+      if (init?.method === "GET" && remainingSseFailures > 0) {
+        remainingSseFailures -= 1;
+        throw new TypeError("simulated SSE connection failure");
+      }
+      if (init?.method === "POST") {
+        postCount += 1;
+      }
+      const response = await globalThis.fetch(input, init);
+      if (init?.method === "GET" && response.ok) {
+        sseConnected = true;
+      }
+      if (init?.method === "POST" && typeof init.body === "string" && (JSON.parse(init.body) as { method?: string }).method === "session/prompt") {
+        promptStatuses.push(response.status);
+      }
+      return response;
+    };
+
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: reconnectingFetch,
+      transport: {
+        path: `/v1/acp/${encodeURIComponent(serverId)}`,
+        bootstrapQuery: { agent: "mock" },
+      },
+    });
+
+    await client.initialize();
+    const session = await client.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+
+    // The SSE loop must recover from repeated failures on its own, without
+    // waiting for another POST to restart it.
+    const postsBeforeReconnect = postCount;
+    await waitFor(() => (sseConnected ? true : undefined));
+    expect(remainingSseFailures).toBe(0);
+    expect(postCount).toBe(postsBeforeReconnect);
+    await sleep(25);
+
+    // With the stream restored, the prompt result is delivered over SSE.
+    const prompt = await client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "reconnect the event stream" }],
+    });
+
+    expect(prompt.stopReason).toBe("end_turn");
+    await waitFor(() => (promptStatuses.length > 0 ? true : undefined));
+    expect(promptStatuses).toEqual([202]);
+
+    await client.disconnect();
+  });
+
+  it("opts in to async prompt delivery over SSE when the event stream is connected", async () => {
+    const serverId = `acp-http-client-async-prompt-${Date.now().toString(36)}`;
+    const promptPosts: Array<{ asyncHeader: string | null; status: number }> = [];
+    let sseConnected = false;
+    const recordingFetch: typeof fetch = async (input, init) => {
+      const response = await globalThis.fetch(input, init);
+      if (init?.method === "GET" && response.ok) {
+        sseConnected = true;
+      }
+      if (init?.method === "POST" && typeof init.body === "string") {
+        const envelope = JSON.parse(init.body) as { method?: string };
+        if (envelope.method === "session/prompt") {
+          promptPosts.push({
+            asyncHeader: new Headers(init.headers).get("x-sandboxagent-async-prompt"),
+            status: response.status,
+          });
+        }
+      }
+      return response;
+    };
+
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: recordingFetch,
+      transport: {
+        path: `/v1/acp/${encodeURIComponent(serverId)}`,
+        bootstrapQuery: { agent: "mock" },
+      },
+    });
+
+    await client.initialize();
+    const session = await client.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+    // Wait until the SSE stream is established before prompting.
+    await waitFor(() => (sseConnected ? true : undefined));
+    await sleep(25);
+
+    const prompt = await client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "deliver over sse" }],
+    });
+
+    expect(prompt.stopReason).toBe("end_turn");
+    // The response can arrive over SSE before the POST itself settles.
+    await waitFor(() => (promptPosts.length > 0 ? true : undefined));
+    expect(promptPosts).toEqual([{ asyncHeader: "1", status: 202 }]);
+
+    await client.disconnect();
+  });
+
+  it("keeps synchronous prompt delivery when the event stream is unavailable", async () => {
+    const serverId = `acp-http-client-sync-prompt-${Date.now().toString(36)}`;
+    const promptPosts: Array<{ asyncHeader: string | null; status: number }> = [];
+    const noSseFetch: typeof fetch = async (input, init) => {
+      if (init?.method === "GET") {
+        throw new TypeError("simulated SSE outage");
+      }
+      const response = await globalThis.fetch(input, init);
+      if (init?.method === "POST" && typeof init.body === "string") {
+        const envelope = JSON.parse(init.body) as { method?: string };
+        if (envelope.method === "session/prompt") {
+          promptPosts.push({
+            asyncHeader: new Headers(init.headers).get("x-sandboxagent-async-prompt"),
+            status: response.status,
+          });
+        }
+      }
+      return response;
+    };
+
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: noSseFetch,
+      transport: {
+        path: `/v1/acp/${encodeURIComponent(serverId)}`,
+        bootstrapQuery: { agent: "mock" },
+      },
+    });
+
+    await client.initialize();
+    const session = await client.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+    const prompt = await client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "deliver inline" }],
+    });
+
+    expect(prompt.stopReason).toBe("end_turn");
+    await waitFor(() => (promptPosts.length > 0 ? true : undefined));
+    expect(promptPosts).toEqual([{ asyncHeader: null, status: 200 }]);
+
+    await client.disconnect();
+  });
 });

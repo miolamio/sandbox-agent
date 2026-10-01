@@ -4,10 +4,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use acp_http_adapter::process::{AdapterError, AdapterRuntime, PostOutcome};
+use acp_http_adapter::process::{AdapterError, AdapterRuntime, PostMode, PostOutcome};
 use acp_http_adapter::registry::LaunchSpec;
 use axum::response::sse::Event;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use sandbox_agent_agent_management::agents::{AgentId, AgentManager, InstallOptions};
 use sandbox_agent_error::SandboxError;
 use sandbox_agent_opencode_adapter::{AcpDispatch, AcpDispatchResult, AcpPayloadStream};
@@ -54,6 +54,25 @@ pub struct AcpServerInstanceInfo {
 
 pub type PinBoxSseStream =
     std::pin::Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>;
+type PinBoxPayloadStream = std::pin::Pin<Box<dyn Stream<Item = (u64, Value)> + Send>>;
+
+impl ProxyInstance {
+    /// Stream payloads with the same error diagnostics that POST responses get,
+    /// so errors delivered only over SSE (async prompts) keep their context.
+    async fn annotated_payload_stream(&self, last_event_id: Option<u64>) -> PinBoxPayloadStream {
+        let stream = self.runtime.clone().payload_stream(last_event_id).await;
+        let agent = self.agent;
+        let runtime = self.runtime.clone();
+        Box::pin(stream.then(move |(sequence, value)| {
+            let runtime = runtime.clone();
+            async move {
+                let value = annotate_agent_error(agent, value);
+                let value = annotate_agent_stderr(value, &runtime).await;
+                (sequence, value)
+            }
+        }))
+    }
+}
 
 impl AcpProxyRuntime {
     pub fn new(agent_manager: Arc<AgentManager>) -> Self {
@@ -105,6 +124,7 @@ impl AcpProxyRuntime {
         server_id: &str,
         bootstrap_agent: Option<AgentId>,
         payload: Value,
+        mode: PostMode,
     ) -> Result<ProxyPostOutcome, SandboxError> {
         let method: String = payload
             .get("method")
@@ -136,7 +156,7 @@ impl AcpProxyRuntime {
 
         let payload = normalize_payload_for_agent(instance.agent, payload);
 
-        match instance.runtime.post(payload).await {
+        match instance.runtime.post_with_mode(payload, mode).await {
             Ok(PostOutcome::Response(value)) => {
                 let total_ms = start.elapsed().as_millis() as u64;
                 tracing::info!(
@@ -179,7 +199,16 @@ impl AcpProxyRuntime {
         last_event_id: Option<u64>,
     ) -> Result<PinBoxSseStream, SandboxError> {
         let instance = self.get_instance(server_id).await?;
-        let stream = instance.runtime.clone().sse_stream(last_event_id).await;
+        let stream =
+            instance
+                .annotated_payload_stream(last_event_id)
+                .await
+                .map(|(sequence, payload)| {
+                    Ok(Event::default()
+                        .event("message")
+                        .id(sequence.to_string())
+                        .data(payload.to_string()))
+                });
         Ok(Box::pin(stream))
     }
 
@@ -442,7 +471,9 @@ impl AcpDispatch for AcpProxyRuntime {
         let server_id = server_id.to_string();
         let agent = bootstrap_agent.and_then(AgentId::parse);
         Box::pin(async move {
-            match self.post(&server_id, agent, payload).await {
+            // The OpenCode-compat layer waits on the dispatch result, so it always
+            // uses the synchronous request/response contract.
+            match self.post(&server_id, agent, payload, PostMode::Sync).await {
                 Ok(ProxyPostOutcome::Response(value)) => Ok(AcpDispatchResult::Response(value)),
                 Ok(ProxyPostOutcome::Accepted) => Ok(AcpDispatchResult::Accepted),
                 Err(err) => Err(err.to_string()),
@@ -461,7 +492,10 @@ impl AcpDispatch for AcpProxyRuntime {
                 .get_instance(&server_id)
                 .await
                 .map_err(|e| e.to_string())?;
-            let stream = instance.runtime.clone().value_stream(last_event_id).await;
+            let stream = instance
+                .annotated_payload_stream(last_event_id)
+                .await
+                .map(|(_sequence, payload)| payload);
             Ok(Box::pin(stream) as AcpPayloadStream)
         })
     }

@@ -267,6 +267,9 @@ class StreamableHttpAcpTransport {
   private closed = false;
   private closingPromise: Promise<void> | null = null;
   private postedOnce = false;
+  // True while an SSE response is open. Only then is it safe to ask the server
+  // to deliver prompt responses exclusively over SSE.
+  private sseConnected = false;
   private readonly seenResponseIds = new Set<string>();
   private readonly seenResponseIdOrder: string[] = [];
 
@@ -371,6 +374,12 @@ class StreamableHttpAcpTransport {
       Accept: "application/json",
     });
 
+    if (this.sseConnected && isAsyncPromptRequest(message)) {
+      // The server acknowledges with 202 and delivers the result over SSE, so a
+      // long-running prompt does not depend on HTTP response-header timeouts.
+      headers.set(ASYNC_PROMPT_HEADER, "1");
+    }
+
     const url = this.buildUrl(this.bootstrapQueryIfNeeded());
     this.postedOnce = true;
     this.ensureSseLoop();
@@ -404,8 +413,22 @@ class StreamableHttpAcpTransport {
       await response.text().catch(() => {});
     } catch (error) {
       console.error("ACP write error:", error);
-      this.failReadable(error);
+      this.handleDetachedRequestError(message, error);
     }
+  }
+
+  private handleDetachedRequestError(message: AnyMessage, error: unknown): void {
+    const id = requestIdFromMessage(message);
+    if (id === undefined) {
+      this.failReadable(error);
+      return;
+    }
+
+    this.pushInbound({
+      jsonrpc: "2.0",
+      id,
+      error: toRpcError(error),
+    } as AnyMessage);
   }
 
   private ensureSseLoop(): void {
@@ -444,7 +467,12 @@ class StreamableHttpAcpTransport {
           throw new Error("SSE stream is not readable in this environment.");
         }
 
-        await this.consumeSse(response.body);
+        this.sseConnected = true;
+        try {
+          await this.consumeSse(response.body);
+        } finally {
+          this.sseConnected = false;
+        }
 
         if (!this.closed) {
           await delay(150);
@@ -454,9 +482,9 @@ class StreamableHttpAcpTransport {
           return;
         }
 
-        // SSE failure is non-fatal: the POST request/response flow still works.
-        // Exiting the loop allows ensureSseLoop() to restart it on the next POST.
-        return;
+        // Prompt responses can be delivered exclusively over SSE after a 202.
+        // Reconnect without waiting for another POST, replaying from Last-Event-ID.
+        await delay(150);
       }
     }
   }
@@ -675,6 +703,48 @@ function responseEnvelopeId(message: AnyMessage): string | null {
     return null;
   }
   return String(id);
+}
+
+const ASYNC_PROMPT_HEADER = "x-sandboxagent-async-prompt";
+
+function isAsyncPromptRequest(message: AnyMessage): boolean {
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    (message as Record<string, unknown>).method === "session/prompt" &&
+    requestIdFromMessage(message) !== undefined
+  );
+}
+
+function requestIdFromMessage(message: AnyMessage): number | string | null | undefined {
+  if (typeof message !== "object" || message === null || !Object.hasOwn(message, "id")) {
+    return undefined;
+  }
+  const id = (message as Record<string, unknown>).id;
+  if (typeof id === "string" || typeof id === "number" || id === null) {
+    return id;
+  }
+  return undefined;
+}
+
+function toRpcError(error: unknown): RpcErrorResponse {
+  if (error instanceof AcpHttpError) {
+    return {
+      code: -32003,
+      message: error.problem?.title ?? `HTTP ${error.status}`,
+      data: error.problem ?? { status: error.status },
+    };
+  }
+  if (error instanceof Error) {
+    return {
+      code: -32603,
+      message: error.message,
+    };
+  }
+  return {
+    code: -32603,
+    message: String(error),
+  };
 }
 
 async function readProblem(response: Response): Promise<ProblemDetails | undefined> {
