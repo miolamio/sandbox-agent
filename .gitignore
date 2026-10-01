@@ -40,7 +40,6 @@ Thumbs.db
 npm-debug.log*
 
 # Rust
-Cargo.lock
 **/*.rs.bk
 
 # Agent runtime directories
