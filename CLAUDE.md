@@ -73,7 +73,7 @@ pnpm --filter sandbox-agent generate
 - Keep CLI subcommands and HTTP endpoints in sync.
 - Update `docs/cli.mdx` when CLI behavior changes.
 - Regenerate `docs/openapi.json` when HTTP contracts change.
-- Keep `docs/inspector.mdx` and `docs/sdks/typescript.mdx` aligned with implementation.
+- Keep `docs/inspector.mdx` and `docs/sdk-overview.mdx` (TypeScript SDK docs) aligned with implementation.
 - Append blockers/decisions to `research/acp/friction.md` during ACP work.
 - `docs/agent-capabilities.mdx` lists models/modes/thought levels per agent. Update it when adding a new agent or changing `fallback_config_options`. If its "Last updated" date is >2 weeks old, re-run `cd scripts/agent-configs && npx tsx dump.ts` and update the doc to match. Source data: `scripts/agent-configs/resources/*.json` and hardcoded entries in `server/packages/sandbox-agent/src/router/support.rs` (`fallback_config_options`).
 - Some agent models are gated by subscription (e.g. Claude `opus`). The live report only shows models available to the current credentials. The static doc and JSON resource files should list all known models regardless of subscription tier.
