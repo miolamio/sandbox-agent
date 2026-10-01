@@ -234,6 +234,30 @@ const page = await sdk.getEvents({
 console.log(page.items.length);
 ```
 
+### Turn events
+
+To know when the agent finished a turn or is waiting for a decision, without holding on to the `prompt(...)` call, subscribe to turn events. Every client attached to the session receives them, not only the one that sent the prompt, so an orchestrator can watch sessions that other clients drive:
+
+```ts
+import type { SessionTurnEvent } from "sandbox-agent";
+
+const off = session.onTurnEvent((event: SessionTurnEvent) => {
+  if (event.type === "turn_ended") {
+    console.log(event.outcome, event.stopReason);
+  }
+});
+// Same thing by session id: sdk.onTurnEvent(session.id, listener)
+```
+
+| `type` | When |
+|--------|------|
+| `turn_started` | A prompt was sent to the agent. |
+| `turn_ended` | The turn is over. `outcome` is `completed`, `error`, `timeout`, `agent_exited`, or `cancelled`; `stopReason` is set when the agent reported one. |
+| `awaiting_input` | The agent asked for a permission decision (`kind: "permission"`) and waits for the reply. |
+| `input_resolved` | That request was answered, or the turn ended without an answer. |
+
+A turn's `turn_ended` is delivered after the turn's other session events. Turn events are not stored in the session history (`getEvents`). See [Agent Sessions](/agent-sessions#track-turn-progress) for the outcomes in detail.
+
 ## Control-plane and HTTP helpers
 
 ```ts

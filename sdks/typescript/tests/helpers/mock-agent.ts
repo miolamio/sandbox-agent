@@ -31,6 +31,8 @@ const { createInterface } = require("node:readline");
 let nextSession = 0;
 let nextPermission = 0;
 const pendingPermissions = new Map();
+// Prompts held open by the "delay:<ms>" hook, keyed by request id.
+const delayedPrompts = new Map();
 // Sessions this process created. Prompts and resume requests for any other
 // session id fail like a real agent that lost its session state.
 const knownSessions = new Set();
@@ -127,6 +129,20 @@ rl.on("line", (line) => {
           stopReason: "end_turn",
         },
       });
+    }
+    return;
+  }
+
+  // session/cancel ends the session's delayed prompts with stopReason "cancelled".
+  if (method === "session/cancel" && !hasId) {
+    const sessionId = msg?.params?.sessionId;
+    for (const [promptId, held] of delayedPrompts) {
+      if (held.sessionId !== sessionId) {
+        continue;
+      }
+      clearTimeout(held.timer);
+      delayedPrompts.delete(promptId);
+      emit({ jsonrpc: "2.0", id: held.id, result: { stopReason: "cancelled" } });
     }
     return;
   }
@@ -332,10 +348,20 @@ rl.on("line", (line) => {
           stopReason: "end_turn",
         },
       });
-    // Test hook: "delay:<ms>" in the prompt text holds the turn open that long.
+    // Test hook: "crash:now" in the prompt text makes the agent process exit mid-turn.
+    if (text.includes("crash:now")) {
+      process.exit(3);
+    }
+    // Test hook: "delay:<ms>" in the prompt text holds the turn open that long
+    // (or until session/cancel for the session).
     const delayMatch = /delay:(\d+)/.exec(text);
     if (delayMatch) {
-      setTimeout(finish, Number(delayMatch[1]));
+      const promptKey = String(msg.id);
+      const timer = setTimeout(() => {
+        delayedPrompts.delete(promptKey);
+        finish();
+      }, Number(delayMatch[1]));
+      delayedPrompts.set(promptKey, { id: msg.id, sessionId: msg?.params?.sessionId, timer });
     } else {
       finish();
     }

@@ -1165,6 +1165,11 @@ fn run_mock_agent_process() -> Result<(), CliError> {
     let stdin = std::io::stdin();
     let reader = stdin.lock();
 
+    // Prompts held by test hooks in the prompt text (see below).
+    let mut next_permission: u64 = 0;
+    let mut waiting_for_permission: HashMap<String, (Value, Value, Value)> = HashMap::new();
+    let mut waiting_for_cancel: Vec<(Value, Value)> = Vec::new();
+
     for line in reader.lines() {
         let line = line.map_err(|e| CliError::Server(format!("stdin read error: {}", e)))?;
         if line.trim().is_empty() {
@@ -1195,15 +1200,82 @@ fn run_mock_agent_process() -> Result<(), CliError> {
         });
         write_stdout_line(&serde_json::to_string(&echo)?)?;
 
-        let has_method = msg.get("method").and_then(|v| v.as_str()).is_some();
+        let method = msg.get("method").and_then(|v| v.as_str());
+        let has_method = method.is_some();
         let has_id = msg.get("id").is_some();
+        let session_id = msg
+            .pointer("/params/sessionId")
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        if method == Some("session/cancel") && !has_id {
+            // Answer prompts held by `__mock_wait_cancel__` for this session.
+            let (cancelled, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut waiting_for_cancel)
+                .into_iter()
+                .partition(|(_, held_session)| *held_session == session_id);
+            waiting_for_cancel = kept;
+            for (prompt_id, _) in cancelled {
+                write_stdout_line(&serde_json::to_string(&json!({
+                    "jsonrpc": "2.0",
+                    "id": prompt_id,
+                    "result": { "stopReason": "cancelled" }
+                }))?)?;
+            }
+            continue;
+        }
+
+        if method == Some("session/prompt") && has_id {
+            // Test hooks, matched anywhere in the prompt params.
+            let params = msg.get("params").map(Value::to_string).unwrap_or_default();
+            if params.contains("__mock_exit__") {
+                std::process::exit(3);
+            }
+            if params.contains("__mock_never_respond__") {
+                continue;
+            }
+            if params.contains("__mock_wait_cancel__") {
+                waiting_for_cancel.push((msg["id"].clone(), session_id));
+                continue;
+            }
+            if params.contains("__mock_request_permission__") {
+                next_permission += 1;
+                let permission_id = format!("mock-permission-{next_permission}");
+                waiting_for_permission.insert(
+                    permission_id.clone(),
+                    (msg["id"].clone(), session_id.clone(), msg.clone()),
+                );
+                write_stdout_line(&serde_json::to_string(&json!({
+                    "jsonrpc": "2.0",
+                    "id": permission_id,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": session_id,
+                        "toolCall": {
+                            "toolCallId": format!("mock-tool-call-{next_permission}"),
+                            "title": "Write mock.txt",
+                            "kind": "edit",
+                            "status": "pending"
+                        },
+                        "options": [
+                            { "kind": "allow_once", "name": "Allow once", "optionId": "allow-once" },
+                            { "kind": "reject_once", "name": "Reject", "optionId": "reject-once" }
+                        ]
+                    }
+                }))?)?;
+                continue;
+            }
+        }
 
         if has_method && has_id {
             // Request -> respond with echo result
+            let mut result = json!({ "echoed": msg });
+            if method == Some("session/prompt") {
+                result["stopReason"] = json!("end_turn");
+            }
             let response = json!({
                 "jsonrpc": "2.0",
                 "id": msg["id"],
-                "result": { "echoed": msg }
+                "result": result
             });
             write_stdout_line(&serde_json::to_string(&response)?)?;
         } else if !has_method && has_id {
@@ -1218,6 +1290,34 @@ fn run_mock_agent_process() -> Result<(), CliError> {
                 }
             });
             write_stdout_line(&serde_json::to_string(&notification)?)?;
+
+            // Finish a prompt held by `__mock_request_permission__`.
+            let answered = msg
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| waiting_for_permission.remove(id));
+            if let Some((prompt_id, session_id, prompt)) = answered {
+                let option_id = msg
+                    .pointer("/result/outcome/optionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("cancelled");
+                write_stdout_line(&serde_json::to_string(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": format!("mock permission: {option_id}") }
+                        }
+                    }
+                }))?)?;
+                write_stdout_line(&serde_json::to_string(&json!({
+                    "jsonrpc": "2.0",
+                    "id": prompt_id,
+                    "result": { "echoed": prompt, "stopReason": "end_turn" }
+                }))?)?;
+            }
         }
     }
 

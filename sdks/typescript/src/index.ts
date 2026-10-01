@@ -47,6 +47,9 @@ export type {
   SessionEventListener,
   PermissionReply,
   PermissionRequestListener,
+  SessionTurnEvent,
+  SessionTurnEventListener,
+  SessionTurnOutcome,
   SessionPermissionRequest,
   SessionPermissionRequestOption,
 } from "./client.ts";

@@ -3,7 +3,15 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { AcpHttpClient, type SessionNotification } from "../src/index.ts";
+import {
+  AcpHttpClient,
+  SANDBOX_AGENT_TURN_ENDED,
+  SANDBOX_AGENT_TURN_STARTED,
+  parseSandboxAgentTurnNotification,
+  sandboxAgentPromptMeta,
+  type SandboxAgentTurnNotification,
+  type SessionNotification,
+} from "../src/index.ts";
 import { spawnSandboxAgent, type SandboxAgentSpawnHandle } from "../../typescript/src/spawn.ts";
 import { prepareMockAgentDataHome } from "../../typescript/tests/helpers/mock-agent.ts";
 
@@ -615,6 +623,53 @@ describe("AcpHttpClient integration", () => {
 
     await client.disconnect();
   });
+  it("delivers typed turn lifecycle notifications and prompt response metadata", async () => {
+    const serverId = `acp-http-client-turns-${Date.now().toString(36)}`;
+    const turnEvents: SandboxAgentTurnNotification[] = [];
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      transport: { path: `/v1/acp/${encodeURIComponent(serverId)}`, bootstrapQuery: { agent: "mock" } },
+      client: {
+        extNotification: async (method, params) => {
+          const parsed = parseSandboxAgentTurnNotification(method, params);
+          if (parsed) {
+            turnEvents.push(parsed);
+          }
+        },
+      },
+    });
+    try {
+      await client.initialize();
+      const session = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      const completed = await client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "turn events" }] });
+      expect(completed.stopReason).toBe("end_turn");
+      const meta = sandboxAgentPromptMeta(completed);
+      expect(meta?.sessionId).toBe(session.sessionId);
+      expect(typeof meta?.sequence).toBe("number");
+
+      const ended = await waitFor(() => turnEvents.find((event) => event.method === SANDBOX_AGENT_TURN_ENDED));
+      expect(turnEvents.map((event) => event.method)).toEqual([SANDBOX_AGENT_TURN_STARTED, SANDBOX_AGENT_TURN_ENDED]);
+      expect(ended.params).toMatchObject({ sessionId: session.sessionId, outcome: "completed", stopReason: "end_turn" });
+      expect(ended.params.requestId).toEqual(turnEvents[0]!.params.requestId);
+
+      // Cancelling a running prompt ends its turn as cancelled.
+      turnEvents.length = 0;
+      const pending = client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "delay:10000" }] });
+      await waitFor(() => turnEvents.find((event) => event.method === SANDBOX_AGENT_TURN_STARTED));
+      await client.cancel({ sessionId: session.sessionId });
+      await expect(withTimeout(pending, "cancelled prompt")).resolves.toMatchObject({ stopReason: "cancelled" });
+      const cancelled = await waitFor(() => turnEvents.find((event) => event.method === SANDBOX_AGENT_TURN_ENDED));
+      expect(cancelled.params).toMatchObject({ outcome: "cancelled", stopReason: "cancelled" });
+
+      expect(parseSandboxAgentTurnNotification("_adapter/agent_exited", { success: false })).toBeNull();
+      expect(parseSandboxAgentTurnNotification(SANDBOX_AGENT_TURN_ENDED, { sessionId: 1 })).toBeNull();
+    } finally {
+      await client.disconnect();
+    }
+  });
+
   it("ignores responses addressed to another client on the same server", async () => {
     const serverId = `acp-http-client-shared-${Date.now().toString(36)}`;
     const transport = { path: `/v1/acp/${encodeURIComponent(serverId)}`, bootstrapQuery: { agent: "mock" } };

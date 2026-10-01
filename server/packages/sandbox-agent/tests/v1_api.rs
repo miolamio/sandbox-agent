@@ -295,3 +295,5 @@ mod desktop;
 mod fs_download_batch;
 #[path = "v1_api/processes.rs"]
 mod processes;
+#[path = "v1_api/turn_events.rs"]
+mod turn_events;

@@ -6,8 +6,8 @@
   - `acp-http-client`: protocol-pure ACP-over-HTTP (`/v1/acp`) with no Sandbox-specific HTTP helpers.
   - `sandbox-agent`: `SandboxAgent` SDK wrapper that combines ACP session operations with Sandbox control-plane and filesystem helpers.
 - `SandboxAgent` entry points are `SandboxAgent.connect(...)` and `SandboxAgent.start(...)`.
-- Stable Sandbox session methods are `createSession`, `resumeSession`, `resumeOrCreateSession`, `destroySession`, `rawSendSessionMethod`, `onSessionEvent`, `setSessionMode`, `setSessionModel`, `setSessionThoughtLevel`, `setSessionConfigOption`, `getSessionConfigOptions`, `getSessionModes`, `respondPermission`, `rawRespondPermission`, and `onPermissionRequest`.
-- `Session` helpers are `prompt(...)`, `rawSend(...)`, `onEvent(...)`, `setMode(...)`, `setModel(...)`, `setThoughtLevel(...)`, `setConfigOption(...)`, `getConfigOptions()`, `getModes()`, `respondPermission(...)`, `rawRespondPermission(...)`, and `onPermissionRequest(...)`.
+- Stable Sandbox session methods are `createSession`, `resumeSession`, `resumeOrCreateSession`, `destroySession`, `rawSendSessionMethod`, `onSessionEvent`, `setSessionMode`, `setSessionModel`, `setSessionThoughtLevel`, `setSessionConfigOption`, `getSessionConfigOptions`, `getSessionModes`, `respondPermission`, `rawRespondPermission`, `onPermissionRequest`, and `onTurnEvent`.
+- `Session` helpers are `prompt(...)`, `rawSend(...)`, `onEvent(...)`, `setMode(...)`, `setModel(...)`, `setThoughtLevel(...)`, `setConfigOption(...)`, `getConfigOptions()`, `getModes()`, `respondPermission(...)`, `rawRespondPermission(...)`, `onPermissionRequest(...)`, and `onTurnEvent(...)`.
 - Cleanup is `sdk.dispose()`.
 
 ### React Component Methodology

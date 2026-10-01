@@ -21,6 +21,10 @@ import {
   type SetSessionConfigOptionRequest,
   type SetSessionModeResponse,
   type SetSessionModeRequest,
+  parseSandboxAgentTurnNotification,
+  type SandboxAgentRequestId,
+  type SandboxAgentTurnNotification,
+  type SandboxAgentTurnOutcome,
 } from "acp-http-client";
 import type { SandboxProvider } from "./providers/types.ts";
 import { DesktopStreamSession, type DesktopStreamConnectOptions } from "./desktop-stream.ts";
@@ -231,6 +235,34 @@ export interface SessionSendOptions {
 export type SessionEventListener = (event: SessionEvent) => void;
 export type PermissionReply = "once" | "always" | "reject";
 export type PermissionRequestListener = (request: SessionPermissionRequest) => void;
+
+/** How a turn ended. */
+export type SessionTurnOutcome = SandboxAgentTurnOutcome;
+
+interface SessionTurnEventBase {
+  /** Local session id. */
+  sessionId: string;
+  agentSessionId: string;
+  /**
+   * Opaque id that correlates events: the prompt request for `turn_started`
+   * and `turn_ended`, the agent's input request for `awaiting_input` and
+   * `input_resolved`.
+   */
+  requestId: SandboxAgentRequestId;
+}
+
+/**
+ * Turn lifecycle signal for a session, delivered to every client attached to
+ * the session's server (not only the one that sent the prompt). Not persisted
+ * as a session event.
+ */
+export type SessionTurnEvent =
+  | (SessionTurnEventBase & { type: "turn_started" })
+  | (SessionTurnEventBase & { type: "turn_ended"; outcome: SessionTurnOutcome; stopReason?: string })
+  | (SessionTurnEventBase & { type: "awaiting_input"; kind: "permission" })
+  | (SessionTurnEventBase & { type: "input_resolved" });
+
+export type SessionTurnEventListener = (event: SessionTurnEvent) => void;
 export type ProcessLogListener = (entry: ProcessLogEntry) => void;
 export type ProcessLogFollowQuery = Omit<ProcessLogsQuery, "follow">;
 
@@ -502,6 +534,10 @@ export class Session {
     return this.sandbox.onPermissionRequest(this.id, listener);
   }
 
+  onTurnEvent(listener: SessionTurnEventListener): () => void {
+    return this.sandbox.onTurnEvent(this.id, listener);
+  }
+
   async respondPermission(permissionId: string, reply: PermissionReply): Promise<void> {
     await this.sandbox.respondPermission(permissionId, reply);
   }
@@ -518,6 +554,8 @@ export class Session {
     this.record = { ...record };
   }
 }
+
+type TurnNotificationHandler = (connection: LiveAcpConnection, localSessionId: string, notification: SandboxAgentTurnNotification) => void;
 
 export class LiveAcpConnection {
   readonly connectionId: string;
@@ -547,6 +585,7 @@ export class LiveAcpConnection {
     agentSessionId: string,
     request: RequestPermissionRequest,
   ) => Promise<RequestPermissionResponse>;
+  private readonly onTurnEvent: TurnNotificationHandler;
 
   private constructor(
     agent: string,
@@ -561,6 +600,7 @@ export class LiveAcpConnection {
       agentSessionId: string,
       request: RequestPermissionRequest,
     ) => Promise<RequestPermissionResponse>,
+    onTurnEvent: TurnNotificationHandler,
   ) {
     this.agent = agent;
     this.serverId = serverId;
@@ -569,6 +609,7 @@ export class LiveAcpConnection {
     this.acp = acp;
     this.onObservedEnvelope = onObservedEnvelope;
     this.onPermissionRequest = onPermissionRequest;
+    this.onTurnEvent = onTurnEvent;
   }
 
   static async create(options: {
@@ -588,6 +629,7 @@ export class LiveAcpConnection {
       agentSessionId: string,
       request: RequestPermissionRequest,
     ) => Promise<RequestPermissionResponse>;
+    onTurnEvent: TurnNotificationHandler;
   }): Promise<LiveAcpConnection> {
     const connectionId = randomId();
 
@@ -633,7 +675,16 @@ export class LiveAcpConnection {
       },
     });
     const supportsResume = initResult.agentCapabilities?.sessionCapabilities?.resume != null;
-    live = new LiveAcpConnection(options.agent, options.serverId, supportsResume, connectionId, acp, options.onObservedEnvelope, options.onPermissionRequest);
+    live = new LiveAcpConnection(
+      options.agent,
+      options.serverId,
+      supportsResume,
+      connectionId,
+      acp,
+      options.onObservedEnvelope,
+      options.onPermissionRequest,
+      options.onTurnEvent,
+    );
 
     if (initResult.authMethods && initResult.authMethods.length > 0) {
       try {
@@ -778,6 +829,19 @@ export class LiveAcpConnection {
   }
 
   private handleEnvelope(envelope: AnyMessage, direction: AcpEnvelopeDirection): void {
+    if (direction === "inbound") {
+      const method = envelopeMethod(envelope);
+      const turn = method ? parseSandboxAgentTurnNotification(method, (envelope as { params?: unknown }).params) : null;
+      if (turn) {
+        // Turn signals are not conversation history: deliver them to turn
+        // listeners instead of persisting them as session events.
+        const localSessionId = this.localByAgentSessionId.get(turn.params.sessionId);
+        if (localSessionId) {
+          this.onTurnEvent(this, localSessionId, turn);
+        }
+        return;
+      }
+    }
     const localSessionId = this.resolveSessionId(envelope, direction);
     this.onObservedEnvelope(this, envelope, direction, localSessionId);
   }
@@ -1044,6 +1108,7 @@ export class SandboxAgent {
   private readonly sessionHandles = new Map<string, Session>();
   private readonly eventListeners = new Map<string, Set<SessionEventListener>>();
   private readonly permissionListeners = new Map<string, Set<PermissionRequestListener>>();
+  private readonly turnListeners = new Map<string, Set<SessionTurnEventListener>>();
   private readonly pendingPermissionRequests = new Map<string, PendingPermissionRequestState>();
   private readonly nextSessionEventIndexBySession = new Map<string, number>();
   private readonly seedSessionEventIndexBySession = new Map<string, Promise<void>>();
@@ -1895,6 +1960,28 @@ export class SandboxAgent {
     };
   }
 
+  /**
+   * Subscribes to turn lifecycle signals of a session: a turn started or ended
+   * (with its outcome), and the agent is waiting for, or no longer waiting for,
+   * a permission decision. Every client attached to the session receives them.
+   */
+  onTurnEvent(sessionId: string, listener: SessionTurnEventListener): () => void {
+    const listeners = this.turnListeners.get(sessionId) ?? new Set<SessionTurnEventListener>();
+    listeners.add(listener);
+    this.turnListeners.set(sessionId, listeners);
+
+    return () => {
+      const set = this.turnListeners.get(sessionId);
+      if (!set) {
+        return;
+      }
+      set.delete(listener);
+      if (set.size === 0) {
+        this.turnListeners.delete(sessionId);
+      }
+    };
+  }
+
   onPermissionRequest(sessionId: string, listener: PermissionRequestListener): () => void {
     const listeners = this.permissionListeners.get(sessionId) ?? new Set<PermissionRequestListener>();
     listeners.add(listener);
@@ -2467,6 +2554,9 @@ export class SandboxAgent {
         },
         onPermissionRequest: async (connection, localSessionId, agentSessionId, request) =>
           this.enqueuePermissionRequest(connection, localSessionId, agentSessionId, request),
+        onTurnEvent: (_connection, localSessionId, notification) => {
+          void this.enqueueTurnEvent(localSessionId, notification);
+        },
       });
 
       const raced = this.liveConnections.get(serverId);
@@ -2568,6 +2658,42 @@ export class SandboxAgent {
       if (this.pendingObservedEnvelopePersistenceBySession.get(localSessionId) === current) {
         this.pendingObservedEnvelopePersistenceBySession.delete(localSessionId);
       }
+    }
+  }
+
+  /**
+   * Delivers a turn signal after every envelope observed before it has been
+   * persisted and delivered to session event listeners, so a `turn_ended`
+   * listener sees the whole turn.
+   */
+  private async enqueueTurnEvent(localSessionId: string, notification: SandboxAgentTurnNotification): Promise<void> {
+    const previous = this.pendingObservedEnvelopePersistenceBySession.get(localSessionId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => {
+        // An earlier persistence failure must not drop the signal.
+      })
+      .then(() => this.emitTurnEvent(localSessionId, notification));
+
+    this.pendingObservedEnvelopePersistenceBySession.set(localSessionId, current);
+    try {
+      await current;
+    } catch (error) {
+      console.error("Failed to deliver sandbox-agent turn event", error);
+    } finally {
+      if (this.pendingObservedEnvelopePersistenceBySession.get(localSessionId) === current) {
+        this.pendingObservedEnvelopePersistenceBySession.delete(localSessionId);
+      }
+    }
+  }
+
+  private async emitTurnEvent(localSessionId: string, notification: SandboxAgentTurnNotification): Promise<void> {
+    const listeners = this.turnListeners.get(localSessionId);
+    if (!listeners || listeners.size === 0) {
+      return;
+    }
+    const event = toSessionTurnEvent(localSessionId, notification);
+    for (const listener of listeners) {
+      listener(event);
     }
   }
 
@@ -3176,6 +3302,29 @@ function isMissingRemoteSessionError(error: AcpRpcError, agentSessionId: string)
     return true;
   }
   return error.message.includes(agentSessionId);
+}
+
+function toSessionTurnEvent(localSessionId: string, notification: SandboxAgentTurnNotification): SessionTurnEvent {
+  const base = {
+    sessionId: localSessionId,
+    agentSessionId: notification.params.sessionId,
+    requestId: notification.params.requestId,
+  };
+  switch (notification.method) {
+    case "_sandboxagent/session/turn_started":
+      return { ...base, type: "turn_started" };
+    case "_sandboxagent/session/turn_ended":
+      return {
+        ...base,
+        type: "turn_ended",
+        outcome: notification.params.outcome,
+        ...(notification.params.stopReason !== undefined ? { stopReason: notification.params.stopReason } : {}),
+      };
+    case "_sandboxagent/session/awaiting_input":
+      return { ...base, type: "awaiting_input", kind: notification.params.kind };
+    case "_sandboxagent/session/input_resolved":
+      return { ...base, type: "input_resolved" };
+  }
 }
 
 function mapSessionParams(params: Record<string, unknown>, agentSessionId: string): Record<string, unknown> {

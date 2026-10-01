@@ -12,6 +12,7 @@ import {
   type SessionEvent,
   type SessionPersistDriver,
   type SessionRecord,
+  type SessionTurnEvent,
 } from "../src/index.ts";
 import { isNodeRuntime } from "../src/spawn.ts";
 import { createDockerTestLayout, disposeDockerTestLayout, startDockerSandboxAgent, type DockerSandboxAgentHandle } from "./helpers/docker.ts";
@@ -810,6 +811,103 @@ describe("Integration: TypeScript SDK flat session API", () => {
       const events = await sdk.getEvents({ sessionId: session.id, limit: 200 });
       expect(events.items.filter(isPromptResult)).toHaveLength(1);
       expect(observed.filter(isPromptResult)).toHaveLength(1);
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("broker observer receives turn-ended signal", async () => {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 500 });
+    // The author sends prompts; the observer only attaches to the same server
+    // and watches, like an orchestrator would.
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist });
+    try {
+      const created = await author.createSession({ agent: "mock" });
+      const watched = await observer.resumeSession(created.id);
+
+      const turnEvents: SessionTurnEvent[] = [];
+      const off = watched.onTurnEvent((event) => turnEvents.push(event));
+
+      const prompt = await created.prompt([{ type: "text", text: "observed turn" }]);
+      expect(prompt.stopReason).toBe("end_turn");
+
+      const ended = await waitFor(() => turnEvents.find((event) => event.type === "turn_ended"));
+      expect(turnEvents.map((event) => event.type)).toEqual(["turn_started", "turn_ended"]);
+      expect(ended).toMatchObject({
+        type: "turn_ended",
+        sessionId: created.id,
+        agentSessionId: created.agentSessionId,
+        outcome: "completed",
+        stopReason: "end_turn",
+      });
+      expect(ended.requestId).toEqual(turnEvents[0]!.requestId);
+
+      // Turn events are signals, not conversation history.
+      const events = await author.getEvents({ sessionId: created.id, limit: 500 });
+      const synthetic = events.items.filter((event) => String((event.payload as { method?: unknown }).method ?? "").startsWith("_sandboxagent/session/"));
+      expect(synthetic).toEqual([]);
+      off();
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("reports awaiting input while a permission request is open", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const turnEvents: SessionTurnEvent[] = [];
+      session.onTurnEvent((event) => turnEvents.push(event));
+      session.onPermissionRequest((request) => {
+        // Reply only after awaiting_input has been delivered.
+        void waitFor(() => turnEvents.find((event) => event.type === "awaiting_input")).then(() => session.respondPermission(request.id, "once"));
+      });
+
+      await session.prompt([{ type: "text", text: "trigger permission for turn events" }]);
+      await waitFor(() => turnEvents.find((event) => event.type === "turn_ended"));
+
+      expect(turnEvents.map((event) => event.type)).toEqual(["turn_started", "awaiting_input", "input_resolved", "turn_ended"]);
+      const awaiting = turnEvents[1]!;
+      expect(awaiting).toMatchObject({ type: "awaiting_input", kind: "permission", sessionId: session.id });
+      expect(turnEvents[2]!.requestId).toEqual(awaiting.requestId);
+      expect(turnEvents[3]).toMatchObject({ outcome: "completed", stopReason: "end_turn" });
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("reports a cancelled turn when the session is destroyed mid-turn", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const turnEvents: SessionTurnEvent[] = [];
+      sdk.onTurnEvent(session.id, (event) => turnEvents.push(event));
+
+      const prompt = session.prompt([{ type: "text", text: "delay:10000" }]);
+      await waitFor(() => turnEvents.find((event) => event.type === "turn_started"));
+      await sdk.destroySession(session.id);
+
+      await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+      const ended = await waitFor(() => turnEvents.find((event) => event.type === "turn_ended"));
+      expect(ended).toMatchObject({ outcome: "cancelled", stopReason: "cancelled" });
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("reports agent_exited when the agent crashes mid-turn", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const turnEvents: SessionTurnEvent[] = [];
+      session.onTurnEvent((event) => turnEvents.push(event));
+
+      await expect(session.prompt([{ type: "text", text: "crash:now" }])).rejects.toBeTruthy();
+      const ended = await waitFor(() => turnEvents.find((event) => event.type === "turn_ended"));
+      expect(ended).toMatchObject({ type: "turn_ended", sessionId: session.id, outcome: "agent_exited" });
+      expect(ended.stopReason).toBeUndefined();
     } finally {
       await sdk.dispose();
     }

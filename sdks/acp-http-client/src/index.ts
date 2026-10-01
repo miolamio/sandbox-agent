@@ -61,6 +61,98 @@ export interface AcpHttpTransportOptions {
   skipBufferedEvents?: boolean;
 }
 
+/**
+ * Turn lifecycle notifications that a Sandbox Agent server publishes on the
+ * event stream of `/v1/acp/{server_id}` (not for `/opencode/*`). They are
+ * delivered to `client.extNotification`; use
+ * {@link parseSandboxAgentTurnNotification} to narrow them.
+ */
+export const SANDBOX_AGENT_TURN_STARTED = "_sandboxagent/session/turn_started";
+export const SANDBOX_AGENT_TURN_ENDED = "_sandboxagent/session/turn_ended";
+export const SANDBOX_AGENT_AWAITING_INPUT = "_sandboxagent/session/awaiting_input";
+export const SANDBOX_AGENT_INPUT_RESOLVED = "_sandboxagent/session/input_resolved";
+/** `_meta` key of the metadata the server adds to `session/prompt` responses. */
+export const SANDBOX_AGENT_META_KEY = "sandboxagent.dev";
+
+export type SandboxAgentTurnOutcome = "completed" | "error" | "timeout" | "agent_exited" | "cancelled";
+
+/** JSON-RPC id as sent on the wire (this client prefixes its own ids per transport). */
+export type SandboxAgentRequestId = string | number;
+
+export type SandboxAgentTurnNotification =
+  | { method: typeof SANDBOX_AGENT_TURN_STARTED; params: { sessionId: string; requestId: SandboxAgentRequestId } }
+  | {
+      method: typeof SANDBOX_AGENT_TURN_ENDED;
+      params: { sessionId: string; requestId: SandboxAgentRequestId; outcome: SandboxAgentTurnOutcome; stopReason?: string };
+    }
+  | { method: typeof SANDBOX_AGENT_AWAITING_INPUT; params: { sessionId: string; requestId: SandboxAgentRequestId; kind: "permission" } }
+  | { method: typeof SANDBOX_AGENT_INPUT_RESOLVED; params: { sessionId: string; requestId: SandboxAgentRequestId } };
+
+/** `_meta["sandboxagent.dev"]` of a `session/prompt` response. */
+export interface SandboxAgentPromptMeta {
+  sessionId: string;
+  /** Event stream id of the turn's last event (`turn_ended`). */
+  sequence: number;
+}
+
+const TURN_OUTCOMES: ReadonlySet<string> = new Set<SandboxAgentTurnOutcome>(["completed", "error", "timeout", "agent_exited", "cancelled"]);
+
+function isRequestId(value: unknown): value is SandboxAgentRequestId {
+  return typeof value === "string" || typeof value === "number";
+}
+
+/** Returns the typed turn notification, or `null` for any other or malformed notification. */
+export function parseSandboxAgentTurnNotification(method: string, params: unknown): SandboxAgentTurnNotification | null {
+  if (!params || typeof params !== "object") {
+    return null;
+  }
+  const record = params as Record<string, unknown>;
+  const { sessionId, requestId } = record;
+  if (typeof sessionId !== "string" || !isRequestId(requestId)) {
+    return null;
+  }
+  switch (method) {
+    case SANDBOX_AGENT_TURN_STARTED:
+    case SANDBOX_AGENT_INPUT_RESOLVED:
+      return { method, params: { sessionId, requestId } };
+    case SANDBOX_AGENT_AWAITING_INPUT:
+      return record.kind === "permission" ? { method, params: { sessionId, requestId, kind: "permission" } } : null;
+    case SANDBOX_AGENT_TURN_ENDED: {
+      const { outcome, stopReason } = record;
+      if (typeof outcome !== "string" || !TURN_OUTCOMES.has(outcome)) {
+        return null;
+      }
+      return {
+        method,
+        params: {
+          sessionId,
+          requestId,
+          outcome: outcome as SandboxAgentTurnOutcome,
+          ...(typeof stopReason === "string" ? { stopReason } : {}),
+        },
+      };
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Reads `_meta["sandboxagent.dev"]` from a `session/prompt` result (or from
+ * `error.data` of a JSON-RPC error), if the server added it.
+ */
+export function sandboxAgentPromptMeta(value: { _meta?: Record<string, unknown> | null } | null | undefined): SandboxAgentPromptMeta | null {
+  const meta = value?._meta?.[SANDBOX_AGENT_META_KEY];
+  if (!meta || typeof meta !== "object") {
+    return null;
+  }
+  const { sessionId, sequence } = meta as Record<string, unknown>;
+  if (typeof sessionId !== "string" || typeof sequence !== "number") {
+    return null;
+  }
+  return { sessionId, sequence };
+}
+
 export interface AcpHttpClientOptions {
   baseUrl: string;
   token?: string;

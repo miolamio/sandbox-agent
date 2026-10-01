@@ -261,6 +261,46 @@ See `examples/permissions/src/index.ts` for a complete permissions example that 
 Some agents like Claude allow configuring permission behavior through modes (e.g. `bypassPermissions`, `acceptEdits`). We recommend leaving the mode as `default` and handling permission decisions explicitly in `onPermissionRequest` instead.
 </Info>
 
+## Track turn progress
+
+Each prompt starts a turn. Turn events tell you when a turn starts and ends, and when the agent is waiting for a permission decision. They reach every client attached to the session (for example a second `SandboxAgent` that reattached with `resumeSession`), so a supervisor can follow sessions without sending the prompts itself:
+
+```ts
+session.onTurnEvent((event) => {
+  switch (event.type) {
+    case "turn_started":
+      console.log("working");
+      break;
+    case "awaiting_input":
+      console.log("waiting for a permission decision");
+      break;
+    case "input_resolved":
+      console.log("permission decision received");
+      break;
+    case "turn_ended":
+      console.log("done:", event.outcome, event.stopReason ?? "");
+      break;
+  }
+});
+```
+
+`turn_ended` comes exactly once per turn, after the turn's other session events, with one of these outcomes:
+
+| `outcome` | Meaning |
+|-----------|---------|
+| `completed` | The agent finished the turn. `stopReason` says why (for example `end_turn` or `max_tokens`). |
+| `cancelled` | The turn was cancelled (`stopReason` is `cancelled`), or the session's agent server was closed or the server shut down before the turn finished (no `stopReason`). |
+| `error` | The agent answered the prompt with an error. |
+| `timeout` | The agent did not finish within the server's request timeout (`--acp-request-timeout-ms`, see the [CLI reference](/cli)). |
+| `agent_exited` | The agent process stopped before finishing the turn. |
+
+`awaiting_input` and `input_resolved` share a `requestId`. Every `awaiting_input` is followed by exactly one `input_resolved`: when a client replies, or before `turn_ended` if the turn ends without a reply.
+
+Notes:
+
+- Sessions served through the [OpenCode compatibility layer](/opencode-compatibility) do not produce turn events.
+- Turn events are not stored in the session history, so `getEvents` does not return them.
+
 ## Destroy a session
 
 ```ts

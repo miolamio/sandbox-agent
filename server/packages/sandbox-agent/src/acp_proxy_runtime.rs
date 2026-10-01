@@ -4,7 +4,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use acp_http_adapter::process::{AdapterError, AdapterRuntime, PostMode, PostOutcome};
+use acp_http_adapter::process::{
+    AdapterError, AdapterRuntime, PostMode, PostOutcome, RuntimeOptions,
+};
 use acp_http_adapter::registry::LaunchSpec;
 use axum::response::sse::Event;
 use futures::{Stream, StreamExt};
@@ -151,12 +153,29 @@ impl AcpProxyRuntime {
         infos
     }
 
+    /// Forwards a `/v1/acp` request. A server created by this call publishes
+    /// turn lifecycle events (`_sandboxagent/session/*`).
     pub async fn post(
         &self,
         server_id: &str,
         bootstrap_agent: Option<AgentId>,
         payload: Value,
         mode: PostMode,
+    ) -> Result<ProxyPostOutcome, SandboxError> {
+        self.post_with_origin(server_id, bootstrap_agent, payload, mode, true)
+            .await
+    }
+
+    /// `turn_events` only applies when this call creates the server: the
+    /// OpenCode-compat layer (`/opencode/*`) creates its servers without turn
+    /// events, `/v1/acp` with them.
+    async fn post_with_origin(
+        &self,
+        server_id: &str,
+        bootstrap_agent: Option<AgentId>,
+        payload: Value,
+        mode: PostMode,
+        turn_events: bool,
     ) -> Result<ProxyPostOutcome, SandboxError> {
         let method: String = payload
             .get("method")
@@ -175,7 +194,7 @@ impl AcpProxyRuntime {
 
         let start = std::time::Instant::now();
         let instance = self
-            .get_or_create_instance(server_id, bootstrap_agent)
+            .get_or_create_instance(server_id, bootstrap_agent, turn_events)
             .await?;
         let instance_elapsed = start.elapsed();
 
@@ -282,6 +301,7 @@ impl AcpProxyRuntime {
         &self,
         server_id: &str,
         bootstrap_agent: Option<AgentId>,
+        turn_events: bool,
     ) -> Result<Arc<ProxyInstance>, SandboxError> {
         if let Some(existing) = self.inner.instances.read().await.get(server_id).cloned() {
             if let Some(agent) = bootstrap_agent {
@@ -326,7 +346,7 @@ impl AcpProxyRuntime {
             ),
         })?;
 
-        let created = self.create_instance(server_id, agent).await?;
+        let created = self.create_instance(server_id, agent, turn_events).await?;
         self.inner
             .instances
             .write()
@@ -340,6 +360,7 @@ impl AcpProxyRuntime {
         &self,
         server_id: &str,
         agent: AgentId,
+        turn_events: bool,
     ) -> Result<Arc<ProxyInstance>, SandboxError> {
         let total_started = std::time::Instant::now();
         tracing::info!(
@@ -388,13 +409,16 @@ impl AcpProxyRuntime {
         );
 
         let spawn_started = std::time::Instant::now();
-        let runtime = AdapterRuntime::start(
+        let runtime = AdapterRuntime::start_with_options(
             LaunchSpec {
                 program: launch.program,
                 args: launch.args,
                 env: launch.env,
             },
-            self.inner.request_timeout,
+            RuntimeOptions {
+                request_timeout: self.inner.request_timeout,
+                turn_events,
+            },
         )
         .await
         .map_err(|err| map_adapter_error(err, Some(agent)))?;
@@ -505,7 +529,12 @@ impl AcpDispatch for AcpProxyRuntime {
         Box::pin(async move {
             // The OpenCode-compat layer waits on the dispatch result, so it always
             // uses the synchronous request/response contract.
-            match self.post(&server_id, agent, payload, PostMode::Sync).await {
+            // It also tracks turns itself, so its servers do not publish turn
+            // lifecycle events.
+            match self
+                .post_with_origin(&server_id, agent, payload, PostMode::Sync, false)
+                .await
+            {
                 Ok(ProxyPostOutcome::Response(value)) => Ok(AcpDispatchResult::Response(value)),
                 Ok(ProxyPostOutcome::Accepted) => Ok(AcpDispatchResult::Accepted),
                 Err(err) => Err(err.to_string()),

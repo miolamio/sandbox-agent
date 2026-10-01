@@ -121,6 +121,27 @@ DELETE /v1/acp/{serverId}         Close ACP server
 - Async prompt (opt-in): a `session/prompt` POST with header `x-sandboxagent-async-prompt: 1` returns `202 Accepted` once the request reaches the agent. Its JSON-RPC result, request-timeout error, or "agent process stopped" error (process exit or `DELETE`) arrives on the SSE stream with the same `id`. Without the header the POST returns `200` with the response body. Clients should only opt in while an SSE stream is open (or reconnect with `Last-Event-ID`). `/opencode/*` always uses the synchronous mode.
 - Request timeout: each ACP request (sync or async prompt) is bounded by `--acp-request-timeout-ms` / `SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS` (flag wins; default 2 h, `DEFAULT_REQUEST_TIMEOUT` in `acp_proxy_runtime.rs`). Sync requests get `504`; async prompts get a JSON-RPC timeout error on SSE with the same `id`.
 
+### Turn lifecycle events (SBA-9)
+
+`AdapterRuntime` (`server/packages/acp-http-adapter/src/process.rs`) tracks turns per server and publishes synthetic JSON-RPC notifications on the same ring/broadcast, with ordinary SSE ids. Enabled for every `/v1/acp` server and for the standalone `acp-http-adapter` binary (`RuntimeOptions::turn_events`, default on). Servers created by the OpenCode-compat layer (`AcpDispatch::post`) start with it off; the flag is fixed when the server is created.
+
+| Method | Params | Published |
+|--------|--------|-----------|
+| `_sandboxagent/session/turn_started` | `{sessionId, requestId}` | when a `session/prompt` request with an `id` is posted, before it is written to the agent's stdin |
+| `_sandboxagent/session/turn_ended` | `{sessionId, requestId, outcome, stopReason?}` | exactly once per turn (see below) |
+| `_sandboxagent/session/awaiting_input` | `{sessionId, requestId, kind: "permission"}` | right after the agent's `session/request_permission` request; `requestId` is that request's id |
+| `_sandboxagent/session/input_resolved` | `{sessionId, requestId}` | when a client POSTs the answer (before it is written to the agent), or when the turn ends / the agent stops without an answer |
+
+- `sessionId` is `params.sessionId` of the prompt or permission request (agent session id, `null` if missing); `requestId` is the JSON-RPC id as received on the wire (the TS client prefixes its ids per transport).
+- Outcomes: `completed` (agent result; `stopReason` copied), `cancelled` (result with `stopReason: "cancelled"`, or `DELETE /v1/acp/{id}` / server shutdown drained the turn, no `stopReason`), `error` (agent JSON-RPC error, or the prompt could not be written to stdin), `timeout` (request timeout, sync or async), `agent_exited` (process exit, also a sync timeout that finds the process already gone).
+- Ownership: the turn lives in the `PendingRequest` entry. Whoever removes the entry (stdout loop on the response, the sync or async timeout path, `fail_pending_requests` on exit or shutdown, a stdin write failure) publishes `turn_ended`, so it is never duplicated. Late agent responses after a timeout stay orphans and are dropped, as before.
+- Ordering: `turn_started` precedes all agent output of the turn. The end of a turn is published as one uninterrupted batch under the ring lock: `input_resolved` for each still-awaited input of that session, then the response (agent result, or our `-32603` error for async timeout / stop), then `turn_ended`. Everything the agent wrote to stdout before its response has already been published by the stdout loop, so `turn_ended` is the last event of the turn. On process exit, the turn batches come before `_adapter/agent_exited`.
+- Response metadata: the prompt response carries `_meta["sandboxagent.dev"] = {sessionId, sequence}` where `sequence` is the SSE id of the turn's `turn_ended`. For results it is `result._meta` (agent `_meta` keys are kept); for JSON-RPC errors it is `error.data._meta` (`data` is created when absent; a non-object `data` is left unchanged). The same annotated envelope goes to SSE and to the sync POST body. Sync errors that are HTTP problems (`504`, `500 agent_process_exited`) carry no metadata; their `turn_ended` is still on SSE.
+- Sync POST vs SSE race: for tracked turns the stdout loop publishes the batch first and only then wakes the sync caller, so by the time the POST returns, every event up to `_meta.sequence` is in the ring. A client that also reads SSE has seen the whole turn once it has seen the event with that id. Untracked requests keep the old order (wake, then publish).
+- Inputs: only `session/request_permission` is tracked (other agent-to-client requests are answered by the client automatically). The first client answer resolves it; a second answer or a late answer after the turn ended is forwarded to the agent without another event. Inputs are resolved at turn end per session (agents run one prompt per session at a time), and all remaining ones on process exit or shutdown.
+- Not tracked: prompts sent as notifications (no `id`), and anything on servers with turn events off. Reconnecting with `Last-Event-ID` replays the events like any other envelope while they are in the ring buffer (1024 entries).
+- Out of scope: a snapshot endpoint for current turn state (SBA-40), Claude background tasks that outlive the turn (SBA-25).
+
 When a message is sent:
 
 1. `send_message()` spawns the agent CLI as a subprocess
