@@ -17,6 +17,7 @@
   - `GET /v1/fs/file`
   - `PUT /v1/fs/file`
   - `POST /v1/fs/upload-batch`
+  - `GET /v1/fs/download-batch` (streamed tar, limits checked before the response starts)
 - Sandbox Agent ACP extension method naming:
   - Custom ACP methods use `_sandboxagent/...` (not `_sandboxagent/v1/...`).
   - Session detach method is `_sandboxagent/session/detach`.
@@ -29,7 +30,7 @@
 - Filesystem and terminal APIs remain Sandbox Agent-specific HTTP contracts and are not ACP.
   - Do not make Sandbox Agent core flows depend on ACP client implementations of `fs/*` or `terminal/*`; in practice those client-side capabilities are often incomplete or inconsistent.
   - ACP-native filesystem and terminal methods are also too limited for Sandbox Agent host/runtime needs, so prefer the native HTTP APIs for richer behavior.
-- Keep `GET /v1/fs/file`, `PUT /v1/fs/file`, and `POST /v1/fs/upload-batch` on HTTP:
+- Keep `GET /v1/fs/file`, `PUT /v1/fs/file`, `POST /v1/fs/upload-batch`, and `GET /v1/fs/download-batch` on HTTP:
   - These are Sandbox Agent host/runtime operations with cross-agent-consistent behavior.
   - They may involve very large binary transfers that ACP JSON-RPC envelopes are not suited to stream.
   - This is intentionally separate from ACP native `fs/read_text_file` and `fs/write_text_file`.

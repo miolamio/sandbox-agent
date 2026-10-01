@@ -5,7 +5,7 @@ sidebarTitle: "File System"
 icon: "folder"
 ---
 
-The filesystem API lets you list, read, write, move, and delete files inside the sandbox, plus upload tar archives in batch.
+The filesystem API lets you list, read, write, move, and delete files inside the sandbox, plus upload and download tar archives in batch.
 
 ## Path resolution
 
@@ -150,5 +150,48 @@ tar -cf skills.tar -C ./skills .
 curl -X POST "http://127.0.0.1:2468/v1/fs/upload-batch?path=./skills" \
   -H "Content-Type: application/x-tar" \
   --data-binary @skills.tar
+```
+</CodeGroup>
+
+## Batch download (tar)
+
+Batch download streams a file or directory back as `application/x-tar`. For a directory, the archive contains the directory contents without a wrapper folder (like `tar -C <dir> .`), so it can be passed straight to batch upload. For a file, the archive contains that single file.
+
+- Symlinks and special files (sockets, pipes, devices) are rejected, both as the requested path and anywhere inside it.
+- The server checks the whole tree before it starts sending. Path errors and limit errors come back as a normal error response, never as a truncated archive.
+- Limits apply to the total size of files (`maxBytes`, default 4 GiB), the number of files and directories (`maxEntries`, default 100000), and the nesting depth below the requested path (`maxDepth`, default 64). A request can pass lower values to tighten them, but cannot raise them. Operators can change the server limits with the `SANDBOX_AGENT_FS_DOWNLOAD_MAX_BYTES`, `SANDBOX_AGENT_FS_DOWNLOAD_MAX_ENTRIES`, and `SANDBOX_AGENT_FS_DOWNLOAD_MAX_DEPTH` environment variables.
+- When a limit is exceeded, the error response has type `urn:sandbox-agent:error:limit_exceeded`, plus `limit` (the limit name) and `max` (its effective value).
+
+<CodeGroup>
+```ts TypeScript
+import { SandboxAgent, SandboxAgentError } from "sandbox-agent";
+import fs from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+
+const sdk = await SandboxAgent.connect({
+  baseUrl: "http://127.0.0.1:2468",
+});
+
+try {
+  const stream = await sdk.downloadFsBatch({
+    path: "./results",
+    maxBytes: 512 * 1024 * 1024,
+  });
+  await pipeline(Readable.fromWeb(stream), fs.createWriteStream("./results.tar"));
+} catch (error) {
+  if (error instanceof SandboxAgentError && error.problem?.type === "urn:sandbox-agent:error:limit_exceeded") {
+    console.error("results are too large", error.problem);
+  } else {
+    throw error;
+  }
+}
+```
+
+```bash cURL
+curl -fsS "http://127.0.0.1:2468/v1/fs/download-batch?path=./results&maxBytes=536870912" \
+  --output results.tar
+
+tar -xf results.tar -C ./results-local
 ```
 </CodeGroup>

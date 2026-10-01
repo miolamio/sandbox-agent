@@ -104,6 +104,7 @@ export type {
   FsMoveResponse,
   FsPathQuery,
   FsStat,
+  FsDownloadBatchQuery,
   FsUploadBatchQuery,
   FsUploadBatchResponse,
   FsWriteResponse,

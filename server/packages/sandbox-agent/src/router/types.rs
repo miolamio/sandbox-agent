@@ -129,6 +129,22 @@ pub struct FsUploadBatchQuery {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsDownloadBatchQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Maximum total size of regular files in bytes. Can only lower the server limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Maximum number of archive entries (files and directories). Can only lower the server limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_entries: Option<u64>,
+    /// Maximum nesting depth below the requested path. Can only lower the server limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FsEntryType {
     File,

@@ -348,3 +348,13 @@ Update this file continuously during the migration.
 - Owner: Unassigned.
 - Status: resolved
 - Links: `sdks/acp-http-client/src/index.ts`, `sdks/acp-http-client/tests/smoke.test.ts`, `sdks/typescript/tests/helpers/mock-agent.ts`, `docs/sdk-overview.mdx`
+
+- Date: 2026-10-01
+- Area: Batch download of files and directories (SBA-14)
+- Issue: Only `POST /v1/fs/upload-batch` existed, so a client could not fetch a results directory in one request. The upstream draft (`e1a0956`, PR #190) built the whole tar in memory, had no limits, and had no CLI counterpart.
+- Impact: Large result directories would have to be read file by file, or could exhaust server memory if archived in one go.
+- Proposed direction: Add `GET /v1/fs/download-batch` as a plain HTTP endpoint (not an ACP extension), streamed, with limits.
+- Decision: Implemented. The server pre-walks the tree with `symlink_metadata` (symlinks and special files rejected), enforces `maxBytes` (4 GiB), `maxEntries` (100000) and `maxDepth` (64) before sending the `200`, then streams the tar from a blocking thread through a bounded channel (64 KiB chunks, 8 in flight). Server limits come from `SANDBOX_AGENT_FS_DOWNLOAD_MAX_{BYTES,ENTRIES,DEPTH}`; query parameters can only lower them. Limit errors are problem+json `400` with type `urn:sandbox-agent:error:limit_exceeded` and `limit`/`max` extensions. If a file changes size or type after the pre-walk, the stream is aborted with a body error, so the client never gets a short archive that looks complete. The TS SDK `downloadFsBatch()` returns a `ReadableStream<Uint8Array>` and does not depend on `tar`. No CLI subcommand: the binary has no filesystem commands at all (not even for upload-batch), and callers use the SDK or HTTP (owner decision, 2026-10-01). The `transport.disableSse` change from the same upstream commit was not ported.
+- Owner: Unassigned.
+- Status: resolved
+- Links: `server/packages/sandbox-agent/src/router/download_batch.rs`, `server/packages/sandbox-agent/tests/v1_api/fs_download_batch.rs`, `sdks/typescript/src/client.ts`, `docs/file-system.mdx`

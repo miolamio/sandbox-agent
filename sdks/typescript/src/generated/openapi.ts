@@ -301,6 +301,19 @@ export interface paths {
      */
     post: operations["post_v1_desktop_window_resize"];
   };
+  "/v1/fs/download-batch": {
+    /**
+     * Download a file or directory as a tar archive.
+     * @description Streams `application/x-tar`. For a directory the archive holds its contents
+     * without a wrapper folder (like `tar -C <dir> .`); for a file it holds that
+     * single file. Symlinks and special files are rejected. The whole tree is
+     * checked against the byte, entry and depth limits before the response starts,
+     * so limit and path errors arrive as problem+json, not as a truncated archive.
+     * Query limits can only lower the server limits (`SANDBOX_AGENT_FS_DOWNLOAD_MAX_BYTES`,
+     * `SANDBOX_AGENT_FS_DOWNLOAD_MAX_ENTRIES`, `SANDBOX_AGENT_FS_DOWNLOAD_MAX_DEPTH`).
+     */
+    get: operations["get_v1_fs_download_batch"];
+  };
   "/v1/fs/entries": {
     get: operations["get_v1_fs_entries"];
   };
@@ -777,6 +790,24 @@ export interface components {
       path: string;
       recursive?: boolean | null;
     };
+    FsDownloadBatchQuery: {
+      /**
+       * Format: int64
+       * @description Maximum total size of regular files in bytes. Can only lower the server limit.
+       */
+      maxBytes?: number | null;
+      /**
+       * Format: int64
+       * @description Maximum nesting depth below the requested path. Can only lower the server limit.
+       */
+      maxDepth?: number | null;
+      /**
+       * Format: int64
+       * @description Maximum number of archive entries (files and directories). Can only lower the server limit.
+       */
+      maxEntries?: number | null;
+      path?: string | null;
+    };
     FsEntriesQuery: {
       path?: string | null;
     };
@@ -824,10 +855,19 @@ export interface components {
     HealthResponse: {
       status: string;
     };
+    McpCommand: string | string[];
     McpConfigQuery: {
       directory: string;
       mcpName: string;
     };
+    McpOAuthConfig: {
+      clientId?: string | null;
+      clientSecret?: string | null;
+      scope?: string | null;
+    };
+    McpOAuthConfigOrDisabled: components["schemas"]["McpOAuthConfig"] | boolean;
+    /** @enum {string} */
+    McpRemoteTransport: "http" | "sse";
     McpServerConfig:
       | {
           args?: string[];
@@ -1005,15 +1045,6 @@ export interface components {
       directory: string;
       skillName: string;
     };
-    McpCommand: string | string[];
-    /** @enum {string} */
-    McpRemoteTransport: "http" | "sse";
-    McpOAuthConfig: {
-      clientId?: string | null;
-      clientSecret?: string | null;
-      scope?: string | null;
-    };
-    McpOAuthConfigOrDisabled: components["schemas"]["McpOAuthConfig"] | boolean;
   };
   responses: never;
   parameters: never;
@@ -2471,6 +2502,44 @@ export interface operations {
       };
       /** @description Desktop runtime is not ready */
       409: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
+      };
+    };
+  };
+  /**
+   * Download a file or directory as a tar archive.
+   * @description Streams `application/x-tar`. For a directory the archive holds its contents
+   * without a wrapper folder (like `tar -C <dir> .`); for a file it holds that
+   * single file. Symlinks and special files are rejected. The whole tree is
+   * checked against the byte, entry and depth limits before the response starts,
+   * so limit and path errors arrive as problem+json, not as a truncated archive.
+   * Query limits can only lower the server limits (`SANDBOX_AGENT_FS_DOWNLOAD_MAX_BYTES`,
+   * `SANDBOX_AGENT_FS_DOWNLOAD_MAX_ENTRIES`, `SANDBOX_AGENT_FS_DOWNLOAD_MAX_DEPTH`).
+   */
+  get_v1_fs_download_batch: {
+    parameters: {
+      query?: {
+        /** @description Source file or directory (defaults to the home directory) */
+        path?: string | null;
+        /** @description Maximum total file bytes (default 4 GiB) */
+        maxBytes?: number | null;
+        /** @description Maximum number of entries (default 100000) */
+        maxEntries?: number | null;
+        /** @description Maximum nesting depth (default 64) */
+        maxDepth?: number | null;
+      };
+    };
+    responses: {
+      /** @description tar archive stream */
+      200: {
+        content: {
+          "application/x-tar": string;
+        };
+      };
+      /** @description Invalid path, symlink, unsupported entry, or limit exceeded (`urn:sandbox-agent:error:limit_exceeded`) */
+      400: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
         };

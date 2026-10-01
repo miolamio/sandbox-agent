@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import {
   InMemorySessionPersistDriver,
   SandboxAgent,
+  SandboxAgentError,
   SessionRequestInterruptedError,
   type ListEventsRequest,
   type ListPage,
@@ -127,6 +128,43 @@ function buildTarArchive(entries: Array<{ name: string; content: string }>): Uin
 
   blocks.push(Buffer.alloc(1024, 0));
   return Buffer.concat(blocks);
+}
+
+/** Minimal tar reader for tests: returns file contents by path and `dir/` keys for directories. */
+function parseTarArchive(bytes: Uint8Array): Map<string, string | null> {
+  const out = new Map<string, string | null>();
+  const decoder = new TextDecoder();
+  const readString = (offset: number, length: number) => {
+    const slice = bytes.subarray(offset, offset + length);
+    const end = slice.indexOf(0);
+    return decoder.decode(end === -1 ? slice : slice.subarray(0, end));
+  };
+  let offset = 0;
+  let longName: string | null = null;
+  while (offset + 512 <= bytes.length) {
+    if (bytes.subarray(offset, offset + 512).every((byte) => byte === 0)) {
+      break;
+    }
+    const size = Number.parseInt(readString(offset + 124, 12).trim() || "0", 8);
+    const type = String.fromCharCode(bytes[offset + 156] || 0x30);
+    const prefix = readString(offset + 345, 155);
+    let name = longName ?? (prefix && readString(offset + 257, 6) === "ustar" ? `${prefix}/` : "") + readString(offset, 100);
+    longName = null;
+    const dataStart = offset + 512;
+    const data = bytes.subarray(dataStart, dataStart + size);
+    offset = dataStart + Math.ceil(size / 512) * 512;
+    if (type === "L") {
+      longName = decoder.decode(data).replace(/\0+$/, "");
+      continue;
+    }
+    name = name.replace(/^\.\//, "");
+    if (type === "5") {
+      out.set(name.endsWith("/") ? name : `${name}/`, null);
+    } else if (type === "0" || type === "\0") {
+      out.set(name, decoder.decode(data));
+    }
+  }
+  return out;
 }
 
 function writeTarString(buffer: Buffer, offset: number, length: number, value: string): void {
@@ -349,6 +387,47 @@ describe("Integration: TypeScript SDK flat session API", () => {
 
       const deleted = await sdk.deleteFsEntry({ path: movedPath });
       expect(deleted.path).toBe(movedPath);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+      await sdk.dispose();
+    }
+  });
+
+  it("downloads a directory as tar via downloadFsBatch", async () => {
+    const sdk = await SandboxAgent.connect({
+      baseUrl,
+      token,
+    });
+
+    const directory = join(layout.rootDir, "fs-download-batch");
+    mkdirSync(directory, { recursive: true });
+
+    try {
+      await sdk.uploadFsBatch(
+        buildTarArchive([
+          { name: "a.txt", content: "alpha" },
+          { name: "nested/b.txt", content: "bravo" },
+        ]),
+        { path: directory },
+      );
+
+      const stream = await sdk.downloadFsBatch({ path: directory });
+      expect(stream).toBeInstanceOf(ReadableStream);
+      const archive = new Uint8Array(await new Response(stream).arrayBuffer());
+      const files = parseTarArchive(archive);
+      expect(files.get("a.txt")).toBe("alpha");
+      expect(files.get("nested/b.txt")).toBe("bravo");
+      expect(files.has("nested/")).toBe(true);
+
+      // Server-side checks fail before streaming starts and surface as SandboxAgentError.
+      const limited = await sdk.downloadFsBatch({ path: directory, maxEntries: 1 }).catch((error: unknown) => error);
+      expect(limited).toBeInstanceOf(SandboxAgentError);
+      expect((limited as SandboxAgentError).status).toBe(400);
+      expect((limited as SandboxAgentError).problem?.type).toBe("urn:sandbox-agent:error:limit_exceeded");
+
+      const missing = await sdk.downloadFsBatch({ path: join(directory, "missing") }).catch((error: unknown) => error);
+      expect(missing).toBeInstanceOf(SandboxAgentError);
+      expect((missing as SandboxAgentError).status).toBe(400);
     } finally {
       rmSync(directory, { recursive: true, force: true });
       await sdk.dispose();

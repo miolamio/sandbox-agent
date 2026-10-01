@@ -2446,6 +2446,84 @@
         }
       }
     },
+    "/v1/fs/download-batch": {
+      "get": {
+        "tags": ["v1"],
+        "summary": "Download a file or directory as a tar archive.",
+        "description": "Streams `application/x-tar`. For a directory the archive holds its contents\nwithout a wrapper folder (like `tar -C <dir> .`); for a file it holds that\nsingle file. Symlinks and special files are rejected. The whole tree is\nchecked against the byte, entry and depth limits before the response starts,\nso limit and path errors arrive as problem+json, not as a truncated archive.\nQuery limits can only lower the server limits (`SANDBOX_AGENT_FS_DOWNLOAD_MAX_BYTES`,\n`SANDBOX_AGENT_FS_DOWNLOAD_MAX_ENTRIES`, `SANDBOX_AGENT_FS_DOWNLOAD_MAX_DEPTH`).",
+        "operationId": "get_v1_fs_download_batch",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Source file or directory (defaults to the home directory)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "maxBytes",
+            "in": "query",
+            "description": "Maximum total file bytes (default 4 GiB)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "maxEntries",
+            "in": "query",
+            "description": "Maximum number of entries (default 100000)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "maxDepth",
+            "in": "query",
+            "description": "Maximum nesting depth (default 64)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true,
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "tar archive stream",
+            "content": {
+              "application/x-tar": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path, symlink, unsupported entry, or limit exceeded (`urn:sandbox-agent:error:limit_exceeded`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/fs/entries": {
       "get": {
         "tags": ["v1"],
@@ -4573,6 +4651,36 @@
           }
         }
       },
+      "FsDownloadBatchQuery": {
+        "type": "object",
+        "properties": {
+          "maxBytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum total size of regular files in bytes. Can only lower the server limit.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "maxDepth": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum nesting depth below the requested path. Can only lower the server limit.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "maxEntries": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum number of archive entries (files and directories). Can only lower the server limit.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "path": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
       "FsEntriesQuery": {
         "type": "object",
         "properties": {
@@ -4715,6 +4823,19 @@
           }
         }
       },
+      "McpCommand": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ]
+      },
       "McpConfigQuery": {
         "type": "object",
         "required": ["directory", "mcpName"],
@@ -4726,6 +4847,37 @@
             "type": "string"
           }
         }
+      },
+      "McpOAuthConfig": {
+        "type": "object",
+        "properties": {
+          "clientId": {
+            "type": "string",
+            "nullable": true
+          },
+          "clientSecret": {
+            "type": "string",
+            "nullable": true
+          },
+          "scope": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "McpOAuthConfigOrDisabled": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/McpOAuthConfig"
+          },
+          {
+            "type": "boolean"
+          }
+        ]
+      },
+      "McpRemoteTransport": {
+        "type": "string",
+        "enum": ["http", "sse"]
       },
       "McpServerConfig": {
         "oneOf": [
@@ -5283,50 +5435,6 @@
             "type": "string"
           }
         }
-      },
-      "McpCommand": {
-        "oneOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          }
-        ]
-      },
-      "McpRemoteTransport": {
-        "type": "string",
-        "enum": ["http", "sse"]
-      },
-      "McpOAuthConfig": {
-        "type": "object",
-        "properties": {
-          "clientId": {
-            "type": "string",
-            "nullable": true
-          },
-          "clientSecret": {
-            "type": "string",
-            "nullable": true
-          },
-          "scope": {
-            "type": "string",
-            "nullable": true
-          }
-        }
-      },
-      "McpOAuthConfigOrDisabled": {
-        "oneOf": [
-          {
-            "$ref": "#/components/schemas/McpOAuthConfig"
-          },
-          {
-            "type": "boolean"
-          }
-        ]
       }
     }
   },

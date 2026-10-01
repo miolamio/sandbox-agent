@@ -70,6 +70,7 @@ import {
   type FsMoveResponse,
   type FsPathQuery,
   type FsStat,
+  type FsDownloadBatchQuery,
   type FsUploadBatchQuery,
   type FsUploadBatchResponse,
   type FsWriteResponse,
@@ -2213,6 +2214,29 @@ export class SandboxAgent {
       accept: "application/json",
     });
     return (await response.json()) as FsUploadBatchResponse;
+  }
+
+  /**
+   * Download a file or directory as a streamed tar archive.
+   *
+   * Directory archives contain the directory contents without a wrapper folder. Path,
+   * symlink and limit errors are thrown as `SandboxAgentError` before any bytes arrive.
+   * Use `new Response(stream).arrayBuffer()` to buffer it, or pipe it to disk.
+   */
+  async downloadFsBatch(query: FsDownloadBatchQuery = {}, options: { signal?: AbortSignal } = {}): Promise<ReadableStream<Uint8Array>> {
+    const response = await this.requestRaw("GET", `${FS_PATH}/download-batch`, {
+      query,
+      accept: "application/x-tar",
+      signal: options.signal,
+    });
+    return (
+      response.body ??
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.close();
+        },
+      })
+    );
   }
 
   async getMcpConfig(query: McpConfigQuery): Promise<McpServerConfig> {

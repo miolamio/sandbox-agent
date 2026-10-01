@@ -52,6 +52,7 @@ use crate::process_runtime::{
 use crate::ui;
 use acp_http_adapter::process::PostMode;
 
+mod download_batch;
 mod support;
 mod types;
 use self::support::*;
@@ -290,6 +291,7 @@ pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>)
         .route("/fs/move", post(post_v1_fs_move))
         .route("/fs/stat", get(get_v1_fs_stat))
         .route("/fs/upload-batch", post(post_v1_fs_upload_batch))
+        .route("/fs/download-batch", get(get_v1_fs_download_batch))
         .route(
             "/processes/config",
             get(get_v1_processes_config).post(post_v1_processes_config),
@@ -485,6 +487,7 @@ pub async fn shutdown_servers(state: &Arc<AppState>, process_grace: std::time::D
         post_v1_fs_move,
         get_v1_fs_stat,
         post_v1_fs_upload_batch,
+        get_v1_fs_download_batch,
         get_v1_processes_config,
         post_v1_processes_config,
         post_v1_processes,
@@ -564,6 +567,7 @@ pub async fn shutdown_servers(state: &Arc<AppState>, process_grace: std::time::D
             FsEntriesQuery,
             FsDeleteQuery,
             FsUploadBatchQuery,
+            FsDownloadBatchQuery,
             FsEntryType,
             FsEntry,
             FsStat,
@@ -596,6 +600,10 @@ pub async fn shutdown_servers(state: &Arc<AppState>, process_grace: std::time::D
             McpConfigQuery,
             SkillsConfigQuery,
             McpServerConfig,
+            McpCommand,
+            McpRemoteTransport,
+            McpOAuthConfig,
+            McpOAuthConfigOrDisabled,
             SkillsConfig,
             SkillSource,
             ProblemDetails,
@@ -2176,6 +2184,40 @@ async fn post_v1_fs_upload_batch(
         paths: extracted,
         truncated,
     }))
+}
+
+/// Download a file or directory as a tar archive.
+///
+/// Streams `application/x-tar`. For a directory the archive holds its contents
+/// without a wrapper folder (like `tar -C <dir> .`); for a file it holds that
+/// single file. Symlinks and special files are rejected. The whole tree is
+/// checked against the byte, entry and depth limits before the response starts,
+/// so limit and path errors arrive as problem+json, not as a truncated archive.
+/// Query limits can only lower the server limits (`SANDBOX_AGENT_FS_DOWNLOAD_MAX_BYTES`,
+/// `SANDBOX_AGENT_FS_DOWNLOAD_MAX_ENTRIES`, `SANDBOX_AGENT_FS_DOWNLOAD_MAX_DEPTH`).
+#[utoipa::path(
+    get,
+    path = "/v1/fs/download-batch",
+    tag = "v1",
+    params(
+        ("path" = Option<String>, Query, description = "Source file or directory (defaults to the home directory)"),
+        ("maxBytes" = Option<u64>, Query, description = "Maximum total file bytes (default 4 GiB)"),
+        ("maxEntries" = Option<u64>, Query, description = "Maximum number of entries (default 100000)"),
+        ("maxDepth" = Option<u64>, Query, description = "Maximum nesting depth (default 64)")
+    ),
+    responses(
+        (status = 200, description = "tar archive stream", content_type = "application/x-tar", body = String),
+        (status = 400, description = "Invalid path, symlink, unsupported entry, or limit exceeded (`urn:sandbox-agent:error:limit_exceeded`)", body = ProblemDetails)
+    )
+)]
+async fn get_v1_fs_download_batch(
+    Query(query): Query<FsDownloadBatchQuery>,
+) -> Result<Response, ApiError> {
+    let raw = query.path.clone().unwrap_or_else(|| ".".to_string());
+    let target = resolve_fs_path(&raw)?;
+    let limits = download_batch::DownloadBatchLimits::from_env(|key| std::env::var(key).ok())
+        .narrowed_by(&query);
+    download_batch::stream_download(target, limits).await
 }
 
 /// Get process runtime configuration.

@@ -291,5 +291,7 @@ mod config_endpoints;
 mod control_plane;
 #[path = "v1_api/desktop.rs"]
 mod desktop;
+#[path = "v1_api/fs_download_batch.rs"]
+mod fs_download_batch;
 #[path = "v1_api/processes.rs"]
 mod processes;

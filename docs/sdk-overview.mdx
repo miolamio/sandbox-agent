@@ -244,8 +244,14 @@ await sdk.installAgent("codex", { reinstall: true });
 const entries = await sdk.listFsEntries({ path: "." });
 const writeResult = await sdk.writeFsFile({ path: "./hello.txt" }, "hello");
 
-console.log(health.status, agents.agents.length, entries.length, writeResult.path);
+// Directory as a streamed tar archive (ReadableStream<Uint8Array>).
+const archive = await sdk.downloadFsBatch({ path: "./results" });
+const archiveBytes = new Uint8Array(await new Response(archive).arrayBuffer());
+
+console.log(health.status, agents.agents.length, entries.length, writeResult.path, archiveBytes.byteLength);
 ```
+
+`downloadFsBatch(query, { signal })` resolves once the server has validated the request and returns the response body as a stream; path, symlink, and limit errors reject with `SandboxAgentError`. `uploadFsBatch(body, query)` is the matching upload. See [File System](/file-system#batch-download-tar) for limits.
 
 ## Desktop API
 
