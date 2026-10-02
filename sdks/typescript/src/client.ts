@@ -2999,6 +2999,10 @@ export class SandboxAgent {
             return;
           }
           const scan = await this.scanPersistedSessionEvents(sessionId);
+          // dispose() or destroySession() may have dropped the turn during the scan.
+          if (this.disposed || this.foreignTurnBuffers.get(key) !== events) {
+            return;
+          }
           if ((responseEventId !== undefined && scan.ids.has(responseEventId)) || events.every((event) => scan.ids.has(event.id))) {
             this.foreignTurnBuffers.delete(key);
             return;
