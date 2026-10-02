@@ -138,17 +138,13 @@ export class PostgresSessionPersistDriver implements SessionPersistDriver {
   async insertEvent(_sessionId: string, event: SessionEvent): Promise<void> {
     await this.ready();
 
+    // Idempotent per event id: clients sharing this database insert the same
+    // server event once each, and the first record wins.
     await this.pool.query(
       `INSERT INTO ${this.table("events")} (
         id, event_index, session_id, created_at, connection_id, sender, payload_json
       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-      ON CONFLICT(id) DO UPDATE SET
-        event_index = EXCLUDED.event_index,
-        session_id = EXCLUDED.session_id,
-        created_at = EXCLUDED.created_at,
-        connection_id = EXCLUDED.connection_id,
-        sender = EXCLUDED.sender,
-        payload_json = EXCLUDED.payload_json`,
+      ON CONFLICT(id) DO NOTHING`,
       [event.id, event.eventIndex, event.sessionId, event.createdAt, event.connectionId, event.sender, event.payload],
     );
   }
