@@ -1398,27 +1398,36 @@ describe("Integration: TypeScript SDK flat session API", () => {
     try {
       const oldServerId = session.serverId;
       await author.dispose();
+      expect((await observer.listAcpServers()).servers.map((server) => server.serverId)).not.toContain(oldServerId);
 
-      // Whether this first prompt is sent again automatically is not pinned here.
-      const first = await withTimeout(
-        watched.prompt([{ type: "text", text: "after the owner left" }]).then(
-          (response) => response,
-          (error: unknown) => error,
-        ),
-        "first prompt after owner dispose",
-      );
-      if (first instanceof Error) {
-        expect(first).toBeInstanceOf(SessionRequestInterruptedError);
-      }
+      // The observer attached without the agent bootstrap query, so its POST to
+      // the deleted server is rejected with a 400 before any agent sees it. The
+      // SDK confirms the server is gone, restores the session on a new server
+      // it owns, and sends the prompt once more, so the call resolves.
+      await expect(withTimeout(watched.prompt([{ type: "text", text: "after the owner left" }]), "first prompt after owner dispose")).resolves.toMatchObject({
+        stopReason: "end_turn",
+      });
 
       const record = await persist.getSession(session.id);
-      expect(record?.serverId).toBeTruthy();
-      expect(record?.serverId).not.toBe(oldServerId);
-      const servers = await observer.listAcpServers();
-      expect(servers.servers.map((server) => server.serverId)).toContain(record?.serverId);
+      const newServerId = record?.serverId;
+      expect(newServerId).toBeTruthy();
+      expect(newServerId).not.toBe(oldServerId);
+      expect(record?.agentSessionId).toBeTruthy();
+      expect((await observer.listAcpServers()).servers.map((server) => server.serverId)).toContain(newServerId);
+
       await expect(withTimeout(watched.prompt([{ type: "text", text: "on the new server" }]), "prompt on new server")).resolves.toMatchObject({
         stopReason: "end_turn",
       });
+      expect((await persist.getSession(session.id))?.serverId).toBe(newServerId);
+
+      // The observer owns the new server now, so its dispose deletes it.
+      await observer.dispose();
+      const checker = await SandboxAgent.connect({ baseUrl, token });
+      try {
+        expect((await checker.listAcpServers()).servers.map((server) => server.serverId)).not.toContain(newServerId);
+      } finally {
+        await checker.dispose();
+      }
     } finally {
       await observer.dispose();
       await author.dispose();

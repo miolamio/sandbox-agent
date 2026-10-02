@@ -16,10 +16,10 @@ When you call `session.prompt(...)` (or `resumeSession(...)`) and the saved sess
 3. Otherwise, creates a fresh session for the same local session id, rebinds the local session to the new runtime session id, and replays recent persisted events into the next prompt as context.
 4. Applies the previously selected mode and config options (model, thought level, and others) again where the agent reports different values.
 
-The same restore runs when a request fails because the agent server is gone (it was removed, or its agent process exited) or the agent no longer knows the session. When any request fails, the SDK asks the server whether the session's agent server still exists. The server stops listing an agent server as soon as its agent process exits, so a crashed agent is never reused.
+The same restore runs when a request fails because the agent server is gone (it was removed, for example because the client that started it called `dispose()`, or its agent process exited) or the agent no longer knows the session. When any request fails, the SDK asks the server whether the session's agent server still exists. The server stops listing an agent server as soon as its agent process exits, so a crashed agent is never reused.
 
 - If the agent rejected the request because it does not know the session, the request is sent once more on the restored session.
-- If the agent server was already gone when the request was sent, the server rejected it before any agent saw it, so the request is sent once more on the restored session.
+- If the agent server was already gone when the request was sent, the server rejected it before any agent saw it, so the request is sent once more on the restored session. This is the usual case for a client that attached with `resumeSession` after the client owning the server disposed: its next prompt restores the session on a new server that it owns and resolves normally (see [Several clients on one session](/sdk-overview#several-clients-on-one-session)).
 - If the agent server went away while the request was running (for example in the middle of a prompt turn), mode and config changes are sent again, but prompts and other requests are not, because the agent may already have run them. The SDK throws `SessionRequestInterruptedError` instead. Its `session` property holds the restored session, so you can send the prompt again if you want to.
 
 Sessions on other agent servers are not affected. If the server itself cannot be reached, nothing is restored and the original error is thrown.
