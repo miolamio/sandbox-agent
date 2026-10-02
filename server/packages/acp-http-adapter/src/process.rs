@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, watch, Mutex};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::registry::LaunchSpec;
@@ -237,6 +237,9 @@ pub struct AdapterRuntime {
     first_stdout: Arc<AtomicBool>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     exit_info: Arc<Mutex<Option<ExitInfo>>>,
+    // Becomes true once the agent process has exited (or its status could not
+    // be read), before pending requests are failed.
+    exited: Arc<watch::Sender<bool>>,
 }
 
 impl AdapterRuntime {
@@ -305,6 +308,7 @@ impl AdapterRuntime {
             first_stdout: Arc::new(AtomicBool::new(false)),
             stderr_tail: Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_SIZE))),
             exit_info: Arc::new(Mutex::new(None)),
+            exited: Arc::new(watch::channel(false).0),
         };
 
         runtime.spawn_stdout_loop(stdout);
@@ -852,6 +856,7 @@ impl AdapterRuntime {
         let inputs = self.inputs.clone();
         let stderr_tail = self.stderr_tail.clone();
         let exit_info = self.exit_info.clone();
+        let exited = self.exited.clone();
 
         tokio::spawn(async move {
             // Do not hold the child lock across Child::wait(). The timeout and
@@ -877,6 +882,9 @@ impl AdapterRuntime {
                 let stderr = stderr_tail_text(&stderr_tail).await;
                 *exit_info.lock().await = Some((status.code(), stderr));
             }
+            // Before failing pending requests: a client that reacts to those
+            // errors by checking for the server must already see it gone.
+            exited.send_replace(true);
 
             let pending_count =
                 fail_pending_requests(&pending, &inputs, &events, TurnOutcome::AgentExited).await;
@@ -963,6 +971,19 @@ impl AdapterRuntime {
 
     pub async fn stderr_tail_summary(&self) -> Option<String> {
         stderr_tail_text(&self.stderr_tail).await
+    }
+
+    /// True once the agent process has exited on its own or was killed. Set
+    /// before pending requests are failed, so anyone reacting to those errors
+    /// already sees the runtime as exited.
+    pub fn has_exited(&self) -> bool {
+        *self.exited.borrow()
+    }
+
+    /// Watches [`Self::has_exited`]. The receiver does not keep the runtime
+    /// alive; waiting on it ends with an error once the runtime is dropped.
+    pub fn exit_watch(&self) -> watch::Receiver<bool> {
+        self.exited.subscribe()
     }
 }
 
@@ -1189,6 +1210,30 @@ mod tests {
             "method": "session/prompt",
             "params": {}
         })
+    }
+
+    #[tokio::test]
+    async fn exit_is_reported_before_pending_requests_fail() {
+        let runtime = AdapterRuntime::start(sh("read -r _line; exit 3"), Duration::from_secs(30))
+            .await
+            .expect("start runtime");
+        let mut exit_watch = runtime.exit_watch();
+        assert!(!runtime.has_exited());
+
+        let err = tokio::time::timeout(Duration::from_secs(5), runtime.post(prompt(1)))
+            .await
+            .expect("post wakes on exit")
+            .expect_err("post fails when the agent exits");
+        assert!(matches!(err, AdapterError::Exited { .. }), "got {err:?}");
+        // Already set when the failed request returns.
+        assert!(runtime.has_exited());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            exit_watch.wait_for(|exited| *exited),
+        )
+        .await
+        .expect("exit watch resolves")
+        .expect("runtime still alive");
     }
 
     #[tokio::test]

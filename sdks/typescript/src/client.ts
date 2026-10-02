@@ -1810,22 +1810,26 @@ export class SandboxAgent {
    * - "session_missing": the agent rejected the request because it does not
    *   know the session, so it did not run it; the session is unbound and the
    *   request can be repeated after restoring.
-   * - "server_gone": the request failed at the HTTP level and the agent server
-   *   no longer exists; the connection is dropped. The agent may still have
-   *   received the request before the server went away.
+   * - "not_delivered": the agent server no longer exists and the request was
+   *   rejected over HTTP before reaching any agent, so it can be repeated after
+   *   restoring; the connection is dropped.
+   * - "server_gone": the agent server no longer exists (deleted, or its agent
+   *   process exited) and the request may have reached the agent before that;
+   *   the connection is dropped.
+   *
+   * Server loss is recognised by asking the server, not by the error code: a
+   * turn cut off mid-way fails over the event stream (-32603), a rejected POST
+   * with -32003, a lost connection as a network error. The server lists an
+   * agent server only while its agent process is running.
    */
-  private async prepareSessionRecovery(live: LiveAcpConnection, record: SessionRecord, error: unknown): Promise<"session_missing" | "server_gone" | null> {
-    if (!(error instanceof AcpRpcError)) {
-      return null;
-    }
-
-    if (isMissingRemoteSessionError(error, record.agentSessionId)) {
+  private async prepareSessionRecovery(
+    live: LiveAcpConnection,
+    record: SessionRecord,
+    error: unknown,
+  ): Promise<"session_missing" | "not_delivered" | "server_gone" | null> {
+    if (error instanceof AcpRpcError && isMissingRemoteSessionError(error, record.agentSessionId)) {
       live.unbindSession(record.id);
       return "session_missing";
-    }
-
-    if (error.code !== ACP_HTTP_TRANSPORT_ERROR_CODE) {
-      return null;
     }
 
     let servers: AcpServerListResponse;
@@ -1839,7 +1843,7 @@ export class SandboxAgent {
     }
 
     await this.discardLiveConnection(live);
-    return "server_gone";
+    return isRejectedBeforeDelivery(error) ? "not_delivered" : "server_gone";
   }
 
   private async discardLiveConnection(live: LiveAcpConnection): Promise<void> {
@@ -3270,6 +3274,20 @@ function normalizeSessionInit(
 
 // acp-http-client reports HTTP-level request failures with this JSON-RPC code.
 const ACP_HTTP_TRANSPORT_ERROR_CODE = -32003;
+
+/**
+ * The POST carrying the request was rejected with a 4xx status. The server
+ * answers 4xx only before forwarding anything to the agent process (unknown
+ * server, invalid request), so the agent never saw the request. 5xx (agent
+ * exited, timeout, write failure) may come after the agent received it.
+ */
+function isRejectedBeforeDelivery(error: unknown): boolean {
+  if (!(error instanceof AcpRpcError) || error.code !== ACP_HTTP_TRANSPORT_ERROR_CODE) {
+    return false;
+  }
+  const status = (error.data as { status?: unknown } | null | undefined)?.status;
+  return typeof status === "number" && status >= 400 && status < 500;
+}
 
 function nonEmptyString(value: unknown): string | undefined {
   if (typeof value !== "string") {
