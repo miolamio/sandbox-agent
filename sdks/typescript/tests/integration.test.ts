@@ -124,6 +124,27 @@ async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 15
   ]);
 }
 
+async function deleteAcpServer(baseUrl: string, token: string | undefined, serverId: string): Promise<void> {
+  const response = await fetch(`${baseUrl}/v1/acp/${encodeURIComponent(serverId)}`, {
+    method: "DELETE",
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  });
+  expect(response.ok).toBe(true);
+}
+
+/**
+ * Client `session/prompt` events of a session whose user text (the last text
+ * block; replayed history is prepended as the first one) contains `text`.
+ */
+async function clientPromptsWithText(sdk: SandboxAgent, sessionId: string, text: string): Promise<SessionEvent[]> {
+  const events = await sdk.getEvents({ sessionId, limit: 500 });
+  return events.items.filter((event) => {
+    const payload = event.payload as { method?: string; params?: { prompt?: Array<{ text?: unknown }> } };
+    const userText = (payload.params?.prompt ?? []).filter((block) => typeof block.text === "string").at(-1)?.text as string | undefined;
+    return event.sender === "client" && payload.method === "session/prompt" && userText?.includes(text) === true;
+  });
+}
+
 function buildTarArchive(entries: Array<{ name: string; content: string }>): Uint8Array {
   const blocks: Buffer[] = [];
 
@@ -735,7 +756,7 @@ describe("Integration: TypeScript SDK flat session API", () => {
     }
   });
 
-  it("restores a session whose agent server was deleted without sending the prompt twice", async () => {
+  it("delivers a prompt once after its agent server was deleted between turns", async () => {
     const sdk = await SandboxAgent.connect({ baseUrl, token });
     try {
       const session = await sdk.createSession({ agent: "mock" });
@@ -743,43 +764,191 @@ describe("Integration: TypeScript SDK flat session API", () => {
 
       const serverId = (await sdk.getSession(session.id))?.serverId;
       expect(serverId).toBeTruthy();
+      await deleteAcpServer(baseUrl, token, serverId!);
 
-      const response = await fetch(`${baseUrl}/v1/acp/${encodeURIComponent(serverId!)}`, {
-        method: "DELETE",
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-      });
-      expect(response.ok).toBe(true);
+      // The server was already gone when the prompt was posted, so the agent
+      // never saw it: the SDK restores the session and sends it once.
+      const turnEvents: SessionTurnEvent[] = [];
+      session.onTurnEvent((event) => turnEvents.push(event));
+      const prompt = await withTimeout(session.prompt([{ type: "text", text: "after delete" }]), "prompt after server delete");
+      expect(prompt.stopReason).toBe("end_turn");
 
-      // The agent may have run a prompt before its server went away, so the SDK
-      // restores the session but does not send the prompt again by itself.
-      const interrupted = await withTimeout(
-        session.prompt([{ type: "text", text: "after delete" }]).then(
+      await waitFor(() => turnEvents.find((event) => event.type === "turn_ended"));
+      expect(turnEvents.filter((event) => event.type === "turn_started")).toHaveLength(1);
+
+      const restored = await sdk.getSession(session.id);
+      expect(restored?.serverId).toBeTruthy();
+      expect(restored?.serverId).not.toBe(serverId);
+      const servers = await sdk.listAcpServers();
+      expect(servers.servers.map((server) => server.serverId)).toContain(restored!.serverId);
+      expect(servers.servers.map((server) => server.serverId)).not.toContain(serverId);
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("treats a 4xx without a sandbox-agent problem body as possibly delivered", async () => {
+    // A proxy in front of the server can answer 408/429/499 after it already
+    // forwarded the request, so such a 4xx must not lead to a silent resend.
+    const defaultFetch = globalThis.fetch;
+    // Set to the deleted server's id: the proxy rejects POSTs to it.
+    let proxyRejectsServer: string | null = null;
+    const proxyFetch: typeof fetch = async (input, init) => {
+      const outgoing = new Request(input, init);
+      const parsed = new URL(outgoing.url);
+      const forwarded = await forwardRequest(defaultFetch, baseUrl, outgoing, parsed);
+      if (proxyRejectsServer && outgoing.method === "POST" && parsed.pathname === `/v1/acp/${encodeURIComponent(proxyRejectsServer)}`) {
+        await forwarded.text().catch(() => {});
+        // A generic problem body, as many gateways send: a status, but not a
+        // Sandbox Agent problem type.
+        return new Response(JSON.stringify({ type: "about:blank", title: "Too Many Requests", status: 429 }), {
+          status: 429,
+          headers: { "Content-Type": "application/problem+json" },
+        });
+      }
+      return forwarded;
+    };
+
+    const sdk = await SandboxAgent.connect({ token, fetch: proxyFetch });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      await session.prompt([{ type: "text", text: "before delete" }]);
+      const serverId = (await sdk.getSession(session.id))?.serverId;
+      await deleteAcpServer(baseUrl, token, serverId!);
+
+      proxyRejectsServer = serverId ?? null;
+      const failed = await withTimeout(
+        session.prompt([{ type: "text", text: "rejected by proxy" }]).then(
           () => null,
           (error: unknown) => error,
         ),
-        "prompt after server delete",
+        "prompt rejected by proxy",
       );
+      proxyRejectsServer = null;
+
+      expect(failed).toBeInstanceOf(SessionRequestInterruptedError);
+      expect(await clientPromptsWithText(sdk, session.id, "rejected by proxy")).toHaveLength(1);
+      const next = await withTimeout(session.prompt([{ type: "text", text: "resent by caller" }]), "prompt after proxy rejection");
+      expect(next.stopReason).toBe("end_turn");
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("reports an interrupted prompt and restores the session when its agent server is deleted mid-turn", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    // Another client with its own agent server must not be affected.
+    const bystander = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const other = await bystander.createSession({ agent: "mock" });
+      await session.prompt([{ type: "text", text: "before delete" }]);
+      const serverId = (await sdk.getSession(session.id))?.serverId;
+      const otherServerId = (await bystander.getSession(other.id))?.serverId;
+      expect(serverId).toBeTruthy();
+      expect(otherServerId).toBeTruthy();
+      expect(otherServerId).not.toBe(serverId);
+
+      const turnEvents: SessionTurnEvent[] = [];
+      session.onTurnEvent((event) => turnEvents.push(event));
+      const pending = session.prompt([{ type: "text", text: "delay:20000 mid-turn" }]).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await waitFor(() => turnEvents.find((event) => event.type === "turn_started"));
+      await deleteAcpServer(baseUrl, token, serverId!);
+
+      const interrupted = await withTimeout(pending, "prompt interrupted by server delete");
       expect(interrupted).toBeInstanceOf(SessionRequestInterruptedError);
       expect((interrupted as SessionRequestInterruptedError).session.id).toBe(session.id);
+      expect((interrupted as SessionRequestInterruptedError).method).toBe("session/prompt");
 
-      const promptsWithText = async (text: string) => {
-        const events = await sdk.getEvents({ sessionId: session.id, limit: 500 });
-        return events.items.filter((event) => {
-          const payload = event.payload as { method?: string; params?: { prompt?: Array<{ text?: unknown }> } };
-          return (
-            event.sender === "client" &&
-            payload.method === "session/prompt" &&
-            (payload.params?.prompt ?? []).some((block) => typeof block.text === "string" && block.text.includes(text))
-          );
-        });
-      };
-      expect(await promptsWithText("after delete")).toHaveLength(1);
+      // Restored before the error was thrown, and the interrupted prompt was
+      // not sent again.
+      const restored = await sdk.getSession(session.id);
+      expect(restored?.serverId).toBeTruthy();
+      expect(restored?.serverId).not.toBe(serverId);
+      expect(await clientPromptsWithText(sdk, session.id, "mid-turn")).toHaveLength(1);
 
-      const servers = await sdk.listAcpServers();
-      expect(servers.servers.some((server) => server.agent === "mock")).toBe(true);
+      const next = await withTimeout(session.prompt([{ type: "text", text: "resent by caller" }]), "prompt on restored session");
+      expect(next.stopReason).toBe("end_turn");
+      expect(await clientPromptsWithText(sdk, session.id, "mid-turn")).toHaveLength(1);
 
-      const prompt = await withTimeout(session.prompt([{ type: "text", text: "resent by caller" }]), "prompt on restored session");
-      expect(prompt.stopReason).toBe("end_turn");
+      const servers = (await sdk.listAcpServers()).servers.map((server) => server.serverId);
+      expect(servers).toContain(otherServerId);
+      expect(servers).not.toContain(serverId);
+      const otherPrompt = await withTimeout(other.prompt([{ type: "text", text: "bystander keeps working" }]), "bystander prompt");
+      expect(otherPrompt.stopReason).toBe("end_turn");
+      expect((await bystander.getSession(other.id))?.serverId).toBe(otherServerId);
+    } finally {
+      await bystander.dispose();
+      await sdk.dispose();
+    }
+  });
+
+  it("restores a session after its agent process crashes while the server stays up", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const serverId = (await sdk.getSession(session.id))?.serverId;
+      expect(serverId).toBeTruthy();
+
+      const crashed = await withTimeout(
+        session.prompt([{ type: "text", text: "crash:now" }]).then(
+          () => null,
+          (error: unknown) => error,
+        ),
+        "crashing prompt",
+      );
+      expect(crashed).toBeInstanceOf(SessionRequestInterruptedError);
+      expect(await clientPromptsWithText(sdk, session.id, "crash:now")).toHaveLength(1);
+
+      // The dead agent server is no longer listed, so it cannot be reused.
+      const servers = (await sdk.listAcpServers()).servers.map((server) => server.serverId);
+      expect(servers).not.toContain(serverId);
+
+      const next = await withTimeout(session.prompt([{ type: "text", text: "continue after agent exit" }]), "prompt after agent crash");
+      expect(next.stopReason).toBe("end_turn");
+      const restored = await sdk.getSession(session.id);
+      expect(restored?.serverId).toBeTruthy();
+      expect(restored?.serverId).not.toBe(serverId);
+      expect(await clientPromptsWithText(sdk, session.id, "crash:now")).toHaveLength(1);
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("delivers a prompt once when the agent process crashed while the session was idle", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const record = await sdk.getSession(session.id);
+      const serverId = record!.serverId!;
+      const turnEvents: SessionTurnEvent[] = [];
+      session.onTurnEvent((event) => turnEvents.push(event));
+      // A finished turn makes sure the event stream is connected.
+      await session.prompt([{ type: "text", text: "warm up" }]);
+
+      // Crash the agent process directly, without this client sending anything.
+      const crash = await fetch(`${baseUrl}/v1/acp/${encodeURIComponent(serverId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "raw-crash",
+          method: "session/prompt",
+          params: { sessionId: record!.agentSessionId, prompt: [{ type: "text", text: "crash:now" }] },
+        }),
+      });
+      expect(crash.status).toBe(500);
+      await waitFor(() => turnEvents.find((event) => event.type === "turn_ended" && event.outcome === "agent_exited"));
+
+      const next = await withTimeout(session.prompt([{ type: "text", text: "after idle crash" }]), "prompt after idle crash");
+      expect(next.stopReason).toBe("end_turn");
+      await waitFor(() => turnEvents.find((event) => event.type === "turn_ended" && event.outcome === "completed"));
+      // Warm-up, crash, and the delivered prompt: one turn each.
+      expect(turnEvents.filter((event) => event.type === "turn_started")).toHaveLength(3);
+      expect((await sdk.getSession(session.id))?.serverId).not.toBe(serverId);
     } finally {
       await sdk.dispose();
     }

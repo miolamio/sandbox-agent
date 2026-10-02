@@ -70,6 +70,24 @@ function emit(value) {
   process.stdout.write(JSON.stringify(value) + "\n");
 }
 
+// The text the user sent: the last text block, because a restored session
+// prepends its replayed history as the first block. Test hooks match only this
+// text, so a hook in replayed history does not fire again.
+function userText(prompt) {
+  if (!Array.isArray(prompt)) {
+    return "";
+  }
+
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    const block = prompt[index];
+    if (block && block.type === "text" && typeof block.text === "string") {
+      return block.text;
+    }
+  }
+
+  return "";
+}
+
 function firstText(prompt) {
   if (!Array.isArray(prompt)) {
     return "";
@@ -336,7 +354,7 @@ rl.on("line", (line) => {
   }
 
   if (method === "session/prompt") {
-    const text = firstText(msg?.params?.prompt);
+    const text = userText(msg?.params?.prompt);
     if (text.includes("permission")) {
       return;
     }

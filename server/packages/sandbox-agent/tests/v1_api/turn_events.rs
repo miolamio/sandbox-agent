@@ -10,7 +10,7 @@ const TURN_ENDED: &str = "_sandboxagent/session/turn_ended";
 const AWAITING_INPUT: &str = "_sandboxagent/session/awaiting_input";
 const INPUT_RESOLVED: &str = "_sandboxagent/session/input_resolved";
 
-fn prompt(id: u64, session_id: &str, text: &str) -> Value {
+pub(super) fn prompt(id: u64, session_id: &str, text: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -23,7 +23,7 @@ fn prompt(id: u64, session_id: &str, text: &str) -> Value {
 }
 
 /// Creates the server with the built-in mock agent (installing its launcher first).
-async fn bootstrap_mock(app: &docker_support::DockerApp, server_id: &str) {
+pub(super) async fn bootstrap_mock(app: &docker_support::DockerApp, server_id: &str) {
     let (status, _, body) = send_request(
         app,
         Method::POST,
