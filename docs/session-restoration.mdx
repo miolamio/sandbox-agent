@@ -22,7 +22,7 @@ The same restore runs when a request fails because the agent server is gone (it 
 - If the agent server was already gone when the request was sent, the server rejected it before any agent saw it, so the request is sent once more on the restored session. This is the usual case for a client that attached with `resumeSession` after the client owning the server disposed: its next prompt restores the session on a new server that it owns and resolves normally (see [Several clients on one session](/sdk-overview#several-clients-on-one-session)).
 - If the agent server went away while the request was running (for example in the middle of a prompt turn), mode and config changes are sent again, but prompts and other requests are not, because the agent may already have run them. The SDK throws `SessionRequestInterruptedError` instead. Its `session` property holds the restored session, so you can send the prompt again if you want to.
 
-Sessions on other agent servers are not affected. If the server itself cannot be reached, nothing is restored and the original error is thrown.
+Sessions on other agent servers are not affected. A session only moves to a new agent server once the server's list of agent servers confirms the old one is gone. If the server itself cannot be reached, or that list cannot be read, nothing is restored: a failed request throws its original error, `resumeSession(...)` throws the list error, and the saved session keeps its `serverId`, so a later attempt reattaches to the same agent server.
 
 This happens automatically; you do not need to manually rebuild the session.
 

@@ -2068,6 +2068,8 @@ export class SandboxAgent {
     try {
       servers = await this.listAcpServers();
     } catch {
+      // Whether the server is gone cannot be confirmed: keep the connection and
+      // let the caller see the original error.
       return null;
     }
     if (servers.servers.some((server) => server.serverId === live.serverId)) {
@@ -2748,7 +2750,8 @@ export class SandboxAgent {
    * Live connection for an agent. With `preferredServerId` (the server a
    * persisted session last ran on), attach to that server if it still exists so
    * its agent process and sessions are reused. Otherwise reuse any connection
-   * for the agent, or start a new server.
+   * for the agent, or start a new server. If the server list cannot be read,
+   * the error is thrown instead of starting a new server.
    */
   private async getLiveConnection(agent: string, preferredServerId?: string): Promise<LiveAcpConnection> {
     await this.awaitHealthy();
@@ -2797,13 +2800,14 @@ export class SandboxAgent {
     return servers.servers.some((server) => server.serverId === serverId);
   }
 
+  /**
+   * Whether the server is listed for the agent. A failed list is thrown, not
+   * taken to mean the server is gone: only a list that was read can confirm
+   * that, and a session is never moved to a new server on a guess.
+   */
   private async isAcpServerRunning(serverId: string, agent: string): Promise<boolean> {
-    try {
-      const { servers } = await this.listAcpServers();
-      return servers.some((server) => server.serverId === serverId && server.agent === agent);
-    } catch {
-      return false;
-    }
+    const { servers } = await this.listAcpServers();
+    return servers.some((server) => server.serverId === serverId && server.agent === agent);
   }
 
   private async openLiveConnection(agent: string, serverId: string, attach: boolean): Promise<LiveAcpConnection> {

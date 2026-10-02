@@ -282,6 +282,31 @@ function nodeCommand(source: string): { command: string; args: string[] } {
   };
 }
 
+/**
+ * A fetch that answers 503 to the selected requests instead of passing them to
+ * the server: `GET /v1/acp` (the server list) while `failList` is set, and
+ * POSTs to the server `failPostTo` while it is set.
+ */
+function createFailingFetch(state: { failList: boolean; failPostTo?: string; failedLists: number }): typeof fetch {
+  return async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+    const fail = () =>
+      new Response(JSON.stringify({ type: "about:blank", title: "Service Unavailable", status: 503 }), {
+        status: 503,
+        headers: { "Content-Type": "application/problem+json" },
+      });
+    if (state.failList && method === "GET" && url.pathname === "/v1/acp") {
+      state.failedLists += 1;
+      return fail();
+    }
+    if (state.failPostTo && method === "POST" && url.pathname === `/v1/acp/${encodeURIComponent(state.failPostTo)}`) {
+      return fail();
+    }
+    return fetch(input, init);
+  };
+}
+
 function forwardRequest(defaultFetch: typeof fetch, baseUrl: string, outgoing: Request, parsed: URL): Promise<Response> {
   const forwardedInit: RequestInit & { duplex?: "half" } = {
     method: outgoing.method,
@@ -1560,6 +1585,91 @@ describe("Integration: TypeScript SDK flat session API", () => {
     } finally {
       await observer.dispose();
       await author.dispose();
+    }
+  });
+
+  it("does not fork a session onto a new server when listing servers fails during resume", async () => {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const state = { failList: true, failedLists: 0 };
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist, fetch: createFailingFetch(state) });
+    try {
+      const session = await author.createSession({ agent: "mock" });
+      await session.prompt([{ type: "text", text: "before list failure" }]);
+      const serverId = session.serverId!;
+      const before = await persist.getSession(session.id);
+
+      await expect(observer.resumeSession(session.id)).rejects.toBeTruthy();
+      expect(state.failedLists).toBeGreaterThan(0);
+      expect(await persist.getSession(session.id)).toEqual(before);
+      expect((await author.listAcpServers()).servers.map((server) => server.serverId)).toEqual([serverId]);
+
+      // A request that restores the session on its own (no resumeSession first) fails the same way.
+      await expect(observer.rawSendSessionMethod(session.id, "session/prompt", { prompt: [{ type: "text", text: "while list fails" }] })).rejects.toBeTruthy();
+      expect(await persist.getSession(session.id)).toEqual(before);
+      expect((await author.listAcpServers()).servers.map((server) => server.serverId)).toEqual([serverId]);
+      expect(await clientPromptsWithText(author, session.id, "while list fails")).toHaveLength(0);
+
+      state.failList = false;
+      const watched = await observer.resumeSession(session.id);
+      expect(watched.serverId).toBe(serverId);
+      expect(watched.agentSessionId).toBe(session.agentSessionId);
+      expect((await author.listAcpServers()).servers.map((server) => server.serverId)).toEqual([serverId]);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("does not recover a failed prompt while listing servers fails", async () => {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    const state: { failList: boolean; failPostTo?: string; failedLists: number } = { failList: false, failedLists: 0 };
+    const sdk = await SandboxAgent.connect({ baseUrl, token, persist, fetch: createFailingFetch(state) });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      await session.prompt([{ type: "text", text: "before failures" }]);
+      const serverId = session.serverId!;
+      const before = await persist.getSession(session.id);
+
+      // The server is alive but the prompt and the list both fail: the prompt
+      // fails, and the session stays on its server.
+      state.failList = true;
+      state.failPostTo = serverId;
+      await expect(session.prompt([{ type: "text", text: "rejected prompt" }])).rejects.not.toBeInstanceOf(SessionRequestInterruptedError);
+      expect(state.failedLists).toBeGreaterThan(0);
+      expect(await persist.getSession(session.id)).toEqual(before);
+      state.failPostTo = undefined;
+      expect(await sdk.listAcpServers().catch(() => null)).toBeNull();
+      state.failList = false;
+      expect((await sdk.listAcpServers()).servers.map((server) => server.serverId)).toEqual([serverId]);
+
+      const retried = await withTimeout(session.prompt([{ type: "text", text: "after failures" }]), "prompt after failures");
+      expect(retried.stopReason).toBe("end_turn");
+      expect((await persist.getSession(session.id))?.serverId).toBe(serverId);
+
+      // The server is gone, but while the list fails that cannot be confirmed:
+      // the prompt fails and no new server is started.
+      await deleteAcpServer(baseUrl, token, serverId);
+      state.failList = true;
+      const lostBefore = await persist.getSession(session.id);
+      await expect(session.prompt([{ type: "text", text: "server unconfirmed" }])).rejects.not.toBeInstanceOf(SessionRequestInterruptedError);
+      expect(await persist.getSession(session.id)).toEqual(lostBefore);
+      state.failList = false;
+      expect((await sdk.listAcpServers()).servers).toEqual([]);
+
+      // Once the list confirms the server is gone, the session is restored and
+      // the prompt is delivered once.
+      const turnEvents: SessionTurnEvent[] = [];
+      session.onTurnEvent((event) => turnEvents.push(event));
+      const recovered = await withTimeout(session.prompt([{ type: "text", text: "after list recovers" }]), "prompt after list recovers");
+      expect(recovered.stopReason).toBe("end_turn");
+      await waitFor(() => turnEvents.find((event) => event.type === "turn_ended"));
+      expect(turnEvents.filter((event) => event.type === "turn_started")).toHaveLength(1);
+      const restored = await persist.getSession(session.id);
+      expect(restored?.serverId).not.toBe(serverId);
+      expect((await sdk.listAcpServers()).servers.map((server) => server.serverId)).toEqual([restored!.serverId]);
+    } finally {
+      await sdk.dispose();
     }
   });
 
