@@ -22,6 +22,7 @@ import {
   type SetSessionModeResponse,
   type SetSessionModeRequest,
   parseSandboxAgentTurnNotification,
+  SANDBOX_AGENT_INPUT_RESOLVED,
   type SandboxAgentRequestId,
   type SandboxAgentTurnNotification,
   type SandboxAgentTurnOutcome,
@@ -124,6 +125,7 @@ const DEFAULT_REPLAY_MAX_CHARS = 12_000;
 const EVENT_INDEX_SCAN_EVENTS_LIMIT = 500;
 const MAX_EVENT_INDEX_INSERT_RETRIES = 3;
 const SESSION_CANCEL_METHOD = "session/cancel";
+const PERMISSION_REQUEST_METHOD = "session/request_permission";
 const MANUAL_CANCEL_ERROR = "Manual session/cancel calls are not allowed. Use destroySession(sessionId) instead.";
 const HEALTH_WAIT_MIN_DELAY_MS = 500;
 const HEALTH_WAIT_MAX_DELAY_MS = 15_000;
@@ -557,12 +559,45 @@ export class Session {
 
 type TurnNotificationHandler = (connection: LiveAcpConnection, localSessionId: string, notification: SandboxAgentTurnNotification) => void;
 
+type ObservedEnvelopeHandler = (
+  connection: LiveAcpConnection,
+  envelope: AnyMessage,
+  direction: AcpEnvelopeDirection,
+  localSessionId: string | null,
+  eventId: string | undefined,
+) => void;
+
+type PermissionRequestContext = {
+  /**
+   * True when this client has a prompt of the session in flight, so the
+   * permission request belongs to its own turn. Only a controlling client may
+   * answer on its own (auto-cancel without a handler).
+   */
+  controlling: boolean;
+  /** JSON-RPC id of the agent's request, matched against `input_resolved`. */
+  rpcId?: string | number;
+};
+
+type PermissionRequestHandler = (
+  connection: LiveAcpConnection,
+  localSessionId: string,
+  agentSessionId: string,
+  request: RequestPermissionRequest,
+  context: PermissionRequestContext,
+) => Promise<RequestPermissionResponse>;
+
 export class LiveAcpConnection {
   readonly connectionId: string;
   readonly agent: string;
   readonly serverId: string;
   /** Whether the agent advertised support for resuming an existing session. */
   readonly supportsResume: boolean;
+  /**
+   * True when this connection created its server. Only the creator deletes the
+   * server when it closes; a connection that attached to an existing server
+   * closes just its own event stream.
+   */
+  readonly ownsServer: boolean;
 
   private readonly acp: AcpHttpClient;
   private readonly sessionByLocalId = new Map<string, string>();
@@ -570,41 +605,33 @@ export class LiveAcpConnection {
   private readonly pendingNewSessionLocals: string[] = [];
   private readonly pendingRequestSessionById = new Map<string, string>();
   private readonly pendingReplayByLocalSessionId = new Map<string, string>();
+  // Prompts this connection sent that have not finished yet, per local session.
+  private readonly activePromptsByLocalSessionId = new Map<string, number>();
+  // JSON-RPC ids of permission requests seen on the event stream and not yet
+  // handed to the handler, keyed by agent session id and tool call id.
+  private readonly permissionRpcIds = new Map<string, string | number>();
   private lastAdapterExit: { success: boolean; code: number | null } | null = null;
   private lastAdapterExitAt = 0;
 
-  private readonly onObservedEnvelope: (
-    connection: LiveAcpConnection,
-    envelope: AnyMessage,
-    direction: AcpEnvelopeDirection,
-    localSessionId: string | null,
-  ) => void;
-  private readonly onPermissionRequest: (
-    connection: LiveAcpConnection,
-    localSessionId: string,
-    agentSessionId: string,
-    request: RequestPermissionRequest,
-  ) => Promise<RequestPermissionResponse>;
+  private readonly onObservedEnvelope: ObservedEnvelopeHandler;
+  private readonly onPermissionRequest: PermissionRequestHandler;
   private readonly onTurnEvent: TurnNotificationHandler;
 
   private constructor(
     agent: string,
     serverId: string,
     supportsResume: boolean,
+    ownsServer: boolean,
     connectionId: string,
     acp: AcpHttpClient,
-    onObservedEnvelope: (connection: LiveAcpConnection, envelope: AnyMessage, direction: AcpEnvelopeDirection, localSessionId: string | null) => void,
-    onPermissionRequest: (
-      connection: LiveAcpConnection,
-      localSessionId: string,
-      agentSessionId: string,
-      request: RequestPermissionRequest,
-    ) => Promise<RequestPermissionResponse>,
+    onObservedEnvelope: ObservedEnvelopeHandler,
+    onPermissionRequest: PermissionRequestHandler,
     onTurnEvent: TurnNotificationHandler,
   ) {
     this.agent = agent;
     this.serverId = serverId;
     this.supportsResume = supportsResume;
+    this.ownsServer = ownsServer;
     this.connectionId = connectionId;
     this.acp = acp;
     this.onObservedEnvelope = onObservedEnvelope;
@@ -620,18 +647,18 @@ export class LiveAcpConnection {
     auth?: SandboxAgentAuthOptions | false;
     agent: string;
     serverId: string;
-    /** Attach to a server that already exists without replaying its buffered events. */
+    /**
+     * Attach to a server that already exists: buffered events are not replayed,
+     * the server is not created if it is gone (connecting fails instead), and
+     * closing the connection leaves the server running.
+     */
     attach?: boolean;
-    onObservedEnvelope: (connection: LiveAcpConnection, envelope: AnyMessage, direction: AcpEnvelopeDirection, localSessionId: string | null) => void;
-    onPermissionRequest: (
-      connection: LiveAcpConnection,
-      localSessionId: string,
-      agentSessionId: string,
-      request: RequestPermissionRequest,
-    ) => Promise<RequestPermissionResponse>;
+    onObservedEnvelope: ObservedEnvelopeHandler;
+    onPermissionRequest: PermissionRequestHandler;
     onTurnEvent: TurnNotificationHandler;
   }): Promise<LiveAcpConnection> {
     const connectionId = randomId();
+    const attach = options.attach === true;
 
     let live: LiveAcpConnection | null = null;
     const acp = new AcpHttpClient({
@@ -641,13 +668,15 @@ export class LiveAcpConnection {
       headers: options.headers,
       transport: {
         path: `${API_PREFIX}/acp/${encodeURIComponent(options.serverId)}`,
-        bootstrapQuery: { agent: options.agent },
-        skipBufferedEvents: options.attach === true,
+        // Without the agent the server rejects the first request instead of
+        // creating the server, so attaching never starts a server of its own.
+        bootstrapQuery: attach ? undefined : { agent: options.agent },
+        skipBufferedEvents: attach,
       },
       client: {
         requestPermission: async (request: RequestPermissionRequest) => {
           if (!live) {
-            return cancelledPermissionResponse();
+            return unansweredPermissionResponse();
           }
           return live.handlePermissionRequest(request);
         },
@@ -659,26 +688,33 @@ export class LiveAcpConnection {
           live.handleAdapterNotification(method, params);
         },
       },
-      onEnvelope: (envelope, direction) => {
+      onEnvelope: (envelope, direction, meta) => {
         if (!live) {
           return;
         }
-        live.handleEnvelope(envelope, direction);
+        live.handleEnvelope(envelope, direction, meta?.eventId);
       },
     });
 
-    const initResult = await acp.initialize({
-      protocolVersion: PROTOCOL_VERSION,
-      clientInfo: {
-        name: "sandbox-agent-sdk",
-        version: "v1",
-      },
-    });
+    let initResult: Awaited<ReturnType<AcpHttpClient["initialize"]>>;
+    try {
+      initResult = await acp.initialize({
+        protocolVersion: PROTOCOL_VERSION,
+        clientInfo: {
+          name: "sandbox-agent-sdk",
+          version: "v1",
+        },
+      });
+    } catch (error) {
+      await acp.disconnect({ deleteServer: !attach }).catch(() => {});
+      throw error;
+    }
     const supportsResume = initResult.agentCapabilities?.sessionCapabilities?.resume != null;
     live = new LiveAcpConnection(
       options.agent,
       options.serverId,
       supportsResume,
+      !attach,
       connectionId,
       acp,
       options.onObservedEnvelope,
@@ -690,15 +726,19 @@ export class LiveAcpConnection {
       try {
         await autoAuthenticate(acp, options.agent, initResult.authMethods, options.auth);
       } catch (error) {
-        await acp.disconnect().catch(() => {});
+        await acp.disconnect({ deleteServer: !attach }).catch(() => {});
         throw error;
       }
     }
     return live;
   }
 
-  async close(): Promise<void> {
-    await this.acp.disconnect();
+  /**
+   * Closes this connection. By default the server is deleted only when this
+   * connection created it; `deleteServer` overrides that.
+   */
+  async close(options: { deleteServer?: boolean } = {}): Promise<void> {
+    await this.acp.disconnect({ deleteServer: options.deleteServer ?? this.ownsServer });
   }
 
   hasBoundSession(localSessionId: string, agentSessionId?: string): boolean {
@@ -804,7 +844,17 @@ export class LiveAcpConnection {
         return undefined;
       }
 
-      return this.acp.prompt(mappedParams as PromptRequest);
+      this.activePromptsByLocalSessionId.set(localSessionId, (this.activePromptsByLocalSessionId.get(localSessionId) ?? 0) + 1);
+      try {
+        return await this.acp.prompt(mappedParams as PromptRequest);
+      } finally {
+        const remaining = (this.activePromptsByLocalSessionId.get(localSessionId) ?? 1) - 1;
+        if (remaining > 0) {
+          this.activePromptsByLocalSessionId.set(localSessionId, remaining);
+        } else {
+          this.activePromptsByLocalSessionId.delete(localSessionId);
+        }
+      }
     }
 
     if (method === "session/cancel") {
@@ -828,9 +878,12 @@ export class LiveAcpConnection {
     return this.acp.extMethod(method, mappedParams);
   }
 
-  private handleEnvelope(envelope: AnyMessage, direction: AcpEnvelopeDirection): void {
+  private handleEnvelope(envelope: AnyMessage, direction: AcpEnvelopeDirection, eventId: string | undefined): void {
     if (direction === "inbound") {
       const method = envelopeMethod(envelope);
+      if (method === PERMISSION_REQUEST_METHOD) {
+        this.rememberPermissionRpcId(envelope);
+      }
       const turn = method ? parseSandboxAgentTurnNotification(method, (envelope as { params?: unknown }).params) : null;
       if (turn) {
         // Turn signals are not conversation history: deliver them to turn
@@ -843,7 +896,16 @@ export class LiveAcpConnection {
       }
     }
     const localSessionId = this.resolveSessionId(envelope, direction);
-    this.onObservedEnvelope(this, envelope, direction, localSessionId);
+    this.onObservedEnvelope(this, envelope, direction, localSessionId, eventId);
+  }
+
+  private rememberPermissionRpcId(envelope: AnyMessage): void {
+    const id = (envelope as { id?: unknown }).id;
+    const params = (envelope as { params?: { sessionId?: unknown; toolCall?: { toolCallId?: unknown } } }).params;
+    if ((typeof id !== "string" && typeof id !== "number") || typeof params?.sessionId !== "string") {
+      return;
+    }
+    this.permissionRpcIds.set(permissionKey(params.sessionId, params.toolCall?.toolCallId), id);
   }
 
   private handleAdapterNotification(method: string, params: Record<string, unknown>): void {
@@ -859,12 +921,19 @@ export class LiveAcpConnection {
 
   private async handlePermissionRequest(request: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     const agentSessionId = request.sessionId;
+    const key = permissionKey(agentSessionId, request.toolCall?.toolCallId);
+    const rpcId = this.permissionRpcIds.get(key);
+    this.permissionRpcIds.delete(key);
     const localSessionId = this.localByAgentSessionId.get(agentSessionId);
     if (!localSessionId) {
-      return cancelledPermissionResponse();
+      // Another client's session on the shared server: that client answers.
+      return unansweredPermissionResponse();
     }
 
-    return this.onPermissionRequest(this, localSessionId, agentSessionId, clonePermissionRequest(request));
+    return this.onPermissionRequest(this, localSessionId, agentSessionId, clonePermissionRequest(request), {
+      controlling: (this.activePromptsByLocalSessionId.get(localSessionId) ?? 0) > 0,
+      rpcId,
+    });
   }
 
   private resolveSessionId(envelope: AnyMessage, direction: AcpEnvelopeDirection): string | null {
@@ -1226,7 +1295,10 @@ export class SandboxAgent {
 
     for (const [permissionId, pending] of this.pendingPermissionRequests) {
       this.pendingPermissionRequests.delete(permissionId);
-      pending.resolve(cancelledPermissionResponse());
+      // A request of another client's turn is left for that client to answer.
+      if (pending.controlling) {
+        pending.resolve(cancelledPermissionResponse());
+      }
     }
 
     const connections = [...this.liveConnections.values()];
@@ -1846,7 +1918,7 @@ export class SandboxAgent {
     if (this.liveConnections.get(live.serverId) === live) {
       this.liveConnections.delete(live.serverId);
     }
-    await live.close().catch(() => {});
+    await live.close({ deleteServer: false }).catch(() => {});
   }
 
   private async flushObservedEnvelopePersistence(sessionId: string): Promise<void> {
@@ -2248,6 +2320,21 @@ export class SandboxAgent {
     });
   }
 
+  /**
+   * Deletes an agent server and stops its agent process, including servers this
+   * client only attached to. Sessions on it are restored on their next use.
+   * `dispose()` deletes only the servers this client created.
+   */
+  async destroyAcpServer(serverId: string): Promise<void> {
+    await this.requestRaw("DELETE", `${API_PREFIX}/acp/${encodeURIComponent(serverId)}`);
+    const live = this.liveConnections.get(serverId);
+    if (live) {
+      this.liveConnections.delete(serverId);
+      this.cancelPendingPermissionsForConnection(live);
+      await live.close({ deleteServer: false }).catch(() => {});
+    }
+  }
+
   async listAcpServers(): Promise<AcpServerListResponse> {
     return this.requestJson("GET", `${API_PREFIX}/acp`);
   }
@@ -2505,7 +2592,11 @@ export class SandboxAgent {
         return existing;
       }
       if (await this.isAcpServerRunning(preferred, agent)) {
-        return this.openLiveConnection(agent, preferred, true);
+        try {
+          return await this.openLiveConnection(agent, preferred, true);
+        } catch {
+          // The server went away after it was listed; start a new one below.
+        }
       }
     }
 
@@ -2547,21 +2638,25 @@ export class SandboxAgent {
         agent,
         serverId,
         attach,
-        onObservedEnvelope: (connection, envelope, direction, localSessionId) => {
-          void this.enqueueObservedEnvelopePersistence(connection, envelope, direction, localSessionId).catch((error) => {
+        onObservedEnvelope: (connection, envelope, direction, localSessionId, eventId) => {
+          void this.enqueueObservedEnvelopePersistence(connection, envelope, direction, localSessionId, eventId).catch((error) => {
             console.error("Failed to persist observed sandbox-agent envelope", error);
           });
         },
-        onPermissionRequest: async (connection, localSessionId, agentSessionId, request) =>
-          this.enqueuePermissionRequest(connection, localSessionId, agentSessionId, request),
-        onTurnEvent: (_connection, localSessionId, notification) => {
+        onPermissionRequest: async (connection, localSessionId, agentSessionId, request, context) =>
+          this.enqueuePermissionRequest(connection, localSessionId, agentSessionId, request, context),
+        onTurnEvent: (connection, localSessionId, notification) => {
+          if (notification.method === SANDBOX_AGENT_INPUT_RESOLVED) {
+            this.dropResolvedPermissionRequests(connection, localSessionId, notification.params.requestId);
+          }
           void this.enqueueTurnEvent(localSessionId, notification);
         },
       });
 
       const raced = this.liveConnections.get(serverId);
       if (raced) {
-        await created.close();
+        // Never delete the server the winning connection uses.
+        await created.close({ deleteServer: false });
         return raced;
       }
 
@@ -2590,15 +2685,21 @@ export class SandboxAgent {
     envelope: AnyMessage,
     direction: AcpEnvelopeDirection,
     localSessionId: string | null,
+    eventId: string | undefined,
   ): Promise<void> {
     if (!localSessionId) {
       return;
     }
 
+    // Every client of a server receives its event stream, so an event from the
+    // stream gets an id derived from the server and the stream's event id. A
+    // driver keeps the first record per id, so several clients sharing one
+    // persistence driver (or a replay after reconnecting) store it once.
+    const stableId = eventId === undefined ? undefined : `${connection.serverId}:${eventId}`;
     let event: SessionEvent | null = null;
     for (let attempt = 0; attempt < MAX_EVENT_INDEX_INSERT_RETRIES; attempt += 1) {
       event = {
-        id: randomId(),
+        id: stableId ?? randomId(),
         eventIndex: await this.allocateSessionEventIndex(localSessionId),
         sessionId: localSessionId,
         createdAt: nowMs(),
@@ -2638,6 +2739,7 @@ export class SandboxAgent {
     envelope: AnyMessage,
     direction: AcpEnvelopeDirection,
     localSessionId: string | null,
+    eventId: string | undefined,
   ): Promise<void> {
     if (!localSessionId) {
       return;
@@ -2648,7 +2750,7 @@ export class SandboxAgent {
       .catch(() => {
         // Keep later envelope persistence moving even if an earlier write failed.
       })
-      .then(() => this.persistObservedEnvelope(connection, envelope, direction, localSessionId));
+      .then(() => this.persistObservedEnvelope(connection, envelope, direction, localSessionId, eventId));
 
     this.pendingObservedEnvelopePersistenceBySession.set(localSessionId, current);
 
@@ -2841,14 +2943,17 @@ export class SandboxAgent {
   }
 
   private async enqueuePermissionRequest(
-    _connection: LiveAcpConnection,
+    connection: LiveAcpConnection,
     localSessionId: string,
     agentSessionId: string,
     request: RequestPermissionRequest,
+    context: PermissionRequestContext,
   ): Promise<RequestPermissionResponse> {
     const listeners = this.permissionListeners.get(localSessionId);
     if (!listeners || listeners.size === 0) {
-      return cancelledPermissionResponse();
+      // Only the client whose prompt the request belongs to cancels it when
+      // nobody handles it. Other clients attached to the session never reply.
+      return context.controlling ? cancelledPermissionResponse() : unansweredPermissionResponse();
     }
 
     const pendingId = randomId();
@@ -2867,6 +2972,9 @@ export class SandboxAgent {
       this.pendingPermissionRequests.set(pendingId, {
         id: pendingId,
         sessionId: localSessionId,
+        connection,
+        rpcId: context.rpcId,
+        controlling: context.controlling,
         request: clonePermissionRequest(request),
         resolve,
         reject,
@@ -2891,6 +2999,27 @@ export class SandboxAgent {
 
     this.pendingPermissionRequests.delete(permissionId);
     pending.resolve(response);
+  }
+
+  /**
+   * The request was answered (by any client) or the turn ended: forget it
+   * without replying, so a late local reply is not sent as a second answer.
+   */
+  private dropResolvedPermissionRequests(connection: LiveAcpConnection, sessionId: string, rpcId: string | number): void {
+    for (const [permissionId, pending] of this.pendingPermissionRequests) {
+      if (pending.connection === connection && pending.sessionId === sessionId && pending.rpcId !== undefined && String(pending.rpcId) === String(rpcId)) {
+        this.pendingPermissionRequests.delete(permissionId);
+      }
+    }
+  }
+
+  private cancelPendingPermissionsForConnection(connection: LiveAcpConnection): void {
+    for (const [permissionId, pending] of this.pendingPermissionRequests) {
+      if (pending.connection === connection) {
+        this.pendingPermissionRequests.delete(permissionId);
+        pending.resolve(cancelledPermissionResponse());
+      }
+    }
   }
 
   private cancelPendingPermissionsForSession(sessionId: string): void {
@@ -3088,6 +3217,10 @@ function isSessionEventIndexConflict(error: unknown): boolean {
 type PendingPermissionRequestState = {
   id: string;
   sessionId: string;
+  connection: LiveAcpConnection;
+  rpcId?: string | number;
+  /** The request belongs to a prompt this client sent. */
+  controlling: boolean;
   request: RequestPermissionRequest;
   resolve: (response: RequestPermissionResponse) => void;
   reject: (reason?: unknown) => void;
@@ -3719,6 +3852,18 @@ function permissionReplyToResponse(permissionId: string, request: RequestPermiss
       optionId: selected.optionId,
     },
   };
+}
+
+/**
+ * Never settles, so no reply is sent: the request belongs to another client.
+ * Nothing keeps a reference to it, so it is garbage collected.
+ */
+function unansweredPermissionResponse(): Promise<RequestPermissionResponse> {
+  return new Promise<RequestPermissionResponse>(() => {});
+}
+
+function permissionKey(agentSessionId: string, toolCallId: unknown): string {
+  return `${agentSessionId}\u0000${typeof toolCallId === "string" ? toolCallId : ""}`;
 }
 
 function cancelledPermissionResponse(): RequestPermissionResponse {

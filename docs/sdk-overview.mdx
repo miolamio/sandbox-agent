@@ -178,6 +178,14 @@ try {
 }
 ```
 
+### Several clients on one session
+
+A second `SandboxAgent` (for example an orchestrator or a UI that watches) can call `resumeSession(id)` on a session another client created, sharing the same persistence driver. It attaches to the agent server that is already running, receives the session's events, and can send prompts too. The roles are:
+
+- **Server ownership.** The client that started an agent server owns it. `sdk.dispose()` deletes only the servers that client started; a client that attached to an existing server closes just its own connection, and the server keeps running for the others. To delete a server explicitly from any client, call `sdk.destroyAcpServer(serverId)`. If the owner disposes first, its server is deleted, and the next prompt from another client restores the session on a new server that this client then owns. If the owner exits without calling `dispose()`, the server keeps running until a client deletes it.
+- **Permission requests.** A request belongs to the client whose prompt is running. If that client has no `onPermissionRequest` listener, it cancels the request, as a single client does. Other attached clients never answer on their own: without a listener they ignore it, and with a listener they receive it and may call `respondPermission`. Once any client has answered, the pending request is removed from the other clients, so a late `respondPermission` there throws instead of sending a second answer.
+- **History.** Each attached client receives every event, and events are stored once in the shared persistence driver (see [event ids](/session-persistence#event-ids-and-shared-drivers)).
+
 ## Session configuration
 
 Set model, mode, or thought level at creation or on an existing session:

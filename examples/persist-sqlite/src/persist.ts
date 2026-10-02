@@ -110,18 +110,14 @@ export class SQLiteSessionPersistDriver implements SessionPersistDriver {
   }
 
   async insertEvent(_sessionId: string, event: SessionEvent): Promise<void> {
+    // Idempotent per event id: clients sharing this database insert the same
+    // server event once each, and the first record wins.
     this.db
       .prepare(
         `INSERT INTO events (
           id, event_index, session_id, created_at, connection_id, sender, payload_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          event_index = excluded.event_index,
-          session_id = excluded.session_id,
-          created_at = excluded.created_at,
-          connection_id = excluded.connection_id,
-          sender = excluded.sender,
-          payload_json = excluded.payload_json`,
+        ON CONFLICT(id) DO NOTHING`,
       )
       .run(event.id, event.eventIndex, event.sessionId, event.createdAt, event.connectionId, event.sender, JSON.stringify(event.payload));
   }

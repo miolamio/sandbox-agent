@@ -52,7 +52,7 @@ class RivetSessionPersistDriver implements SessionPersistDriver {
     const slice = all.slice(offset, offset + limit);
     return { items: slice, nextCursor: offset + slice.length < all.length ? String(offset + slice.length) : undefined };
   }
-  async insertEvent(sessionId: string, event: SessionEvent) { const events = this.data.events[sessionId] ?? []; events.push({ ...event, payload: JSON.parse(JSON.stringify(event.payload)) }); this.data.events[sessionId] = events; }
+  async insertEvent(sessionId: string, event: SessionEvent) { const events = this.data.events[sessionId] ?? []; if (events.some((e) => e.id === event.id)) return; events.push({ ...event, payload: JSON.parse(JSON.stringify(event.payload)) }); this.data.events[sessionId] = events; }
 }
 
 type WorkspaceState = RivetPersistState & {

@@ -244,6 +244,7 @@ await session.prompt([
 ]);
 ```
 
+Without a listener, the client that sent the prompt cancels the request. Other clients attached to the same session (through `resumeSession`) never answer a request on their own; see [Several clients on one session](/sdk-overview#several-clients-on-one-session).
 
 ### Auto-approving permissions
 

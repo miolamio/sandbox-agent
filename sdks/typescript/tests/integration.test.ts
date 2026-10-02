@@ -12,6 +12,7 @@ import {
   type SessionEvent,
   type SessionPersistDriver,
   type SessionRecord,
+  type Session,
   type SessionTurnEvent,
 } from "../src/index.ts";
 import { isNodeRuntime } from "../src/spawn.ts";
@@ -848,6 +849,268 @@ describe("Integration: TypeScript SDK flat session API", () => {
       const synthetic = events.items.filter((event) => String((event.payload as { method?: unknown }).method ?? "").startsWith("_sandboxagent/session/"));
       expect(synthetic).toEqual([]);
       off();
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  // Author + observer: two clients share one persistence driver, and the
+  // observer attaches to the author's agent server with resumeSession().
+  async function connectAuthorAndObserver() {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist });
+    const session = await author.createSession({ agent: "mock" });
+    const watched = await observer.resumeSession(session.id);
+    expect(watched.serverId).toBe(session.serverId);
+    // Make sure the observer's event stream is live before a scenario starts.
+    await promptAndWaitForObserver(session, watched, "connect observer");
+    return { persist, author, observer, session, watched };
+  }
+
+  async function promptAndWaitForObserver(author: Session, watched: Session, text: string): Promise<void> {
+    let ended = false;
+    const off = watched.onTurnEvent((event) => {
+      if (event.type === "turn_ended") {
+        ended = true;
+      }
+    });
+    try {
+      await withTimeout(author.prompt([{ type: "text", text }]), `prompt '${text}'`);
+      await waitFor(() => (ended ? true : undefined));
+    } finally {
+      off();
+    }
+  }
+
+  function collectPermissionTexts(session: Session): string[] {
+    const texts: string[] = [];
+    session.onEvent((event) => {
+      const text = (event.payload as any)?.params?.update?.content?.text;
+      if (typeof text === "string" && text.startsWith("mock permission ")) {
+        texts.push(text);
+      }
+    });
+    return texts;
+  }
+
+  it("a passive observer does not answer the author's permission request", async () => {
+    const { author, observer, session } = await connectAuthorAndObserver();
+    try {
+      const texts = collectPermissionTexts(session);
+      let permissionId: string | undefined;
+      session.onPermissionRequest((request) => {
+        permissionId = request.id;
+      });
+
+      let finished = false;
+      const pending = session.prompt([{ type: "text", text: "trigger permission" }]);
+      void pending.then(
+        () => (finished = true),
+        () => (finished = true),
+      );
+      await waitFor(() => permissionId);
+      await sleep(300);
+      // Without an answer from the author the turn is still waiting.
+      expect(finished).toBe(false);
+
+      await session.respondPermission(permissionId!, "once");
+      await expect(withTimeout(pending, "prompt after the author's reply")).resolves.toMatchObject({ stopReason: "end_turn" });
+      await waitFor(() => (texts.length > 0 ? texts : undefined));
+      await sleep(100);
+      expect(texts).toEqual(["mock permission approved: allow-once"]);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("an observer's pending permission request is dropped once the author answered it", async () => {
+    const { author, observer, session, watched } = await connectAuthorAndObserver();
+    try {
+      const texts = collectPermissionTexts(session);
+      let authorPermissionId: string | undefined;
+      let observerPermissionId: string | undefined;
+      session.onPermissionRequest((request) => {
+        authorPermissionId = request.id;
+      });
+      watched.onPermissionRequest((request) => {
+        observerPermissionId = request.id;
+      });
+      const resolved: SessionTurnEvent[] = [];
+      watched.onTurnEvent((event) => {
+        if (event.type === "input_resolved") {
+          resolved.push(event);
+        }
+      });
+
+      const pending = session.prompt([{ type: "text", text: "trigger permission" }]);
+      await waitFor(() => authorPermissionId);
+      await waitFor(() => observerPermissionId);
+      await session.respondPermission(authorPermissionId!, "once");
+      await expect(withTimeout(pending, "prompt after the author's reply")).resolves.toMatchObject({ stopReason: "end_turn" });
+      await waitFor(() => resolved[0]);
+
+      // A late reply from the observer is not sent as a second answer.
+      await expect(watched.respondPermission(observerPermissionId!, "reject")).rejects.toThrow(/not found/);
+      await sleep(100);
+      expect(texts).toEqual(["mock permission approved: allow-once"]);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("a client attached to another session on the same server does not answer its permission requests", async () => {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist });
+    try {
+      const target = await author.createSession({ agent: "mock" });
+      const neighbour = await author.createSession({ agent: "mock" });
+      expect(neighbour.serverId).toBe(target.serverId);
+      const watched = await observer.resumeSession(neighbour.id);
+      await promptAndWaitForObserver(neighbour, watched, "connect observer");
+
+      let permissionId: string | undefined;
+      target.onPermissionRequest((request) => {
+        permissionId = request.id;
+      });
+      let finished = false;
+      const pending = target.prompt([{ type: "text", text: "trigger permission" }]);
+      void pending.then(
+        () => (finished = true),
+        () => (finished = true),
+      );
+      await waitFor(() => permissionId);
+      await sleep(300);
+      expect(finished).toBe(false);
+
+      await target.respondPermission(permissionId!, "once");
+      await expect(withTimeout(pending, "prompt after the author's reply")).resolves.toMatchObject({ stopReason: "end_turn" });
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("a sole client without a permission handler still cancels permission requests", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const texts = collectPermissionTexts(session);
+      await expect(withTimeout(session.prompt([{ type: "text", text: "trigger permission" }]), "prompt")).resolves.toMatchObject({
+        stopReason: "end_turn",
+      });
+      await waitFor(() => (texts.length > 0 ? texts : undefined));
+      expect(texts).toEqual(["mock permission approved: cancelled"]);
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("disposing an attached observer leaves the author's server and other observers running", async () => {
+    const { persist, author, observer, session } = await connectAuthorAndObserver();
+    const second = await SandboxAgent.connect({ baseUrl, token, persist });
+    try {
+      const secondWatched = await second.resumeSession(session.id);
+      const serverId = session.serverId;
+      const agentSessionId = session.agentSessionId;
+      expect(serverId).toBeTruthy();
+
+      await observer.dispose();
+
+      const servers = await author.listAcpServers();
+      expect(servers.servers.map((server) => server.serverId)).toContain(serverId);
+
+      await promptAndWaitForObserver(session, secondWatched, "author continues");
+      const record = await persist.getSession(session.id);
+      expect(record?.serverId).toBe(serverId);
+      expect(record?.agentSessionId).toBe(agentSessionId);
+
+      const events = await author.getEvents({ sessionId: session.id, limit: 1000 });
+      const replayed = events.items.some((event) => {
+        const payload = event.payload as { method?: string; params?: { prompt?: Array<{ text?: unknown }> } };
+        const text = payload.params?.prompt?.[0]?.text;
+        return payload.method === "session/prompt" && typeof text === "string" && text.includes("Previous session history is replayed below");
+      });
+      expect(replayed).toBe(false);
+    } finally {
+      await second.dispose();
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("disposing an observer mid-turn does not interrupt the author's turn", async () => {
+    const { author, observer, session } = await connectAuthorAndObserver();
+    try {
+      const turnEvents: SessionTurnEvent[] = [];
+      session.onTurnEvent((event) => turnEvents.push(event));
+      const prompt = session.prompt([{ type: "text", text: "delay:1500" }]);
+      await waitFor(() => turnEvents.find((event) => event.type === "turn_started"));
+
+      await observer.dispose();
+
+      await expect(withTimeout(prompt, "author prompt")).resolves.toMatchObject({ stopReason: "end_turn" });
+      const ended = await waitFor(() => turnEvents.find((event) => event.type === "turn_ended"));
+      expect(ended).toMatchObject({ outcome: "completed" });
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("the client that created a server deletes it on dispose", async () => {
+    const { author, observer, session } = await connectAuthorAndObserver();
+    try {
+      await author.dispose();
+      const servers = await observer.listAcpServers();
+      expect(servers.servers.map((server) => server.serverId)).not.toContain(session.serverId);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("destroyAcpServer deletes a server the client only attached to", async () => {
+    const { author, observer, session } = await connectAuthorAndObserver();
+    try {
+      await observer.destroyAcpServer(session.serverId!);
+      const servers = await author.listAcpServers();
+      expect(servers.servers.map((server) => server.serverId)).not.toContain(session.serverId);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("an attached observer does not duplicate events in shared persistence", async () => {
+    const { author, observer, session, watched } = await connectAuthorAndObserver();
+    try {
+      const chunkText = "mock: same payload";
+      const delivered: SessionEvent[] = [];
+      watched.onEvent((event) => {
+        if ((event.payload as any)?.params?.update?.content?.text === chunkText) {
+          delivered.push(event);
+        }
+      });
+
+      // Two distinct events with an identical payload must both be kept.
+      await promptAndWaitForObserver(session, watched, "same payload");
+      await promptAndWaitForObserver(session, watched, "same payload");
+
+      const events = (await author.getEvents({ sessionId: session.id, limit: 1000 })).items;
+      const textOf = (event: SessionEvent) => (event.payload as any)?.params?.update?.content?.text;
+      expect(events.filter((event) => event.sender === "agent" && textOf(event) === "mock: connect observer")).toHaveLength(1);
+      const chunks = events.filter((event) => event.sender === "agent" && textOf(event) === chunkText);
+      expect(chunks).toHaveLength(2);
+      expect(new Set(events.map((event) => event.id)).size).toBe(events.length);
+
+      // The observer still receives every event.
+      expect(delivered).toHaveLength(2);
+      expect(delivered.map((event) => event.id).sort()).toEqual(chunks.map((event) => event.id).sort());
     } finally {
       await observer.dispose();
       await author.dispose();

@@ -86,8 +86,16 @@ export class IndexedDbSessionPersistDriver implements SessionPersistDriver {
 
   async insertEvent(_sessionId: string, event: SessionEvent): Promise<void> {
     const db = await this.dbPromise;
+    // Idempotent per event id: clients sharing this database insert the same
+    // server event once each, and the first record wins.
     await transactionPromise(db, [EVENTS_STORE], "readwrite", (tx) => {
-      tx.objectStore(EVENTS_STORE).put(encodeEventRow(event));
+      const store = tx.objectStore(EVENTS_STORE);
+      const existing = store.getKey(event.id);
+      existing.onsuccess = () => {
+        if (existing.result === undefined) {
+          store.put(encodeEventRow(event));
+        }
+      };
     });
   }
 

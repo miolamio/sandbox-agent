@@ -46,7 +46,26 @@ export interface ProblemDetails {
 
 export type AcpEnvelopeDirection = "inbound" | "outbound";
 
-export type AcpEnvelopeObserver = (envelope: AnyMessage, direction: AcpEnvelopeDirection) => void;
+export interface AcpEnvelopeMeta {
+  /**
+   * Event stream id of an inbound envelope that arrived over the event stream
+   * (SSE). The server assigns ids in order per server, and every client of that
+   * server sees the same id for the same event, also when a reconnect replays
+   * it. Missing for envelopes delivered in a POST response body.
+   */
+  eventId?: string;
+}
+
+export type AcpEnvelopeObserver = (envelope: AnyMessage, direction: AcpEnvelopeDirection, meta?: AcpEnvelopeMeta) => void;
+
+export interface AcpDisconnectOptions {
+  /**
+   * Also delete the server (`DELETE` on the transport path). Defaults to
+   * `true`. Pass `false` to close only this client's event stream and leave a
+   * server that other clients may still use running.
+   */
+  deleteServer?: boolean;
+}
 
 export type QueryValue = string | number | boolean | null | undefined;
 
@@ -321,8 +340,8 @@ export class AcpHttpClient {
     return this.connection.extNotification(method, params);
   }
 
-  async disconnect(): Promise<void> {
-    await this.transport.close();
+  async disconnect(options: AcpDisconnectOptions = {}): Promise<void> {
+    await this.transport.close(options.deleteServer !== false);
   }
 
   get closed(): Promise<void> {
@@ -427,16 +446,16 @@ class StreamableHttpAcpTransport {
     };
   }
 
-  async close(): Promise<void> {
+  async close(deleteServer = true): Promise<void> {
     if (this.closingPromise) {
       return this.closingPromise;
     }
 
-    this.closingPromise = this.closeImpl();
+    this.closingPromise = this.closeImpl(deleteServer);
     return this.closingPromise;
   }
 
-  private async closeImpl(): Promise<void> {
+  private async closeImpl(deleteServer: boolean): Promise<void> {
     if (this.closed) {
       return;
     }
@@ -448,7 +467,7 @@ class StreamableHttpAcpTransport {
       this.sseAbortController.abort();
     }
 
-    if (!this.postedOnce) {
+    if (!this.postedOnce || !deleteServer) {
       try {
         this.readableController?.close();
       } catch {
@@ -779,10 +798,10 @@ class StreamableHttpAcpTransport {
     }
 
     const envelope = JSON.parse(payloadText) as AnyMessage;
-    this.pushInbound(envelope);
+    this.pushInbound(envelope, eventId ?? undefined);
   }
 
-  private pushInbound(envelope: AnyMessage): void {
+  private pushInbound(envelope: AnyMessage, eventId?: string): void {
     if (this.closed) {
       return;
     }
@@ -799,7 +818,7 @@ class StreamableHttpAcpTransport {
       envelope = { ...(envelope as Record<string, unknown>), id: originalId } as AnyMessage;
     }
 
-    this.observeEnvelope(envelope, "inbound");
+    this.observeEnvelope(envelope, "inbound", eventId === undefined ? undefined : { eventId });
 
     try {
       this.readableController?.enqueue(envelope);
@@ -829,12 +848,12 @@ class StreamableHttpAcpTransport {
     }
   }
 
-  private observeEnvelope(message: AnyMessage, direction: AcpEnvelopeDirection): void {
+  private observeEnvelope(message: AnyMessage, direction: AcpEnvelopeDirection, meta?: AcpEnvelopeMeta): void {
     if (!this.onEnvelope) {
       return;
     }
 
-    this.onEnvelope(message, direction);
+    this.onEnvelope(message, direction, meta);
   }
 
   private buildHeaders(extra?: HeadersInit): Headers {

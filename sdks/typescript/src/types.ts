@@ -154,7 +154,11 @@ export interface SessionRecord {
 export type SessionEventSender = "client" | "agent";
 
 export interface SessionEvent {
-  // Stable unique event id. For ordering, sort by (sessionId, eventIndex).
+  /**
+   * Stable unique event id. For ordering, sort by (sessionId, eventIndex).
+   * Events from a server's event stream use `<serverId>:<stream event id>`, so
+   * every client that shares a driver produces the same id for the same event.
+   */
   id: string;
   eventIndex: number;
   sessionId: string;
@@ -183,6 +187,11 @@ export interface SessionPersistDriver {
   listSessions(request?: ListPageRequest): Promise<ListPage<SessionRecord>>;
   updateSession(session: SessionRecord): Promise<void>;
   listEvents(request: ListEventsRequest): Promise<ListPage<SessionEvent>>;
+  /**
+   * Stores an event. Must be idempotent per `event.id`: when an event with the
+   * same id is already stored, keep the stored record and do not throw. Clients
+   * sharing a driver insert the same server event once each.
+   */
   insertEvent(sessionId: string, event: SessionEvent): Promise<void>;
 }
 
@@ -269,6 +278,10 @@ export class InMemorySessionPersistDriver implements SessionPersistDriver {
 
   async insertEvent(sessionId: string, event: SessionEvent): Promise<void> {
     const events = this.eventsBySession.get(sessionId) ?? [];
+    if (events.some((existing) => existing.id === event.id)) {
+      // Already stored (another client sharing this driver, or a replay).
+      return;
+    }
     events.push(cloneSessionEvent(event));
 
     if (events.length > this.maxEventsPerSession) {
