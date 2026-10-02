@@ -538,6 +538,9 @@ pub(super) fn content_type_is(headers: &HeaderMap, expected: &str) -> bool {
 
 /// Opt-in header for asynchronous `session/prompt` delivery over SSE.
 pub(super) const ASYNC_PROMPT_HEADER: &str = "x-sandboxagent-async-prompt";
+/// Response header of `GET /v1/acp/{server_id}`: the server instance's
+/// `created_at_ms`, so event ids of different instances with one id differ.
+pub(super) const SERVER_GENERATION_HEADER: &str = "x-sandboxagent-server-generation";
 
 /// True when the client opted in to receive `session/prompt` responses over SSE
 /// (`x-sandboxagent-async-prompt: 1` or `true`).

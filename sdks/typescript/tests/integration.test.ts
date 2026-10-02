@@ -53,6 +53,37 @@ class DelayedWritePersistDriver implements SessionPersistDriver {
   }
 }
 
+/** Delegates to a shared driver until `dead` is set; then writes nothing (a client that died). */
+class KillablePersistDriver implements SessionPersistDriver {
+  dead = false;
+
+  constructor(private readonly inner: SessionPersistDriver) {}
+
+  getSession(id: string) {
+    return this.inner.getSession(id);
+  }
+
+  listSessions(request?: { cursor?: string; limit?: number }) {
+    return this.inner.listSessions(request);
+  }
+
+  async updateSession(session: SessionRecord): Promise<void> {
+    if (!this.dead) {
+      await this.inner.updateSession(session);
+    }
+  }
+
+  listEvents(request: ListEventsRequest) {
+    return this.inner.listEvents(request);
+  }
+
+  async insertEvent(sessionId: string, event: SessionEvent): Promise<void> {
+    if (!this.dead) {
+      await this.inner.insertEvent(sessionId, event);
+    }
+  }
+}
+
 class StrictUniqueSessionPersistDriver implements SessionPersistDriver {
   private readonly events = new InMemorySessionPersistDriver({
     maxEventsPerSession: 500,
@@ -1325,6 +1356,96 @@ describe("Integration: TypeScript SDK flat session API", () => {
       expect(replayTokens).toEqual(expected);
     } finally {
       await third?.dispose();
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("an observer stores the rest of a turn whose prompting client died mid-turn", async () => {
+    const shared = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    const authorPersist = new KillablePersistDriver(shared);
+    const author = await SandboxAgent.connect({ baseUrl, token, persist: authorPersist });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist: shared });
+    try {
+      const session = await author.createSession({ agent: "mock" });
+      const watched = await observer.resumeSession(session.id);
+      await promptAndWaitForObserver(session, watched, "connect observer");
+
+      // The author shows the request to a user and then dies: it never answers
+      // and stores nothing more.
+      session.onPermissionRequest(() => {});
+      let permissionId: string | undefined;
+      watched.onPermissionRequest((request) => {
+        permissionId = request.id;
+      });
+      let ended = false;
+      watched.onTurnEvent((event) => {
+        if (event.type === "turn_ended") {
+          ended = true;
+        }
+      });
+      const pending = session.prompt([{ type: "text", text: "trigger permission" }]).catch(() => undefined);
+      await waitFor(() => permissionId);
+      authorPersist.dead = true;
+
+      await watched.respondPermission(permissionId!, "once");
+      await waitFor(() => (ended ? true : undefined));
+      await pending;
+      await sleep(500);
+
+      const events = (await shared.listEvents({ sessionId: session.id, limit: 1000 })).items;
+      expect(new Set(events.map((event) => event.id)).size).toBe(events.length);
+      const textOf = (event: SessionEvent) => (event.payload as any)?.params?.update?.content?.text;
+      const promptIndex = events.findIndex((event) => event.sender === "client" && (event.payload as any)?.params?.prompt?.[0]?.text === "trigger permission");
+      const chunkIndex = events.findIndex((event) => textOf(event) === "mock: trigger permission");
+      const requestIndex = events.findIndex((event) => (event.payload as any)?.method === "session/request_permission");
+      const approved = events.filter((event) => textOf(event) === "mock permission approved: allow-once");
+      expect(approved).toHaveLength(1);
+      const approvedIndex = events.indexOf(approved[0]!);
+      expect(promptIndex).toBeGreaterThanOrEqual(0);
+      expect(promptIndex).toBeLessThan(chunkIndex);
+      expect(chunkIndex).toBeLessThan(requestIndex);
+      expect(requestIndex).toBeLessThan(approvedIndex);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("an observer attaching mid-turn while the server list fails does not duplicate events", async () => {
+    const shared = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    const author = await SandboxAgent.connect({ baseUrl, token, persist: shared });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist: shared });
+    try {
+      const session = await author.createSession({ agent: "mock" });
+      let permissionId: string | undefined;
+      session.onPermissionRequest((request) => {
+        permissionId = request.id;
+      });
+      const pending = session.prompt([{ type: "text", text: "trigger permission" }]);
+      await waitFor(() => permissionId);
+
+      // Every server list call after the first one (which finds the server to attach to) fails.
+      const listAcpServers = observer.listAcpServers.bind(observer);
+      let calls = 0;
+      (observer as unknown as { listAcpServers: () => ReturnType<typeof listAcpServers> }).listAcpServers = async () => {
+        calls += 1;
+        if (calls > 1) {
+          throw new Error("simulated server list failure");
+        }
+        return listAcpServers();
+      };
+      await observer.resumeSession(session.id);
+      await sleep(100);
+      await session.respondPermission(permissionId!, "once");
+      await withTimeout(pending, "prompt");
+      await sleep(500);
+
+      const events = (await shared.listEvents({ sessionId: session.id, limit: 1000 })).items;
+      expect(new Set(events.map((event) => event.id)).size).toBe(events.length);
+      const approved = events.filter((event) => (event.payload as any)?.params?.update?.content?.text === "mock permission approved: allow-once");
+      expect(approved).toHaveLength(1);
+    } finally {
       await observer.dispose();
       await author.dispose();
     }

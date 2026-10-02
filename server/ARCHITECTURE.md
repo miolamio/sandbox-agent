@@ -119,6 +119,7 @@ DELETE /v1/acp/{serverId}         Close ACP server
 - `GET /v1/acp/{serverId}` replays buffered envelopes and then streams live updates.
 - Clients continue turns by POSTing ACP JSON-RPC requests to the same server id.
 - Async prompt (opt-in): a `session/prompt` POST with header `x-sandboxagent-async-prompt: 1` returns `202 Accepted` once the request reaches the agent. Its JSON-RPC result, request-timeout error, or "agent process stopped" error (process exit or `DELETE`) arrives on the SSE stream with the same `id`. Without the header the POST returns `200` with the response body. Clients should only opt in while an SSE stream is open (or reconnect with `Last-Event-ID`). `/opencode/*` always uses the synchronous mode.
+- `GET /v1/acp/{server_id}` (SSE) sends `x-sandboxagent-server-generation`: the instance's `created_at_ms` (the same as `createdAtMs` in `GET /v1/acp`). SSE ids restart at 1 for a later instance with the same server id, so clients identify an event by `(generation, id)`.
 - Request timeout: each ACP request (sync or async prompt) is bounded by `--acp-request-timeout-ms` / `SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS` (flag wins; default 2 h, `DEFAULT_REQUEST_TIMEOUT` in `acp_proxy_runtime.rs`). Sync requests get `504`; async prompts get a JSON-RPC timeout error on SSE with the same `id`.
 
 ### Turn lifecycle events (SBA-9)

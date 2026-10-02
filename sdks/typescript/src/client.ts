@@ -3,6 +3,7 @@ import {
   AcpRpcError,
   PROTOCOL_VERSION,
   type AcpEnvelopeDirection,
+  type AcpEnvelopeMeta,
   type AnyMessage,
   type AuthMethod,
   type CancelNotification,
@@ -575,12 +576,18 @@ type TurnNotificationHandler = (connection: LiveAcpConnection, localSessionId: s
 type ObservedEnvelopeContext = {
   /** Event stream id, for envelopes that arrived over the event stream. */
   eventId?: string;
+  /** Server instance generation from the event stream, see `AcpEnvelopeMeta`. */
+  serverGeneration?: string;
   /**
-   * Whether this client stores the envelope. During another client's turn
+   * Whether this client stores the envelope now. During another client's turn
    * that client stores the turn's events (in the order it saw them, after its
-   * own prompt), and this client only delivers them to its listeners.
+   * own prompt); this client delivers them to its listeners and keeps them in
+   * a buffer for that turn (`foreignTurn`), which it stores after the turn
+   * ended, so the turn is kept even if the prompting client died.
    */
   store: boolean;
+  /** Buffer key of the foreign turn the envelope belongs to, when `store` is false. */
+  foreignTurn?: number;
   /**
    * Whether the event index must be read from persistence again before
    * writing: at the start of this client's own prompt and for writes outside
@@ -642,8 +649,15 @@ export class LiveAcpConnection {
   private readonly pendingReplayByLocalSessionId = new Map<string, string>();
   // Prompts this connection sent that have not finished yet, per local session.
   private readonly activePromptsByLocalSessionId = new Map<string, number>();
-  // Turns of other clients in progress, per local session (turn request ids).
+  // Turns in progress per local session (turn request ids), split by whether
+  // this client sent the prompt (its wire request id prefix) or another client.
+  private readonly ownTurnsByLocalSessionId = new Map<string, Set<string>>();
   private readonly foreignTurnsByLocalSessionId = new Map<string, Set<string>>();
+  // Buffer key of the current run of foreign turns, per local session.
+  private readonly foreignTurnKeyByLocalSessionId = new Map<string, number>();
+  private nextForeignTurnKey = 1;
+  /** Called when the foreign turns of a session are over (or lost to a stream gap). */
+  onForeignTurnFinished?: (connection: LiveAcpConnection, localSessionId: string, foreignTurn: number) => void;
   // JSON-RPC ids of permission requests seen on the event stream and not yet
   // handed to the handler, keyed by agent session id and tool call id.
   private readonly permissionRpcIds = new Map<string, string | number>();
@@ -729,7 +743,7 @@ export class LiveAcpConnection {
         if (!live) {
           return;
         }
-        live.handleEnvelope(envelope, direction, meta?.eventId);
+        live.handleEnvelope(envelope, direction, meta);
       },
     });
 
@@ -915,7 +929,12 @@ export class LiveAcpConnection {
     return this.acp.extMethod(method, mappedParams);
   }
 
-  private handleEnvelope(envelope: AnyMessage, direction: AcpEnvelopeDirection, eventId: string | undefined): void {
+  private handleEnvelope(envelope: AnyMessage, direction: AcpEnvelopeDirection, meta: AcpEnvelopeMeta | undefined): void {
+    if (meta?.streamGap) {
+      // Events were lost (the server's buffer moved past this client), so a
+      // turn_ended may be missing: forget the turns in progress.
+      this.resetTurns();
+    }
     if (direction === "inbound") {
       const method = envelopeMethod(envelope);
       if (method === PERMISSION_REQUEST_METHOD) {
@@ -927,39 +946,71 @@ export class LiveAcpConnection {
         // listeners instead of persisting them as session events.
         const localSessionId = this.localByAgentSessionId.get(turn.params.sessionId);
         if (localSessionId) {
-          this.trackForeignTurn(localSessionId, turn);
+          this.trackTurn(localSessionId, turn);
           this.onTurnEvent(this, localSessionId, turn);
         }
         return;
       }
     }
     const localSessionId = this.resolveSessionId(envelope, direction);
-    const ownTurn = localSessionId !== null && (this.activePromptsByLocalSessionId.get(localSessionId) ?? 0) > 0;
+    const activePrompt = localSessionId !== null && (this.activePromptsByLocalSessionId.get(localSessionId) ?? 0) > 0;
+    const ownTurn = activePrompt || (localSessionId !== null && (this.ownTurnsByLocalSessionId.get(localSessionId)?.size ?? 0) > 0);
     const foreignTurn = localSessionId !== null && (this.foreignTurnsByLocalSessionId.get(localSessionId)?.size ?? 0) > 0;
     const isOwnPrompt = direction === "outbound" && envelopeMethod(envelope) === "session/prompt";
+    const store = direction === "outbound" || ownTurn || !foreignTurn;
     this.onObservedEnvelope(this, envelope, direction, localSessionId, {
-      eventId,
-      store: direction === "outbound" || ownTurn || !foreignTurn,
-      reseedIndex: !ownTurn || isOwnPrompt,
+      eventId: meta?.eventId,
+      serverGeneration: meta?.serverGeneration,
+      store,
+      foreignTurn: store || localSessionId === null ? undefined : this.foreignTurnKeyByLocalSessionId.get(localSessionId),
+      reseedIndex: !activePrompt || isOwnPrompt,
     });
   }
 
-  private trackForeignTurn(localSessionId: string, turn: SandboxAgentTurnNotification): void {
+  /**
+   * A turn is this client's own when its request id carries this client's
+   * wire id prefix (also when the prompt's HTTP request failed after the
+   * server accepted it), otherwise another client's.
+   */
+  private trackTurn(localSessionId: string, turn: SandboxAgentTurnNotification): void {
     const requestId = String(turn.params.requestId);
     if (turn.method === SANDBOX_AGENT_TURN_STARTED) {
-      if ((this.activePromptsByLocalSessionId.get(localSessionId) ?? 0) === 0) {
-        const turns = this.foreignTurnsByLocalSessionId.get(localSessionId) ?? new Set<string>();
-        turns.add(requestId);
-        this.foreignTurnsByLocalSessionId.set(localSessionId, turns);
+      const own = this.acp.isOwnWireRequestId(turn.params.requestId);
+      const byLocal = own ? this.ownTurnsByLocalSessionId : this.foreignTurnsByLocalSessionId;
+      const turns = byLocal.get(localSessionId) ?? new Set<string>();
+      if (!own && turns.size === 0) {
+        this.foreignTurnKeyByLocalSessionId.set(localSessionId, this.nextForeignTurnKey++);
       }
+      turns.add(requestId);
+      byLocal.set(localSessionId, turns);
       return;
     }
     if (turn.method === SANDBOX_AGENT_TURN_ENDED) {
-      const turns = this.foreignTurnsByLocalSessionId.get(localSessionId);
-      turns?.delete(requestId);
-      if (turns && turns.size === 0) {
-        this.foreignTurnsByLocalSessionId.delete(localSessionId);
+      const own = this.ownTurnsByLocalSessionId.get(localSessionId);
+      own?.delete(requestId);
+      if (own && own.size === 0) {
+        this.ownTurnsByLocalSessionId.delete(localSessionId);
       }
+      const foreign = this.foreignTurnsByLocalSessionId.get(localSessionId);
+      if (foreign?.delete(requestId) && foreign.size === 0) {
+        this.finishForeignTurns(localSessionId);
+      }
+    }
+  }
+
+  private finishForeignTurns(localSessionId: string): void {
+    this.foreignTurnsByLocalSessionId.delete(localSessionId);
+    const key = this.foreignTurnKeyByLocalSessionId.get(localSessionId);
+    this.foreignTurnKeyByLocalSessionId.delete(localSessionId);
+    if (key !== undefined) {
+      this.onForeignTurnFinished?.(this, localSessionId, key);
+    }
+  }
+
+  private resetTurns(): void {
+    this.ownTurnsByLocalSessionId.clear();
+    for (const localSessionId of [...this.foreignTurnsByLocalSessionId.keys()]) {
+      this.finishForeignTurns(localSessionId);
     }
   }
 
@@ -1230,6 +1281,10 @@ export class SandboxAgent {
   private readonly cancelUnansweredPermissionsAfterMs?: number;
   // Timers of the opt-in cancellation of other clients' unanswered requests.
   private readonly passivePermissionTimers = new Set<PassivePermissionTimer>();
+  // Events of other clients' turns, stored after the turn ended (see
+  // ObservedEnvelopeContext.store). Keyed by session, connection and turn key.
+  private readonly foreignTurnBuffers = new Map<string, SessionEvent[]>();
+  private readonly foreignTurnFlushTimers = new Set<ReturnType<typeof setTimeout>>();
 
   private healthPromise?: Promise<void>;
   private healthError?: Error;
@@ -1374,6 +1429,11 @@ export class SandboxAgent {
       clearTimeout(timer.handle);
     }
     this.passivePermissionTimers.clear();
+    for (const timer of this.foreignTurnFlushTimers) {
+      clearTimeout(timer);
+    }
+    this.foreignTurnFlushTimers.clear();
+    this.foreignTurnBuffers.clear();
 
     const connections = [...this.liveConnections.values()];
     this.liveConnections.clear();
@@ -1715,6 +1775,7 @@ export class SandboxAgent {
 
   async destroySession(id: string): Promise<Session> {
     this.cancelPendingPermissionsForSession(id);
+    this.clearPassivePermissionTimers((timer) => timer.sessionId === id);
 
     try {
       await this.sendSessionMethodInternal(id, SESSION_CANCEL_METHOD, {}, {}, true);
@@ -1993,6 +2054,7 @@ export class SandboxAgent {
   }
 
   private async discardLiveConnection(live: LiveAcpConnection): Promise<void> {
+    this.clearPassivePermissionTimers((timer) => timer.connection === live);
     if (this.liveConnections.get(live.serverId) === live) {
       this.liveConnections.delete(live.serverId);
     }
@@ -2409,6 +2471,7 @@ export class SandboxAgent {
     if (live) {
       this.liveConnections.delete(serverId);
       this.cancelPendingPermissionsForConnection(live);
+      this.clearPassivePermissionTimers((timer) => timer.connection === live);
       await live.close({ deleteServer: false }).catch(() => {});
     }
   }
@@ -2747,12 +2810,7 @@ export class SandboxAgent {
         },
       });
 
-      try {
-        const listed = (await this.listAcpServers()).servers.find((server) => server.serverId === serverId);
-        created.generation = listed?.createdAtMs;
-      } catch {
-        // Without it, event ids fall back to the server id alone.
-      }
+      created.onForeignTurnFinished = (connection, localSessionId, foreignTurn) => this.scheduleForeignTurnFlush(connection, localSessionId, foreignTurn);
 
       const raced = this.liveConnections.get(serverId);
       if (raced) {
@@ -2796,8 +2854,13 @@ export class SandboxAgent {
     // stream gets an id derived from the server instance and the stream's event
     // id. A driver keeps the first record per id, so a replay after
     // reconnecting, or an event two clients store, is kept once.
-    const generation = connection.generation === undefined ? "" : `@${connection.generation}`;
-    const stableId = context.eventId === undefined ? undefined : `${connection.serverId}${generation}:${context.eventId}`;
+    let stableId: string | undefined;
+    let sharedId = false;
+    if (context.eventId !== undefined) {
+      const generation = context.serverGeneration ?? (await this.lookupConnectionGeneration(connection));
+      sharedId = generation !== undefined;
+      stableId = generation === undefined ? `${connection.serverId}:${context.eventId}` : `${connection.serverId}@${generation}:${context.eventId}`;
+    }
     const buildEvent = (eventIndex: number): SessionEvent => ({
       id: stableId ?? randomId(),
       eventIndex,
@@ -2810,8 +2873,16 @@ export class SandboxAgent {
 
     let event: SessionEvent;
     if (!context.store) {
-      // Another client's turn: that client stores it. Deliver with a local index.
+      // Another client's turn: that client stores it. Deliver with a local index
+      // and keep it to store after the turn, in case that client died. Only ids
+      // every client derives the same way are kept, so no event is stored twice.
       event = buildEvent(await this.allocateSessionEventIndex(localSessionId, false));
+      if (sharedId && context.foreignTurn !== undefined) {
+        const key = foreignTurnBufferKey(localSessionId, connection, context.foreignTurn);
+        const buffered = this.foreignTurnBuffers.get(key) ?? [];
+        buffered.push(event);
+        this.foreignTurnBuffers.set(key, buffered);
+      }
     } else {
       let stored: SessionEvent | null = null;
       for (let attempt = 0; attempt < MAX_EVENT_INDEX_INSERT_RETRIES; attempt += 1) {
@@ -2840,6 +2911,83 @@ export class SandboxAgent {
     for (const listener of listeners) {
       listener(event);
     }
+  }
+
+  /**
+   * Generation of the connection's server for servers that do not send it on
+   * the event stream: `createdAtMs` from the server list, looked up again on
+   * every call until it is known.
+   */
+  private async lookupConnectionGeneration(connection: LiveAcpConnection): Promise<string | undefined> {
+    if (connection.generation === undefined) {
+      try {
+        const listed = (await this.listAcpServers()).servers.find((server) => server.serverId === connection.serverId);
+        connection.generation = listed?.createdAtMs;
+      } catch {
+        // Not known yet: such events are not shared with other clients.
+      }
+    }
+    return connection.generation === undefined ? undefined : String(connection.generation);
+  }
+
+  /**
+   * After another client's turn ended, store the events of that turn the
+   * prompting client did not store (it may have died). The grace period lets
+   * a live prompting client finish its own writes first, so the stored order
+   * stays the order it saw.
+   */
+  private scheduleForeignTurnFlush(connection: LiveAcpConnection, localSessionId: string, foreignTurn: number): void {
+    const key = foreignTurnBufferKey(localSessionId, connection, foreignTurn);
+    const timer = setTimeout(() => {
+      this.foreignTurnFlushTimers.delete(timer);
+      const previous = this.pendingObservedEnvelopePersistenceBySession.get(localSessionId) ?? Promise.resolve();
+      const current = previous
+        .catch(() => {})
+        .then(async () => {
+          const events = this.foreignTurnBuffers.get(key) ?? [];
+          this.foreignTurnBuffers.delete(key);
+          await this.storeMissingEvents(localSessionId, events);
+        });
+      this.pendingObservedEnvelopePersistenceBySession.set(localSessionId, current);
+      void current
+        .catch((error) => {
+          console.error("Failed to persist observed sandbox-agent turn", error);
+        })
+        .finally(() => {
+          if (this.pendingObservedEnvelopePersistenceBySession.get(localSessionId) === current) {
+            this.pendingObservedEnvelopePersistenceBySession.delete(localSessionId);
+          }
+        });
+    }, FOREIGN_TURN_FLUSH_GRACE_MS);
+    this.foreignTurnFlushTimers.add(timer);
+  }
+
+  /** Stores, in order and after the highest stored index, the events not stored yet. */
+  private async storeMissingEvents(sessionId: string, events: SessionEvent[]): Promise<void> {
+    if (events.length === 0) {
+      return;
+    }
+    const { maxIndex, ids } = await this.scanPersistedSessionEvents(sessionId);
+    let next = Math.max(this.nextSessionEventIndexBySession.get(sessionId) ?? 1, maxIndex + 1);
+    for (const event of events) {
+      if (ids.has(event.id)) {
+        continue;
+      }
+      for (let attempt = 0; attempt < MAX_EVENT_INDEX_INSERT_RETRIES; attempt += 1) {
+        const eventIndex = attempt === 0 ? next : await this.allocateSessionEventIndex(sessionId, true);
+        try {
+          await this.persist.insertEvent(sessionId, { ...event, eventIndex });
+          next = eventIndex + 1;
+          break;
+        } catch (error) {
+          if (!isSessionEventIndexConflict(error) || attempt === MAX_EVENT_INDEX_INSERT_RETRIES - 1) {
+            throw error;
+          }
+        }
+      }
+      await this.persistSessionStateFromEvent(sessionId, event.payload, event.sender === "client" ? "outbound" : "inbound");
+    }
+    this.nextSessionEventIndexBySession.set(sessionId, Math.max(this.nextSessionEventIndexBySession.get(sessionId) ?? 1, next));
   }
 
   private async enqueueObservedEnvelopePersistence(
@@ -2993,7 +3141,12 @@ export class SandboxAgent {
   }
 
   private async findMaxPersistedSessionEventIndex(sessionId: string): Promise<number> {
+    return (await this.scanPersistedSessionEvents(sessionId)).maxIndex;
+  }
+
+  private async scanPersistedSessionEvents(sessionId: string): Promise<{ maxIndex: number; ids: Set<string> }> {
     let maxIndex = 0;
+    const ids = new Set<string>();
     let eventCursor: string | undefined;
 
     while (true) {
@@ -3004,6 +3157,7 @@ export class SandboxAgent {
       });
 
       for (const event of eventsPage.items) {
+        ids.add(event.id);
         if (Number.isFinite(event.eventIndex) && event.eventIndex > maxIndex) {
           maxIndex = Math.floor(event.eventIndex);
         }
@@ -3015,7 +3169,7 @@ export class SandboxAgent {
       eventCursor = eventsPage.nextCursor;
     }
 
-    return maxIndex;
+    return { maxIndex, ids };
   }
 
   private async collectReplayEvents(sessionId: string, maxEvents: number): Promise<SessionEvent[]> {
@@ -3126,10 +3280,6 @@ export class SandboxAgent {
     pending.resolve(response);
   }
 
-  /**
-   * The request was answered (by any client) or the turn ended: forget it
-   * without replying, so a late local reply is not sent as a second answer.
-   */
   /** Opt-in: cancel another client's request unless it is answered in time. */
   private cancelPermissionLater(
     connection: LiveAcpConnection,
@@ -3151,6 +3301,20 @@ export class SandboxAgent {
     });
   }
 
+  private clearPassivePermissionTimers(matches: (timer: PassivePermissionTimer) => boolean): void {
+    for (const timer of this.passivePermissionTimers) {
+      if (matches(timer)) {
+        // The promise is left unsettled: no reply is sent.
+        clearTimeout(timer.handle);
+        this.passivePermissionTimers.delete(timer);
+      }
+    }
+  }
+
+  /**
+   * The request was answered (by any client) or the turn ended: forget it
+   * without replying, so a late local reply is not sent as a second answer.
+   */
   private dropResolvedPermissionRequests(connection: LiveAcpConnection, sessionId: string, rpcId: string | number): void {
     for (const timer of this.passivePermissionTimers) {
       if (timer.connection === connection && timer.sessionId === sessionId && timer.rpcId !== undefined && String(timer.rpcId) === String(rpcId)) {
@@ -4042,6 +4206,14 @@ function permissionReplyToResponse(permissionId: string, request: RequestPermiss
  */
 function unansweredPermissionResponse(): Promise<RequestPermissionResponse> {
   return new Promise<RequestPermissionResponse>(() => {});
+}
+
+// How long after another client's turn ended its events are stored by this
+// client (only those still missing), see scheduleForeignTurnFlush.
+const FOREIGN_TURN_FLUSH_GRACE_MS = 100;
+
+function foreignTurnBufferKey(localSessionId: string, connection: LiveAcpConnection, foreignTurn: number): string {
+  return `${localSessionId}\u0000${connection.connectionId}\u0000${foreignTurn}`;
 }
 
 /** The server rejected a request because the server does not exist (any more). */

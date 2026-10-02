@@ -53,7 +53,15 @@
         ],
         "responses": {
           "200": {
-            "description": "SSE stream of ACP envelopes"
+            "description": "SSE stream of ACP envelopes",
+            "headers": {
+              "x-sandboxagent-server-generation": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Creation time (ms) of this server instance, the same as `createdAtMs` in `GET /v1/acp`; differs for a later server that reuses the id"
+              }
+            }
           },
           "400": {
             "description": "Invalid request",

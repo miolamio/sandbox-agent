@@ -247,12 +247,15 @@ impl AcpProxyRuntime {
         }
     }
 
+    /// Returns the instance generation (its `created_at_ms`) with the stream,
+    /// so clients can tell a later server that reuses the same id apart.
     pub async fn sse(
         &self,
         server_id: &str,
         last_event_id: Option<u64>,
-    ) -> Result<PinBoxSseStream, SandboxError> {
+    ) -> Result<(i64, PinBoxSseStream), SandboxError> {
         let instance = self.get_instance(server_id).await?;
+        let generation = instance.created_at_ms;
         let stream =
             instance
                 .annotated_payload_stream(last_event_id)
@@ -263,7 +266,7 @@ impl AcpProxyRuntime {
                         .id(sequence.to_string())
                         .data(payload.to_string()))
                 });
-        Ok(Box::pin(stream))
+        Ok((generation, Box::pin(stream)))
     }
 
     pub async fn delete(&self, server_id: &str) -> Result<(), SandboxError> {

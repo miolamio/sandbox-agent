@@ -693,6 +693,42 @@ async fn acp_list_servers_returns_active_instances() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn sse_reports_server_generation_header() {
+    let test_app = TestApp::with_setup(AuthConfig::disabled(), |install_dir| {
+        setup_stub_artifacts(install_dir, "codex");
+    });
+
+    bootstrap_server(&test_app.app, "server-generation", "codex").await;
+
+    let (status, _, body) = send_request(&test_app.app, Method::GET, "/v1/acp", None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed = parse_json(&body);
+    let created_at_ms = parsed["servers"]
+        .as_array()
+        .expect("servers array")
+        .iter()
+        .find(|server| server["serverId"] == "server-generation")
+        .expect("listed server")["createdAtMs"]
+        .as_i64()
+        .expect("createdAtMs");
+
+    let response = reqwest::Client::new()
+        .get(test_app.app.http_url("/v1/acp/server-generation"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("sse response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let generation = response
+        .headers()
+        .get("x-sandboxagent-server-generation")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    assert_eq!(generation, Some(created_at_ms.to_string()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn sandboxagent_methods_are_not_handled_specially() {
     let test_app = TestApp::with_setup(AuthConfig::disabled(), |install_dir| {
         setup_stub_artifacts(install_dir, "codex");

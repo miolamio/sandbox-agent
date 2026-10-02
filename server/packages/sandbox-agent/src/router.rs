@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::sse::KeepAlive;
 use axum::response::{IntoResponse, Response, Sse};
@@ -3281,7 +3281,9 @@ async fn post_v1_acp(
         ("server_id" = String, Path, description = "Client-defined ACP server id")
     ),
     responses(
-        (status = 200, description = "SSE stream of ACP envelopes"),
+        (status = 200, description = "SSE stream of ACP envelopes", headers(
+            ("x-sandboxagent-server-generation" = String, description = "Creation time (ms) of this server instance, the same as `createdAtMs` in `GET /v1/acp`; differs for a later server that reuses the id")
+        )),
         (status = 406, description = "Client does not accept SSE responses", body = ProblemDetails),
         (status = 404, description = "Unknown ACP server", body = ProblemDetails),
         (status = 400, description = "Invalid request", body = ProblemDetails)
@@ -3291,7 +3293,7 @@ async fn get_v1_acp(
     State(state): State<Arc<AppState>>,
     Path(server_id): Path<String>,
     headers: HeaderMap,
-) -> Result<Sse<PinBoxSseStream>, ApiError> {
+) -> Result<Response, ApiError> {
     if !accept_allows(&headers, TEXT_EVENT_STREAM) {
         return Err(SandboxError::NotAcceptable {
             message: "accept must allow text/event-stream".to_string(),
@@ -3300,13 +3302,21 @@ async fn get_v1_acp(
     }
 
     let last_event_id = parse_last_event_id(&headers)?;
-    let stream = state.acp_proxy().sse(&server_id, last_event_id).await?;
+    let (generation, stream) = state.acp_proxy().sse(&server_id, last_event_id).await?;
 
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("heartbeat"),
-    ))
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("heartbeat"),
+        )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&generation.to_string()) {
+        response
+            .headers_mut()
+            .insert(SERVER_GENERATION_HEADER, value);
+    }
+    Ok(response)
 }
 
 #[utoipa::path(
