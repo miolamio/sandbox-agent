@@ -24,6 +24,35 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Delegates to a shared driver, with a delay before each event write (a slow client). */
+class DelayedWritePersistDriver implements SessionPersistDriver {
+  constructor(
+    private readonly inner: SessionPersistDriver,
+    private readonly delayMs: number,
+  ) {}
+
+  getSession(id: string) {
+    return this.inner.getSession(id);
+  }
+
+  listSessions(request?: { cursor?: string; limit?: number }) {
+    return this.inner.listSessions(request);
+  }
+
+  updateSession(session: SessionRecord) {
+    return this.inner.updateSession(session);
+  }
+
+  listEvents(request: ListEventsRequest) {
+    return this.inner.listEvents(request);
+  }
+
+  async insertEvent(sessionId: string, event: SessionEvent): Promise<void> {
+    await sleep(this.delayMs);
+    await this.inner.insertEvent(sessionId, event);
+  }
+}
+
 class StrictUniqueSessionPersistDriver implements SessionPersistDriver {
   private readonly events = new InMemorySessionPersistDriver({
     maxEventsPerSession: 500,
@@ -1080,6 +1109,161 @@ describe("Integration: TypeScript SDK flat session API", () => {
       await observer.destroyAcpServer(session.serverId!);
       const servers = await author.listAcpServers();
       expect(servers.servers.map((server) => server.serverId)).not.toContain(session.serverId);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("keeps shared history and replay in true order with an attached observer and a slow author", async () => {
+    const shared = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    // The author's writes land late, so the observer sees each event first.
+    const author = await SandboxAgent.connect({ baseUrl, token, persist: new DelayedWritePersistDriver(shared, 40) });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist: shared });
+    let third: SandboxAgent | undefined;
+    try {
+      const session = await author.createSession({ agent: "mock" });
+      const watched = await observer.resumeSession(session.id);
+      const words = ["one", "two", "three", "four"];
+      for (const word of words) {
+        await promptAndWaitForObserver(session, watched, `PROMPT:${word}`);
+      }
+      await sleep(300);
+
+      const expected = words.flatMap((word) => [`P:${word}`, `C:${word}`]);
+      const stored = (await shared.listEvents({ sessionId: session.id, limit: 1000 })).items;
+      const tokens = stored.flatMap((event) => {
+        const payload = event.payload as any;
+        const promptText = payload?.method === "session/prompt" ? payload.params?.prompt?.[0]?.text : undefined;
+        const chunkText = payload?.params?.update?.content?.text;
+        const prompt = event.sender === "client" && typeof promptText === "string" ? /^PROMPT:(\w+)$/.exec(promptText) : null;
+        const chunk = event.sender === "agent" && typeof chunkText === "string" ? /^mock: PROMPT:(\w+)$/.exec(chunkText) : null;
+        return prompt ? [`P:${prompt[1]}`] : chunk ? [`C:${chunk[1]}`] : [];
+      });
+      expect(tokens).toEqual(expected);
+
+      // A client that has to recreate the session replays the history in the same order.
+      await author.destroyAcpServer(session.serverId!);
+      third = await SandboxAgent.connect({ baseUrl, token, persist: shared });
+      const restored = await third.resumeSession(session.id);
+      await withTimeout(restored.prompt([{ type: "text", text: "after replay" }]), "replayed prompt");
+      const after = (await shared.listEvents({ sessionId: session.id, limit: 1000 })).items;
+      const replayPrompt = after.find(
+        (event) => event.sender === "client" && JSON.stringify(event.payload).includes("Previous session history is replayed below"),
+      );
+      expect(replayPrompt).toBeTruthy();
+      const replayTokens = [...JSON.stringify(replayPrompt!.payload).matchAll(/(mock: )?PROMPT:(\w+)/g)].map((match) => `${match[1] ? "C" : "P"}:${match[2]}`);
+      expect(replayTokens).toEqual(expected);
+    } finally {
+      await third?.dispose();
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("does not fork a session when attaching to its server fails for another reason", async () => {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const session = await author.createSession({ agent: "mock" });
+    const serverId = session.serverId!;
+    let failed = false;
+    // A network failure on the first request to the existing server.
+    const flakyFetch: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!failed && init?.method === "POST" && url.includes(`/v1/acp/${encodeURIComponent(serverId)}`)) {
+        failed = true;
+        throw new TypeError("simulated network failure");
+      }
+      return fetch(input, init);
+    };
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist, fetch: flakyFetch });
+    try {
+      await expect(observer.resumeSession(session.id)).rejects.toBeTruthy();
+      expect(failed).toBe(true);
+
+      const record = await persist.getSession(session.id);
+      expect(record?.serverId).toBe(serverId);
+      expect(record?.agentSessionId).toBe(session.agentSessionId);
+      const servers = await author.listAcpServers();
+      expect(servers.servers.map((server) => server.serverId)).toEqual([serverId]);
+
+      const watched = await observer.resumeSession(session.id);
+      expect(watched.serverId).toBe(serverId);
+      expect(watched.agentSessionId).toBe(session.agentSessionId);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("a passive client opted in to cancelUnansweredPermissionsAfterMs cancels a request nobody answers", async () => {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist, cancelUnansweredPermissionsAfterMs: 500 });
+    try {
+      const session = await author.createSession({ agent: "mock" });
+      const watched = await observer.resumeSession(session.id);
+      await promptAndWaitForObserver(session, watched, "connect observer");
+      const texts = collectPermissionTexts(session);
+      // The author's listener never answers, like a client that hung or died.
+      let permissionId: string | undefined;
+      session.onPermissionRequest((request) => {
+        permissionId = request.id;
+      });
+
+      const started = Date.now();
+      const prompt = await withTimeout(session.prompt([{ type: "text", text: "trigger permission" }]), "prompt");
+      expect(prompt.stopReason).toBe("end_turn");
+      expect(permissionId).toBeTruthy();
+      expect(Date.now() - started).toBeGreaterThanOrEqual(400);
+      await waitFor(() => (texts.length > 0 ? texts : undefined));
+      expect(texts).toEqual(["mock permission approved: cancelled"]);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("restores an observer's session on a new server after the owner disposed", async () => {
+    const { persist, author, observer, session, watched } = await connectAuthorAndObserver();
+    try {
+      const oldServerId = session.serverId;
+      await author.dispose();
+
+      // Whether this first prompt is sent again automatically is not pinned here.
+      const first = await withTimeout(
+        watched.prompt([{ type: "text", text: "after the owner left" }]).then(
+          (response) => response,
+          (error: unknown) => error,
+        ),
+        "first prompt after owner dispose",
+      );
+      if (first instanceof Error) {
+        expect(first).toBeInstanceOf(SessionRequestInterruptedError);
+      }
+
+      const record = await persist.getSession(session.id);
+      expect(record?.serverId).toBeTruthy();
+      expect(record?.serverId).not.toBe(oldServerId);
+      const servers = await observer.listAcpServers();
+      expect(servers.servers.map((server) => server.serverId)).toContain(record?.serverId);
+      await expect(withTimeout(watched.prompt([{ type: "text", text: "on the new server" }]), "prompt on new server")).resolves.toMatchObject({
+        stopReason: "end_turn",
+      });
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("derives stream event ids from the server id and its generation", async () => {
+    const { author, observer, session } = await connectAuthorAndObserver();
+    try {
+      const server = (await author.listAcpServers()).servers.find((entry) => entry.serverId === session.serverId);
+      expect(server).toBeTruthy();
+      const events = (await author.getEvents({ sessionId: session.id, limit: 1000 })).items;
+      const chunk = events.find((event) => (event.payload as any)?.params?.update?.content?.text === "mock: connect observer");
+      expect(chunk?.id).toMatch(new RegExp(`^${session.serverId}@${server!.createdAtMs}:\\d+$`));
     } finally {
       await observer.dispose();
       await author.dispose();

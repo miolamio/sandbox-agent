@@ -156,7 +156,7 @@ export type SessionEventSender = "client" | "agent";
 export interface SessionEvent {
   /**
    * Stable unique event id. For ordering, sort by (sessionId, eventIndex).
-   * Events from a server's event stream use `<serverId>:<stream event id>`, so
+   * Events from a server's event stream use `<serverId>@<createdAtMs>:<stream event id>`, so
    * every client that shares a driver produces the same id for the same event.
    */
   id: string;
@@ -203,12 +203,17 @@ export interface InMemorySessionPersistDriverOptions {
 const DEFAULT_MAX_SESSIONS = 1024;
 const DEFAULT_MAX_EVENTS_PER_SESSION = 500;
 const DEFAULT_LIST_LIMIT = 100;
+const SEEN_EVENT_IDS_FACTOR = 4;
 
 export class InMemorySessionPersistDriver implements SessionPersistDriver {
   private readonly maxSessions: number;
   private readonly maxEventsPerSession: number;
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly eventsBySession = new Map<string, SessionEvent[]>();
+  // Ids stored per session, kept longer than the events themselves (up to
+  // SEEN_EVENT_IDS_FACTOR times the event cap), so a late copy of an event that
+  // was already trimmed is not stored again.
+  private readonly seenEventIdsBySession = new Map<string, Set<string>>();
 
   constructor(options: InMemorySessionPersistDriverOptions = {}) {
     this.maxSessions = normalizeCap(options.maxSessions, DEFAULT_MAX_SESSIONS);
@@ -259,6 +264,7 @@ export class InMemorySessionPersistDriver implements SessionPersistDriver {
     for (const sessionId of removable) {
       this.sessions.delete(sessionId);
       this.eventsBySession.delete(sessionId);
+      this.seenEventIdsBySession.delete(sessionId);
     }
   }
 
@@ -278,10 +284,17 @@ export class InMemorySessionPersistDriver implements SessionPersistDriver {
 
   async insertEvent(sessionId: string, event: SessionEvent): Promise<void> {
     const events = this.eventsBySession.get(sessionId) ?? [];
-    if (events.some((existing) => existing.id === event.id)) {
+    const seen = this.seenEventIdsBySession.get(sessionId) ?? new Set<string>();
+    if (seen.has(event.id)) {
       // Already stored (another client sharing this driver, or a replay).
       return;
     }
+    seen.add(event.id);
+    if (seen.size > this.maxEventsPerSession * SEEN_EVENT_IDS_FACTOR) {
+      // Sets iterate in insertion order: forget the oldest id.
+      seen.delete(seen.values().next().value as string);
+    }
+    this.seenEventIdsBySession.set(sessionId, seen);
     events.push(cloneSessionEvent(event));
 
     if (events.length > this.maxEventsPerSession) {

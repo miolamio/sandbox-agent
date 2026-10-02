@@ -23,6 +23,8 @@ import {
   type SetSessionModeRequest,
   parseSandboxAgentTurnNotification,
   SANDBOX_AGENT_INPUT_RESOLVED,
+  SANDBOX_AGENT_TURN_ENDED,
+  SANDBOX_AGENT_TURN_STARTED,
   type SandboxAgentRequestId,
   type SandboxAgentTurnNotification,
   type SandboxAgentTurnOutcome,
@@ -174,6 +176,15 @@ interface SandboxAgentConnectCommonOptions {
   persist?: SessionPersistDriver;
   replayMaxEvents?: number;
   replayMaxChars?: number;
+  /**
+   * Off by default. When set, this client cancels a permission request of a
+   * session it is attached to if the request is still unanswered after this
+   * many milliseconds, it has no `onPermissionRequest` listener for the
+   * session, and the request belongs to another client's prompt. Use it on a
+   * supervising client so a turn does not wait for the server's request
+   * timeout (2 hours by default) when the prompting client died.
+   */
+  cancelUnansweredPermissionsAfterMs?: number;
   signal?: AbortSignal;
   token?: string;
   skipHealthCheck?: boolean;
@@ -202,6 +213,8 @@ export interface SandboxAgentStartOptions {
   persist?: SessionPersistDriver;
   replayMaxEvents?: number;
   replayMaxChars?: number;
+  /** See {@link SandboxAgentConnectOptions} `cancelUnansweredPermissionsAfterMs`. */
+  cancelUnansweredPermissionsAfterMs?: number;
   signal?: AbortSignal;
   token?: string;
 }
@@ -559,12 +572,29 @@ export class Session {
 
 type TurnNotificationHandler = (connection: LiveAcpConnection, localSessionId: string, notification: SandboxAgentTurnNotification) => void;
 
+type ObservedEnvelopeContext = {
+  /** Event stream id, for envelopes that arrived over the event stream. */
+  eventId?: string;
+  /**
+   * Whether this client stores the envelope. During another client's turn
+   * that client stores the turn's events (in the order it saw them, after its
+   * own prompt), and this client only delivers them to its listeners.
+   */
+  store: boolean;
+  /**
+   * Whether the event index must be read from persistence again before
+   * writing: at the start of this client's own prompt and for writes outside
+   * its own turns, other clients may have written events since.
+   */
+  reseedIndex: boolean;
+};
+
 type ObservedEnvelopeHandler = (
   connection: LiveAcpConnection,
   envelope: AnyMessage,
   direction: AcpEnvelopeDirection,
   localSessionId: string | null,
-  eventId: string | undefined,
+  context: ObservedEnvelopeContext,
 ) => void;
 
 type PermissionRequestContext = {
@@ -598,6 +628,11 @@ export class LiveAcpConnection {
    * closes just its own event stream.
    */
   readonly ownsServer: boolean;
+  /**
+   * Creation time of the server instance (`createdAtMs` from the server list),
+   * so event ids of a later server reusing the same id do not collide.
+   */
+  generation?: number;
 
   private readonly acp: AcpHttpClient;
   private readonly sessionByLocalId = new Map<string, string>();
@@ -607,6 +642,8 @@ export class LiveAcpConnection {
   private readonly pendingReplayByLocalSessionId = new Map<string, string>();
   // Prompts this connection sent that have not finished yet, per local session.
   private readonly activePromptsByLocalSessionId = new Map<string, number>();
+  // Turns of other clients in progress, per local session (turn request ids).
+  private readonly foreignTurnsByLocalSessionId = new Map<string, Set<string>>();
   // JSON-RPC ids of permission requests seen on the event stream and not yet
   // handed to the handler, keyed by agent session id and tool call id.
   private readonly permissionRpcIds = new Map<string, string | number>();
@@ -890,13 +927,40 @@ export class LiveAcpConnection {
         // listeners instead of persisting them as session events.
         const localSessionId = this.localByAgentSessionId.get(turn.params.sessionId);
         if (localSessionId) {
+          this.trackForeignTurn(localSessionId, turn);
           this.onTurnEvent(this, localSessionId, turn);
         }
         return;
       }
     }
     const localSessionId = this.resolveSessionId(envelope, direction);
-    this.onObservedEnvelope(this, envelope, direction, localSessionId, eventId);
+    const ownTurn = localSessionId !== null && (this.activePromptsByLocalSessionId.get(localSessionId) ?? 0) > 0;
+    const foreignTurn = localSessionId !== null && (this.foreignTurnsByLocalSessionId.get(localSessionId)?.size ?? 0) > 0;
+    const isOwnPrompt = direction === "outbound" && envelopeMethod(envelope) === "session/prompt";
+    this.onObservedEnvelope(this, envelope, direction, localSessionId, {
+      eventId,
+      store: direction === "outbound" || ownTurn || !foreignTurn,
+      reseedIndex: !ownTurn || isOwnPrompt,
+    });
+  }
+
+  private trackForeignTurn(localSessionId: string, turn: SandboxAgentTurnNotification): void {
+    const requestId = String(turn.params.requestId);
+    if (turn.method === SANDBOX_AGENT_TURN_STARTED) {
+      if ((this.activePromptsByLocalSessionId.get(localSessionId) ?? 0) === 0) {
+        const turns = this.foreignTurnsByLocalSessionId.get(localSessionId) ?? new Set<string>();
+        turns.add(requestId);
+        this.foreignTurnsByLocalSessionId.set(localSessionId, turns);
+      }
+      return;
+    }
+    if (turn.method === SANDBOX_AGENT_TURN_ENDED) {
+      const turns = this.foreignTurnsByLocalSessionId.get(localSessionId);
+      turns?.delete(requestId);
+      if (turns && turns.size === 0) {
+        this.foreignTurnsByLocalSessionId.delete(localSessionId);
+      }
+    }
   }
 
   private rememberPermissionRpcId(envelope: AnyMessage): void {
@@ -1163,6 +1227,9 @@ export class SandboxAgent {
   private readonly persist: SessionPersistDriver;
   private readonly replayMaxEvents: number;
   private readonly replayMaxChars: number;
+  private readonly cancelUnansweredPermissionsAfterMs?: number;
+  // Timers of the opt-in cancellation of other clients' unanswered requests.
+  private readonly passivePermissionTimers = new Set<PassivePermissionTimer>();
 
   private healthPromise?: Promise<void>;
   private healthError?: Error;
@@ -1202,6 +1269,8 @@ export class SandboxAgent {
 
     this.replayMaxEvents = normalizePositiveInt(options.replayMaxEvents, DEFAULT_REPLAY_MAX_EVENTS);
     this.replayMaxChars = normalizePositiveInt(options.replayMaxChars, DEFAULT_REPLAY_MAX_CHARS);
+    const cancelAfter = options.cancelUnansweredPermissionsAfterMs;
+    this.cancelUnansweredPermissionsAfterMs = typeof cancelAfter === "number" && Number.isFinite(cancelAfter) && cancelAfter >= 0 ? cancelAfter : undefined;
 
     this.startHealthWait();
   }
@@ -1244,6 +1313,7 @@ export class SandboxAgent {
         persist: options.persist,
         replayMaxEvents: options.replayMaxEvents,
         replayMaxChars: options.replayMaxChars,
+        cancelUnansweredPermissionsAfterMs: options.cancelUnansweredPermissionsAfterMs,
         signal: options.signal,
         skipHealthCheck: options.skipHealthCheck,
         token: options.token ?? (await resolveProviderToken(provider, rawSandboxId)),
@@ -1300,6 +1370,10 @@ export class SandboxAgent {
         pending.resolve(cancelledPermissionResponse());
       }
     }
+    for (const timer of this.passivePermissionTimers) {
+      clearTimeout(timer.handle);
+    }
+    this.passivePermissionTimers.clear();
 
     const connections = [...this.liveConnections.values()];
     this.liveConnections.clear();
@@ -2594,8 +2668,13 @@ export class SandboxAgent {
       if (await this.isAcpServerRunning(preferred, agent)) {
         try {
           return await this.openLiveConnection(agent, preferred, true);
-        } catch {
-          // The server went away after it was listed; start a new one below.
+        } catch (error) {
+          // Only a server that went away after it was listed is replaced by a
+          // new one below. Any other failure (network, auth, server error) is
+          // thrown, so the session is not forked onto a second server.
+          if (!isMissingServerRejection(error) || (await this.isAcpServerListedOrThrow(preferred, error))) {
+            throw error;
+          }
         }
       }
     }
@@ -2611,6 +2690,17 @@ export class SandboxAgent {
     }
 
     return this.openLiveConnection(agent, `sdk-${agent}-${randomId()}`, false);
+  }
+
+  /** Whether the server is listed; rethrows `cause` when the list cannot be read. */
+  private async isAcpServerListedOrThrow(serverId: string, cause: unknown): Promise<boolean> {
+    let servers: AcpServerListResponse;
+    try {
+      servers = await this.listAcpServers();
+    } catch {
+      throw cause;
+    }
+    return servers.servers.some((server) => server.serverId === serverId);
   }
 
   private async isAcpServerRunning(serverId: string, agent: string): Promise<boolean> {
@@ -2638,8 +2728,8 @@ export class SandboxAgent {
         agent,
         serverId,
         attach,
-        onObservedEnvelope: (connection, envelope, direction, localSessionId, eventId) => {
-          void this.enqueueObservedEnvelopePersistence(connection, envelope, direction, localSessionId, eventId).catch((error) => {
+        onObservedEnvelope: (connection, envelope, direction, localSessionId, context) => {
+          void this.enqueueObservedEnvelopePersistence(connection, envelope, direction, localSessionId, context).catch((error) => {
             console.error("Failed to persist observed sandbox-agent envelope", error);
           });
         },
@@ -2652,6 +2742,13 @@ export class SandboxAgent {
           void this.enqueueTurnEvent(localSessionId, notification);
         },
       });
+
+      try {
+        const listed = (await this.listAcpServers()).servers.find((server) => server.serverId === serverId);
+        created.generation = listed?.createdAtMs;
+      } catch {
+        // Without it, event ids fall back to the server id alone.
+      }
 
       const raced = this.liveConnections.get(serverId);
       if (raced) {
@@ -2685,44 +2782,51 @@ export class SandboxAgent {
     envelope: AnyMessage,
     direction: AcpEnvelopeDirection,
     localSessionId: string | null,
-    eventId: string | undefined,
+    context: ObservedEnvelopeContext,
   ): Promise<void> {
     if (!localSessionId) {
       return;
     }
 
     // Every client of a server receives its event stream, so an event from the
-    // stream gets an id derived from the server and the stream's event id. A
-    // driver keeps the first record per id, so several clients sharing one
-    // persistence driver (or a replay after reconnecting) store it once.
-    const stableId = eventId === undefined ? undefined : `${connection.serverId}:${eventId}`;
-    let event: SessionEvent | null = null;
-    for (let attempt = 0; attempt < MAX_EVENT_INDEX_INSERT_RETRIES; attempt += 1) {
-      event = {
-        id: stableId ?? randomId(),
-        eventIndex: await this.allocateSessionEventIndex(localSessionId),
-        sessionId: localSessionId,
-        createdAt: nowMs(),
-        connectionId: connection.connectionId,
-        sender: direction === "outbound" ? "client" : "agent",
-        payload: cloneEnvelope(envelope),
-      };
+    // stream gets an id derived from the server instance and the stream's event
+    // id. A driver keeps the first record per id, so a replay after
+    // reconnecting, or an event two clients store, is kept once.
+    const generation = connection.generation === undefined ? "" : `@${connection.generation}`;
+    const stableId = context.eventId === undefined ? undefined : `${connection.serverId}${generation}:${context.eventId}`;
+    const buildEvent = (eventIndex: number): SessionEvent => ({
+      id: stableId ?? randomId(),
+      eventIndex,
+      sessionId: localSessionId,
+      createdAt: nowMs(),
+      connectionId: connection.connectionId,
+      sender: direction === "outbound" ? "client" : "agent",
+      payload: cloneEnvelope(envelope),
+    });
 
-      try {
-        await this.persist.insertEvent(localSessionId, event);
-        break;
-      } catch (error) {
-        if (!isSessionEventIndexConflict(error) || attempt === MAX_EVENT_INDEX_INSERT_RETRIES - 1) {
-          throw error;
+    let event: SessionEvent;
+    if (!context.store) {
+      // Another client's turn: that client stores it. Deliver with a local index.
+      event = buildEvent(await this.allocateSessionEventIndex(localSessionId, false));
+    } else {
+      let stored: SessionEvent | null = null;
+      for (let attempt = 0; attempt < MAX_EVENT_INDEX_INSERT_RETRIES; attempt += 1) {
+        stored = buildEvent(await this.allocateSessionEventIndex(localSessionId, context.reseedIndex || attempt > 0));
+        try {
+          await this.persist.insertEvent(localSessionId, stored);
+          break;
+        } catch (error) {
+          if (!isSessionEventIndexConflict(error) || attempt === MAX_EVENT_INDEX_INSERT_RETRIES - 1) {
+            throw error;
+          }
         }
       }
+      if (!stored) {
+        return;
+      }
+      event = stored;
+      await this.persistSessionStateFromEvent(localSessionId, envelope, direction);
     }
-
-    if (!event) {
-      return;
-    }
-
-    await this.persistSessionStateFromEvent(localSessionId, envelope, direction);
 
     const listeners = this.eventListeners.get(localSessionId);
     if (!listeners || listeners.size === 0) {
@@ -2739,7 +2843,7 @@ export class SandboxAgent {
     envelope: AnyMessage,
     direction: AcpEnvelopeDirection,
     localSessionId: string | null,
-    eventId: string | undefined,
+    context: ObservedEnvelopeContext,
   ): Promise<void> {
     if (!localSessionId) {
       return;
@@ -2750,7 +2854,7 @@ export class SandboxAgent {
       .catch(() => {
         // Keep later envelope persistence moving even if an earlier write failed.
       })
-      .then(() => this.persistObservedEnvelope(connection, envelope, direction, localSessionId, eventId));
+      .then(() => this.persistObservedEnvelope(connection, envelope, direction, localSessionId, context));
 
     this.pendingObservedEnvelopePersistenceBySession.set(localSessionId, current);
 
@@ -2845,7 +2949,18 @@ export class SandboxAgent {
     }
   }
 
-  private async allocateSessionEventIndex(sessionId: string): Promise<number> {
+  /**
+   * `reseed` reads the highest stored index again and continues after it (or
+   * after the local counter, whichever is higher), so writes that other
+   * clients sharing the driver made in the meantime are not overtaken.
+   */
+  private async allocateSessionEventIndex(sessionId: string, reseed: boolean): Promise<number> {
+    if (reseed) {
+      const maxPersistedIndex = await this.findMaxPersistedSessionEventIndex(sessionId);
+      const next = Math.max(this.nextSessionEventIndexBySession.get(sessionId) ?? 1, maxPersistedIndex + 1);
+      this.nextSessionEventIndexBySession.set(sessionId, next + 1);
+      return next;
+    }
     await this.ensureSessionEventIndexSeeded(sessionId);
     const nextIndex = this.nextSessionEventIndexBySession.get(sessionId) ?? 1;
     this.nextSessionEventIndexBySession.set(sessionId, nextIndex + 1);
@@ -2953,7 +3068,13 @@ export class SandboxAgent {
     if (!listeners || listeners.size === 0) {
       // Only the client whose prompt the request belongs to cancels it when
       // nobody handles it. Other clients attached to the session never reply.
-      return context.controlling ? cancelledPermissionResponse() : unansweredPermissionResponse();
+      if (context.controlling) {
+        return cancelledPermissionResponse();
+      }
+      if (this.cancelUnansweredPermissionsAfterMs !== undefined) {
+        return this.cancelPermissionLater(connection, localSessionId, context.rpcId, this.cancelUnansweredPermissionsAfterMs);
+      }
+      return unansweredPermissionResponse();
     }
 
     const pendingId = randomId();
@@ -3005,7 +3126,35 @@ export class SandboxAgent {
    * The request was answered (by any client) or the turn ended: forget it
    * without replying, so a late local reply is not sent as a second answer.
    */
+  /** Opt-in: cancel another client's request unless it is answered in time. */
+  private cancelPermissionLater(
+    connection: LiveAcpConnection,
+    sessionId: string,
+    rpcId: string | number | undefined,
+    delayMs: number,
+  ): Promise<RequestPermissionResponse> {
+    return new Promise<RequestPermissionResponse>((resolve) => {
+      const timer: PassivePermissionTimer = {
+        connection,
+        sessionId,
+        rpcId,
+        handle: setTimeout(() => {
+          this.passivePermissionTimers.delete(timer);
+          resolve(cancelledPermissionResponse());
+        }, delayMs),
+      };
+      this.passivePermissionTimers.add(timer);
+    });
+  }
+
   private dropResolvedPermissionRequests(connection: LiveAcpConnection, sessionId: string, rpcId: string | number): void {
+    for (const timer of this.passivePermissionTimers) {
+      if (timer.connection === connection && timer.sessionId === sessionId && timer.rpcId !== undefined && String(timer.rpcId) === String(rpcId)) {
+        // Answered elsewhere: never reply (the promise is left unsettled).
+        clearTimeout(timer.handle);
+        this.passivePermissionTimers.delete(timer);
+      }
+    }
     for (const [permissionId, pending] of this.pendingPermissionRequests) {
       if (pending.connection === connection && pending.sessionId === sessionId && pending.rpcId !== undefined && String(pending.rpcId) === String(rpcId)) {
         this.pendingPermissionRequests.delete(permissionId);
@@ -3213,6 +3362,13 @@ function isSessionEventIndexConflict(error: unknown): boolean {
 
   return /UNIQUE constraint failed: .*session_id, .*event_index/.test(error.message);
 }
+
+type PassivePermissionTimer = {
+  connection: LiveAcpConnection;
+  sessionId: string;
+  rpcId?: string | number;
+  handle: ReturnType<typeof setTimeout>;
+};
 
 type PendingPermissionRequestState = {
   id: string;
@@ -3860,6 +4016,15 @@ function permissionReplyToResponse(permissionId: string, request: RequestPermiss
  */
 function unansweredPermissionResponse(): Promise<RequestPermissionResponse> {
   return new Promise<RequestPermissionResponse>(() => {});
+}
+
+/** The server rejected a request because the server does not exist (any more). */
+function isMissingServerRejection(error: unknown): boolean {
+  if (!(error instanceof AcpRpcError) || error.code !== ACP_HTTP_TRANSPORT_ERROR_CODE) {
+    return false;
+  }
+  const status = (error.data as { status?: unknown } | undefined)?.status;
+  return status === 400 || status === 404;
 }
 
 function permissionKey(agentSessionId: string, toolCallId: unknown): string {

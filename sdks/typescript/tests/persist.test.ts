@@ -26,4 +26,16 @@ describe("InMemorySessionPersistDriver", () => {
       ["server-1:8", 3, "observer"],
     ]);
   });
+
+  it("does not store an event again after it was trimmed by the event cap", async () => {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 2 });
+    await persist.insertEvent("s1", event("a", 1, "author"));
+    await persist.insertEvent("s1", event("b", 2, "author"));
+    await persist.insertEvent("s1", event("c", 3, "author"));
+    // A replayed copy of the trimmed event arrives late.
+    await persist.insertEvent("s1", event("a", 4, "observer"));
+
+    const { items } = await persist.listEvents({ sessionId: "s1" });
+    expect(items.map((item) => item.id)).toEqual(["b", "c"]);
+  });
 });
