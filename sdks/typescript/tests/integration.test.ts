@@ -1315,6 +1315,49 @@ describe("Integration: TypeScript SDK flat session API", () => {
     }
   });
 
+  async function expectLiveSlowAuthorOrder(writeDelayMs: number): Promise<void> {
+    const shared = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    // Both clients stay alive; only the author's writes are slow.
+    const author = await SandboxAgent.connect({ baseUrl, token, persist: new DelayedWritePersistDriver(shared, writeDelayMs) });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist: shared });
+    try {
+      const session = await author.createSession({ agent: "mock" });
+      const watched = await observer.resumeSession(session.id);
+      const words = ["warm", "one", "two", "three", "four"];
+      for (const word of words) {
+        await promptAndWaitForObserver(session, watched, `PROMPT:${word}`);
+      }
+      // Longer than the observer's stall detection (2 s), so a late write by it would show.
+      await sleep(3_000);
+
+      const stored = (await shared.listEvents({ sessionId: session.id, limit: 1000 })).items;
+      const marked = stored.flatMap((event) => {
+        const payload = event.payload as any;
+        const promptText = payload?.method === "session/prompt" ? payload.params?.prompt?.[0]?.text : undefined;
+        const chunkText = payload?.params?.update?.content?.text;
+        const prompt = event.sender === "client" && typeof promptText === "string" ? /^PROMPT:(\w+)$/.exec(promptText) : null;
+        const chunk = event.sender === "agent" && typeof chunkText === "string" ? /^mock: PROMPT:(\w+)$/.exec(chunkText) : null;
+        return prompt ? [{ token: `P:${prompt[1]}`, event }] : chunk ? [{ token: `C:${chunk[1]}`, event }] : [];
+      });
+      expect(marked.map((entry) => entry.token)).toEqual(words.flatMap((word) => [`P:${word}`, `C:${word}`]));
+      // Strictly increasing indexes: the order does not depend on how ties are broken.
+      for (let index = 1; index < marked.length; index += 1) {
+        expect(marked[index]!.event.eventIndex).toBeGreaterThan(marked[index - 1]!.event.eventIndex);
+      }
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  }
+
+  it("keeps shared history in order with a live observer and a live author whose writes take 150 ms", async () => {
+    await expectLiveSlowAuthorOrder(150);
+  }, 60_000);
+
+  it("keeps shared history in order with a live observer and a live author whose writes take 60 ms", async () => {
+    await expectLiveSlowAuthorOrder(60);
+  }, 60_000);
+
   it("keeps shared history and replay in true order with an attached observer and a slow author", async () => {
     const shared = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
     // The author's writes land late, so the observer sees each event first.
@@ -1391,7 +1434,8 @@ describe("Integration: TypeScript SDK flat session API", () => {
       await watched.respondPermission(permissionId!, "once");
       await waitFor(() => (ended ? true : undefined));
       await pending;
-      await sleep(500);
+      // Longer than the observer's stall detection (2 s), so a late write by it would show.
+      await sleep(3_000);
 
       const events = (await shared.listEvents({ sessionId: session.id, limit: 1000 })).items;
       expect(new Set(events.map((event) => event.id)).size).toBe(events.length);
@@ -1406,6 +1450,38 @@ describe("Integration: TypeScript SDK flat session API", () => {
       expect(promptIndex).toBeLessThan(chunkIndex);
       expect(chunkIndex).toBeLessThan(requestIndex);
       expect(requestIndex).toBeLessThan(approvedIndex);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("an observer stores the turn of an owner that disposed mid-turn without storing it", async () => {
+    const shared = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
+    const authorPersist = new KillablePersistDriver(shared);
+    const author = await SandboxAgent.connect({ baseUrl, token, persist: authorPersist });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist: shared });
+    try {
+      const session = await author.createSession({ agent: "mock" });
+      const watched = await observer.resumeSession(session.id);
+      await promptAndWaitForObserver(session, watched, "connect observer");
+
+      let seen = false;
+      watched.onEvent((event) => {
+        if ((event.payload as any)?.params?.update?.content?.text === "mock: delay:5000") {
+          seen = true;
+        }
+      });
+      // The author stores nothing of this turn and then disposes, which deletes its server.
+      authorPersist.dead = true;
+      void session.prompt([{ type: "text", text: "delay:5000" }]).catch(() => undefined);
+      await waitFor(() => (seen ? true : undefined));
+      await withTimeout(author.dispose(), "author dispose");
+      await sleep(3_000);
+
+      const events = (await shared.listEvents({ sessionId: session.id, limit: 1000 })).items;
+      const chunks = events.filter((event) => (event.payload as any)?.params?.update?.content?.text === "mock: delay:5000");
+      expect(chunks).toHaveLength(1);
     } finally {
       await observer.dispose();
       await author.dispose();
@@ -1439,7 +1515,8 @@ describe("Integration: TypeScript SDK flat session API", () => {
       await sleep(100);
       await session.respondPermission(permissionId!, "once");
       await withTimeout(pending, "prompt");
-      await sleep(500);
+      // Longer than the observer's stall detection (2 s), so a late write by it would show.
+      await sleep(3_000);
 
       const events = (await shared.listEvents({ sessionId: session.id, limit: 1000 })).items;
       expect(new Set(events.map((event) => event.id)).size).toBe(events.length);

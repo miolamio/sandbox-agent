@@ -656,8 +656,13 @@ export class LiveAcpConnection {
   // Buffer key of the current run of foreign turns, per local session.
   private readonly foreignTurnKeyByLocalSessionId = new Map<string, number>();
   private nextForeignTurnKey = 1;
-  /** Called when the foreign turns of a session are over (or lost to a stream gap). */
-  onForeignTurnFinished?: (connection: LiveAcpConnection, localSessionId: string, foreignTurn: number) => void;
+  /**
+   * Called when the foreign turns of a session are over (or can no longer be
+   * followed: stream gap, stream stopped, connection closed). `responseEventId`
+   * is the stored id the prompt response gets when the prompting client
+   * received it over the event stream (the event just before `turn_ended`).
+   */
+  onForeignTurnFinished?: (connection: LiveAcpConnection, localSessionId: string, foreignTurn: number, responseEventId: string | undefined) => void;
   // JSON-RPC ids of permission requests seen on the event stream and not yet
   // handed to the handler, keyed by agent session id and tool call id.
   private readonly permissionRpcIds = new Map<string, string | number>();
@@ -745,6 +750,9 @@ export class LiveAcpConnection {
         }
         live.handleEnvelope(envelope, direction, meta);
       },
+      onEventStreamStopped: () => {
+        live?.finishAllTurns();
+      },
     });
 
     let initResult: Awaited<ReturnType<AcpHttpClient["initialize"]>>;
@@ -789,6 +797,7 @@ export class LiveAcpConnection {
    * connection created it; `deleteServer` overrides that.
    */
   async close(options: { deleteServer?: boolean } = {}): Promise<void> {
+    this.finishAllTurns();
     await this.acp.disconnect({ deleteServer: options.deleteServer ?? this.ownsServer });
   }
 
@@ -946,7 +955,7 @@ export class LiveAcpConnection {
         // listeners instead of persisting them as session events.
         const localSessionId = this.localByAgentSessionId.get(turn.params.sessionId);
         if (localSessionId) {
-          this.trackTurn(localSessionId, turn);
+          this.trackTurn(localSessionId, turn, meta);
           this.onTurnEvent(this, localSessionId, turn);
         }
         return;
@@ -972,7 +981,7 @@ export class LiveAcpConnection {
    * wire id prefix (also when the prompt's HTTP request failed after the
    * server accepted it), otherwise another client's.
    */
-  private trackTurn(localSessionId: string, turn: SandboxAgentTurnNotification): void {
+  private trackTurn(localSessionId: string, turn: SandboxAgentTurnNotification, meta: AcpEnvelopeMeta | undefined): void {
     const requestId = String(turn.params.requestId);
     if (turn.method === SANDBOX_AGENT_TURN_STARTED) {
       const own = this.acp.isOwnWireRequestId(turn.params.requestId);
@@ -993,18 +1002,29 @@ export class LiveAcpConnection {
       }
       const foreign = this.foreignTurnsByLocalSessionId.get(localSessionId);
       if (foreign?.delete(requestId) && foreign.size === 0) {
-        this.finishForeignTurns(localSessionId);
+        // The server publishes the prompt response right before turn_ended.
+        const sequence = meta?.eventId !== undefined && /^\d+$/.test(meta.eventId) ? BigInt(meta.eventId) : undefined;
+        const responseEventId =
+          sequence !== undefined && sequence > 0n && meta?.serverGeneration !== undefined
+            ? `${this.serverId}@${meta.serverGeneration}:${sequence - 1n}`
+            : undefined;
+        this.finishForeignTurns(localSessionId, responseEventId);
       }
     }
   }
 
-  private finishForeignTurns(localSessionId: string): void {
+  private finishForeignTurns(localSessionId: string, responseEventId?: string): void {
     this.foreignTurnsByLocalSessionId.delete(localSessionId);
     const key = this.foreignTurnKeyByLocalSessionId.get(localSessionId);
     this.foreignTurnKeyByLocalSessionId.delete(localSessionId);
     if (key !== undefined) {
-      this.onForeignTurnFinished?.(this, localSessionId, key);
+      this.onForeignTurnFinished?.(this, localSessionId, key, responseEventId);
     }
+  }
+
+  /** Stops following the turns in progress (the connection closes or its stream stopped). */
+  finishAllTurns(): void {
+    this.resetTurns();
   }
 
   private resetTurns(): void {
@@ -1284,7 +1304,10 @@ export class SandboxAgent {
   // Events of other clients' turns, stored after the turn ended (see
   // ObservedEnvelopeContext.store). Keyed by session, connection and turn key.
   private readonly foreignTurnBuffers = new Map<string, SessionEvent[]>();
-  private readonly foreignTurnFlushTimers = new Set<ReturnType<typeof setTimeout>>();
+  // Buffers that hit MAX_FOREIGN_TURN_BUFFER_EVENTS: the rest of that turn is not kept.
+  private readonly overflowedForeignTurns = new Set<string>();
+  // Pending checks of finished foreign turns, by buffer key.
+  private readonly foreignTurnChecks = new Map<string, { sessionId: string; timer: ReturnType<typeof setTimeout> }>();
 
   private healthPromise?: Promise<void>;
   private healthError?: Error;
@@ -1429,11 +1452,12 @@ export class SandboxAgent {
       clearTimeout(timer.handle);
     }
     this.passivePermissionTimers.clear();
-    for (const timer of this.foreignTurnFlushTimers) {
-      clearTimeout(timer);
+    for (const check of this.foreignTurnChecks.values()) {
+      clearTimeout(check.timer);
     }
-    this.foreignTurnFlushTimers.clear();
+    this.foreignTurnChecks.clear();
     this.foreignTurnBuffers.clear();
+    this.overflowedForeignTurns.clear();
 
     const connections = [...this.liveConnections.values()];
     this.liveConnections.clear();
@@ -1776,6 +1800,7 @@ export class SandboxAgent {
   async destroySession(id: string): Promise<Session> {
     this.cancelPendingPermissionsForSession(id);
     this.clearPassivePermissionTimers((timer) => timer.sessionId === id);
+    this.dropForeignTurnsOfSession(id);
 
     try {
       await this.sendSessionMethodInternal(id, SESSION_CANCEL_METHOD, {}, {}, true);
@@ -2055,6 +2080,7 @@ export class SandboxAgent {
 
   private async discardLiveConnection(live: LiveAcpConnection): Promise<void> {
     this.clearPassivePermissionTimers((timer) => timer.connection === live);
+    live.finishAllTurns();
     if (this.liveConnections.get(live.serverId) === live) {
       this.liveConnections.delete(live.serverId);
     }
@@ -2472,6 +2498,7 @@ export class SandboxAgent {
       this.liveConnections.delete(serverId);
       this.cancelPendingPermissionsForConnection(live);
       this.clearPassivePermissionTimers((timer) => timer.connection === live);
+      live.finishAllTurns();
       await live.close({ deleteServer: false }).catch(() => {});
     }
   }
@@ -2810,7 +2837,8 @@ export class SandboxAgent {
         },
       });
 
-      created.onForeignTurnFinished = (connection, localSessionId, foreignTurn) => this.scheduleForeignTurnFlush(connection, localSessionId, foreignTurn);
+      created.onForeignTurnFinished = (connection, localSessionId, foreignTurn, responseEventId) =>
+        this.scheduleForeignTurnCheck(foreignTurnBufferKey(localSessionId, connection, foreignTurn), localSessionId, responseEventId);
 
       const raced = this.liveConnections.get(serverId);
       if (raced) {
@@ -2876,12 +2904,22 @@ export class SandboxAgent {
       // Another client's turn: that client stores it. Deliver with a local index
       // and keep it to store after the turn, in case that client died. Only ids
       // every client derives the same way are kept, so no event is stored twice.
-      event = buildEvent(await this.allocateSessionEventIndex(localSessionId, false));
+      event = buildEvent(await this.peekSessionEventIndex(localSessionId));
       if (sharedId && context.foreignTurn !== undefined) {
         const key = foreignTurnBufferKey(localSessionId, connection, context.foreignTurn);
-        const buffered = this.foreignTurnBuffers.get(key) ?? [];
-        buffered.push(event);
-        this.foreignTurnBuffers.set(key, buffered);
+        if (!this.overflowedForeignTurns.has(key)) {
+          const buffered = this.foreignTurnBuffers.get(key) ?? [];
+          if (buffered.length >= MAX_FOREIGN_TURN_BUFFER_EVENTS) {
+            this.foreignTurnBuffers.delete(key);
+            this.overflowedForeignTurns.add(key);
+            console.warn(
+              `sandbox-agent: another client's turn in session '${localSessionId}' exceeded ${MAX_FOREIGN_TURN_BUFFER_EVENTS} events; this client will not store it if that client dies`,
+            );
+          } else {
+            buffered.push(event);
+            this.foreignTurnBuffers.set(key, buffered);
+          }
+        }
       }
     } else {
       let stored: SessionEvent | null = null;
@@ -2931,46 +2969,92 @@ export class SandboxAgent {
   }
 
   /**
-   * After another client's turn ended, store the events of that turn the
-   * prompting client did not store (it may have died). The grace period lets
-   * a live prompting client finish its own writes first, so the stored order
-   * stays the order it saw.
+   * After another client's turn ended (or could no longer be followed), decide
+   * whether the prompting client stored it. A live prompting client stores
+   * every event of its turn, in order, ending with the prompt response, so this
+   * client never writes while it sees that client make progress:
+   * - done, nothing to write: the prompt response (`responseEventId`) or all
+   *   buffered events of the turn are stored;
+   * - keep waiting: the store changed since the last check (someone is
+   *   writing);
+   * - prompting client gone: nothing changed for FOREIGN_TURN_STALL_MS; then
+   *   the missing events are stored after the highest stored index.
    */
-  private scheduleForeignTurnFlush(connection: LiveAcpConnection, localSessionId: string, foreignTurn: number): void {
-    const key = foreignTurnBufferKey(localSessionId, connection, foreignTurn);
-    const timer = setTimeout(() => {
-      this.foreignTurnFlushTimers.delete(timer);
-      const previous = this.pendingObservedEnvelopePersistenceBySession.get(localSessionId) ?? Promise.resolve();
-      const current = previous
-        .catch(() => {})
-        .then(async () => {
-          const events = this.foreignTurnBuffers.get(key) ?? [];
-          this.foreignTurnBuffers.delete(key);
-          await this.storeMissingEvents(localSessionId, events);
-        });
-      this.pendingObservedEnvelopePersistenceBySession.set(localSessionId, current);
-      void current
-        .catch((error) => {
-          console.error("Failed to persist observed sandbox-agent turn", error);
-        })
-        .finally(() => {
-          if (this.pendingObservedEnvelopePersistenceBySession.get(localSessionId) === current) {
-            this.pendingObservedEnvelopePersistenceBySession.delete(localSessionId);
+  private scheduleForeignTurnCheck(key: string, sessionId: string, responseEventId: string | undefined): void {
+    if (this.disposed || this.foreignTurnChecks.has(key)) {
+      return;
+    }
+    let lastState: string | undefined;
+    let unchangedSince = Date.now();
+    const schedule = (delayMs: number) => {
+      const timer = setTimeout(() => {
+        void this.runInSessionQueue(sessionId, async () => {
+          if (this.foreignTurnChecks.get(key)?.timer !== timer) {
+            return;
           }
+          this.foreignTurnChecks.delete(key);
+          const events = this.foreignTurnBuffers.get(key);
+          if (!events) {
+            this.overflowedForeignTurns.delete(key);
+            return;
+          }
+          const scan = await this.scanPersistedSessionEvents(sessionId);
+          if ((responseEventId !== undefined && scan.ids.has(responseEventId)) || events.every((event) => scan.ids.has(event.id))) {
+            this.foreignTurnBuffers.delete(key);
+            return;
+          }
+          const state = `${scan.ids.size}:${scan.maxIndex}`;
+          if (state !== lastState) {
+            lastState = state;
+            unchangedSince = Date.now();
+          } else if (Date.now() - unchangedSince >= FOREIGN_TURN_STALL_MS) {
+            this.foreignTurnBuffers.delete(key);
+            await this.storeMissingEvents(sessionId, events, scan);
+            return;
+          }
+          schedule(FOREIGN_TURN_CHECK_INTERVAL_MS);
+        }).catch((error) => {
+          console.error("Failed to persist observed sandbox-agent turn", error);
         });
-    }, FOREIGN_TURN_FLUSH_GRACE_MS);
-    this.foreignTurnFlushTimers.add(timer);
+      }, delayMs);
+      this.foreignTurnChecks.set(key, { sessionId, timer });
+    };
+    schedule(FOREIGN_TURN_CHECK_INTERVAL_MS);
+  }
+
+  private dropForeignTurnsOfSession(sessionId: string): void {
+    for (const [key, check] of this.foreignTurnChecks) {
+      if (check.sessionId === sessionId) {
+        clearTimeout(check.timer);
+        this.foreignTurnChecks.delete(key);
+      }
+    }
+    const prefix = `${sessionId}\u0000`;
+    for (const key of [...this.foreignTurnBuffers.keys(), ...this.overflowedForeignTurns]) {
+      if (key.startsWith(prefix)) {
+        this.foreignTurnBuffers.delete(key);
+        this.overflowedForeignTurns.delete(key);
+      }
+    }
+  }
+
+  /** Runs `task` after the session's queued persistence work, keeping later work behind it. */
+  private runInSessionQueue(sessionId: string, task: () => Promise<void>): Promise<void> {
+    const previous = this.pendingObservedEnvelopePersistenceBySession.get(sessionId) ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(task);
+    this.pendingObservedEnvelopePersistenceBySession.set(sessionId, current);
+    return current.finally(() => {
+      if (this.pendingObservedEnvelopePersistenceBySession.get(sessionId) === current) {
+        this.pendingObservedEnvelopePersistenceBySession.delete(sessionId);
+      }
+    });
   }
 
   /** Stores, in order and after the highest stored index, the events not stored yet. */
-  private async storeMissingEvents(sessionId: string, events: SessionEvent[]): Promise<void> {
-    if (events.length === 0) {
-      return;
-    }
-    const { maxIndex, ids } = await this.scanPersistedSessionEvents(sessionId);
-    let next = Math.max(this.nextSessionEventIndexBySession.get(sessionId) ?? 1, maxIndex + 1);
+  private async storeMissingEvents(sessionId: string, events: SessionEvent[], scan: { maxIndex: number; ids: Set<string> }): Promise<void> {
+    let next = scan.maxIndex + 1;
     for (const event of events) {
-      if (ids.has(event.id)) {
+      if (scan.ids.has(event.id)) {
         continue;
       }
       for (let attempt = 0; attempt < MAX_EVENT_INDEX_INSERT_RETRIES; attempt += 1) {
@@ -3106,6 +3190,16 @@ export class SandboxAgent {
    * after the local counter, whichever is higher), so writes that other
    * clients sharing the driver made in the meantime are not overtaken.
    */
+  /**
+   * Index for an event this client delivers but does not store: the next
+   * index it would use, without taking it, so delivering other clients'
+   * events does not push this client's own writes further out.
+   */
+  private async peekSessionEventIndex(sessionId: string): Promise<number> {
+    await this.ensureSessionEventIndexSeeded(sessionId);
+    return this.nextSessionEventIndexBySession.get(sessionId) ?? 1;
+  }
+
   private async allocateSessionEventIndex(sessionId: string, reseed: boolean): Promise<number> {
     if (reseed) {
       const maxPersistedIndex = await this.findMaxPersistedSessionEventIndex(sessionId);
@@ -4208,9 +4302,13 @@ function unansweredPermissionResponse(): Promise<RequestPermissionResponse> {
   return new Promise<RequestPermissionResponse>(() => {});
 }
 
-// How long after another client's turn ended its events are stored by this
-// client (only those still missing), see scheduleForeignTurnFlush.
-const FOREIGN_TURN_FLUSH_GRACE_MS = 100;
+// Checks of another client's finished turn (see scheduleForeignTurnCheck): how
+// often the store is checked, and how long it must stay unchanged, with the
+// turn still incomplete, before the prompting client is taken to be gone.
+const FOREIGN_TURN_CHECK_INTERVAL_MS = 250;
+const FOREIGN_TURN_STALL_MS = 2_000;
+// Events of another client's turn kept for that check, per turn.
+const MAX_FOREIGN_TURN_BUFFER_EVENTS = 1_000;
 
 function foreignTurnBufferKey(localSessionId: string, connection: LiveAcpConnection, foreignTurn: number): string {
   return `${localSessionId}\u0000${connection.connectionId}\u0000${foreignTurn}`;

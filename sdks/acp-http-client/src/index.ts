@@ -193,6 +193,11 @@ export interface AcpHttpClientOptions {
   headers?: HeadersInit;
   client?: Partial<Client>;
   onEnvelope?: AcpEnvelopeObserver;
+  /**
+   * Called when the event stream stops for good (for example the server was
+   * deleted), so state that waits for further events can be finished.
+   */
+  onEventStreamStopped?: () => void;
   transport?: AcpHttpTransportOptions;
 }
 
@@ -278,6 +283,7 @@ export class AcpHttpClient {
       token: options.token,
       defaultHeaders: options.headers,
       onEnvelope: options.onEnvelope,
+      onEventStreamStopped: options.onEventStreamStopped,
       transport: options.transport,
     });
 
@@ -386,6 +392,11 @@ type StreamableHttpAcpTransportOptions = {
   token?: string;
   defaultHeaders?: HeadersInit;
   onEnvelope?: AcpEnvelopeObserver;
+  /**
+   * Called when the event stream stops for good (for example the server was
+   * deleted), so state that waits for further events can be finished.
+   */
+  onEventStreamStopped?: () => void;
   transport?: AcpHttpTransportOptions;
 };
 
@@ -398,6 +409,7 @@ class StreamableHttpAcpTransport {
   private readonly token?: string;
   private readonly defaultHeaders?: HeadersInit;
   private readonly onEnvelope?: AcpEnvelopeObserver;
+  private readonly onEventStreamStopped?: () => void;
   private readonly bootstrapQuery: URLSearchParams | null;
 
   private readableController: ReadableStreamDefaultController<AnyMessage> | null = null;
@@ -444,6 +456,7 @@ class StreamableHttpAcpTransport {
     this.token = options.token;
     this.defaultHeaders = options.defaultHeaders;
     this.onEnvelope = options.onEnvelope;
+    this.onEventStreamStopped = options.onEventStreamStopped;
     this.bootstrapQuery = options.transport?.bootstrapQuery ? buildQueryParams(options.transport.bootstrapQuery) : null;
     if (options.transport?.skipBufferedEvents) {
       // Last-Event-ID asks for events after the given id. The largest id the
@@ -705,7 +718,14 @@ class StreamableHttpAcpTransport {
           throw new Error("SSE stream is not readable in this environment.");
         }
 
-        this.serverGeneration = response.headers.get(SERVER_GENERATION_HEADER) ?? undefined;
+        const generation = response.headers.get(SERVER_GENERATION_HEADER) ?? undefined;
+        if (generation !== this.serverGeneration) {
+          // A different server instance (or the first connect): its event ids
+          // start over, so earlier ids say nothing about gaps.
+          this.lastReceivedSequence = undefined;
+          this.pendingStreamGap = false;
+        }
+        this.serverGeneration = generation;
         this.sseConnected = true;
         this.sseEverConnected = true;
         this.sseFailures = 0;
@@ -735,6 +755,7 @@ class StreamableHttpAcpTransport {
         this.notifySseStateChange();
         if (isTerminalSseError(error, this.sseEverConnected) || this.sseFailures >= SSE_MAX_CONSECUTIVE_FAILURES) {
           this.failAsyncPending(error);
+          this.onEventStreamStopped?.();
           return;
         }
         await delay(Math.min(SSE_RECONNECT_BASE_MS * 2 ** (this.sseFailures - 1), SSE_RECONNECT_MAX_MS));
