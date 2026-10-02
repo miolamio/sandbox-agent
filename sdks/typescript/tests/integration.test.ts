@@ -757,6 +757,54 @@ describe("Integration: TypeScript SDK flat session API", () => {
     }
   });
 
+  it("treats a 4xx without a sandbox-agent problem body as possibly delivered", async () => {
+    // A proxy in front of the server can answer 408/429/499 after it already
+    // forwarded the request, so such a 4xx must not lead to a silent resend.
+    const defaultFetch = globalThis.fetch;
+    // Set to the deleted server's id: the proxy rejects POSTs to it.
+    let proxyRejectsServer: string | null = null;
+    const proxyFetch: typeof fetch = async (input, init) => {
+      const outgoing = new Request(input, init);
+      const parsed = new URL(outgoing.url);
+      const forwarded = await forwardRequest(defaultFetch, baseUrl, outgoing, parsed);
+      if (proxyRejectsServer && outgoing.method === "POST" && parsed.pathname === `/v1/acp/${encodeURIComponent(proxyRejectsServer)}`) {
+        await forwarded.text().catch(() => {});
+        // A generic problem body, as many gateways send: a status, but not a
+        // Sandbox Agent problem type.
+        return new Response(JSON.stringify({ type: "about:blank", title: "Too Many Requests", status: 429 }), {
+          status: 429,
+          headers: { "Content-Type": "application/problem+json" },
+        });
+      }
+      return forwarded;
+    };
+
+    const sdk = await SandboxAgent.connect({ token, fetch: proxyFetch });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      await session.prompt([{ type: "text", text: "before delete" }]);
+      const serverId = (await sdk.getSession(session.id))?.serverId;
+      await deleteAcpServer(baseUrl, token, serverId!);
+
+      proxyRejectsServer = serverId ?? null;
+      const failed = await withTimeout(
+        session.prompt([{ type: "text", text: "rejected by proxy" }]).then(
+          () => null,
+          (error: unknown) => error,
+        ),
+        "prompt rejected by proxy",
+      );
+      proxyRejectsServer = null;
+
+      expect(failed).toBeInstanceOf(SessionRequestInterruptedError);
+      expect(await clientPromptsWithText(sdk, session.id, "rejected by proxy")).toHaveLength(1);
+      const next = await withTimeout(session.prompt([{ type: "text", text: "resent by caller" }]), "prompt after proxy rejection");
+      expect(next.stopReason).toBe("end_turn");
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
   it("reports an interrupted prompt and restores the session when its agent server is deleted mid-turn", async () => {
     const sdk = await SandboxAgent.connect({ baseUrl, token });
     // Another client with its own agent server must not be affected.

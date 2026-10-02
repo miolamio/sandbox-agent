@@ -3275,18 +3275,26 @@ function normalizeSessionInit(
 // acp-http-client reports HTTP-level request failures with this JSON-RPC code.
 const ACP_HTTP_TRANSPORT_ERROR_CODE = -32003;
 
+// Problem types Sandbox Agent returns for POST /v1/acp/{server_id} before it
+// forwards anything to the agent process: an unknown (deleted or exited) server
+// without `?agent=`, or an invalid request.
+const UNDELIVERED_POST_PROBLEM_TYPES = new Set(["urn:sandbox-agent:error:invalid_request", "urn:sandbox-agent:error:session_not_found"]);
+
 /**
- * The POST carrying the request was rejected with a 4xx status. The server
- * answers 4xx only before forwarding anything to the agent process (unknown
- * server, invalid request), so the agent never saw the request. 5xx (agent
- * exited, timeout, write failure) may come after the agent received it.
+ * The POST carrying the request was rejected by Sandbox Agent itself with a 4xx
+ * problem it only returns before forwarding anything to the agent process, so
+ * the agent never saw the request. Any other failure may come after the agent
+ * received it: 5xx (agent exited, timeout, write failure), and 4xx without a
+ * Sandbox Agent problem body, which a proxy in front of the server (408, 429,
+ * 499) can return after it already forwarded the request.
  */
 function isRejectedBeforeDelivery(error: unknown): boolean {
   if (!(error instanceof AcpRpcError) || error.code !== ACP_HTTP_TRANSPORT_ERROR_CODE) {
     return false;
   }
-  const status = (error.data as { status?: unknown } | null | undefined)?.status;
-  return typeof status === "number" && status >= 400 && status < 500;
+  const problem = error.data as { status?: unknown; type?: unknown } | null | undefined;
+  const status = problem?.status;
+  return typeof status === "number" && status >= 400 && status < 500 && typeof problem?.type === "string" && UNDELIVERED_POST_PROBLEM_TYPES.has(problem.type);
 }
 
 function nonEmptyString(value: unknown): string | undefined {
