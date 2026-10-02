@@ -1717,6 +1717,12 @@ fn build_cors_layer(server: &ServerArgs) -> Result<CorsLayer, CliError> {
         cors = cors.allow_credentials(true);
     }
 
+    // Browser clients read the server generation from the event stream
+    // response to build stable event ids.
+    cors = cors.expose_headers([axum::http::HeaderName::from_static(
+        "x-sandboxagent-server-generation",
+    )]);
+
     Ok(cors)
 }
 
@@ -1870,6 +1876,44 @@ fn write_stderr_line(text: &str) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cors_exposes_server_generation_header() {
+        use clap::Parser;
+        use tower::ServiceExt;
+
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            server: ServerArgs,
+        }
+
+        let args = Wrapper::try_parse_from(["test", "--cors-allow-origin", "http://example.test"])
+            .expect("args");
+        let router = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(build_cors_layer(&args.server).expect("cors layer"));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header("origin", "http://example.test")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let exposed = response
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            exposed.contains("x-sandboxagent-server-generation"),
+            "exposed: {exposed}"
+        );
+    }
 
     #[test]
     fn shutdown_timeout_defaults_without_flag_or_env() {

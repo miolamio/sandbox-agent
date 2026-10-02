@@ -46,7 +46,40 @@ export interface ProblemDetails {
 
 export type AcpEnvelopeDirection = "inbound" | "outbound";
 
-export type AcpEnvelopeObserver = (envelope: AnyMessage, direction: AcpEnvelopeDirection) => void;
+export interface AcpEnvelopeMeta {
+  /**
+   * Event stream id of an inbound envelope that arrived over the event stream
+   * (SSE). The server assigns ids in order per server, and every client of that
+   * server sees the same id for the same event, also when a reconnect replays
+   * it. Missing for envelopes delivered in a POST response body.
+   */
+  eventId?: string;
+  /**
+   * Generation of the server instance that sent the event (Sandbox Agent's
+   * `x-sandboxagent-server-generation` event stream header, the instance's
+   * creation time). Event ids restart for a later server reusing the same
+   * id, so `(generation, eventId)` identifies an event. Missing when the
+   * server does not send the header.
+   */
+  serverGeneration?: string;
+  /**
+   * True on the first envelope after events were skipped on the event stream
+   * (the event id jumped, for example because the server's event buffer moved
+   * past a reconnecting client), so earlier state may be incomplete.
+   */
+  streamGap?: boolean;
+}
+
+export type AcpEnvelopeObserver = (envelope: AnyMessage, direction: AcpEnvelopeDirection, meta?: AcpEnvelopeMeta) => void;
+
+export interface AcpDisconnectOptions {
+  /**
+   * Also delete the server (`DELETE` on the transport path). Defaults to
+   * `true`. Pass `false` to close only this client's event stream and leave a
+   * server that other clients may still use running.
+   */
+  deleteServer?: boolean;
+}
 
 export type QueryValue = string | number | boolean | null | undefined;
 
@@ -160,6 +193,11 @@ export interface AcpHttpClientOptions {
   headers?: HeadersInit;
   client?: Partial<Client>;
   onEnvelope?: AcpEnvelopeObserver;
+  /**
+   * Called when the event stream stops for good (for example the server was
+   * deleted), so state that waits for further events can be finished.
+   */
+  onEventStreamStopped?: () => void;
   transport?: AcpHttpTransportOptions;
 }
 
@@ -245,6 +283,7 @@ export class AcpHttpClient {
       token: options.token,
       defaultHeaders: options.headers,
       onEnvelope: options.onEnvelope,
+      onEventStreamStopped: options.onEventStreamStopped,
       transport: options.transport,
     });
 
@@ -321,8 +360,8 @@ export class AcpHttpClient {
     return this.connection.extNotification(method, params);
   }
 
-  async disconnect(): Promise<void> {
-    await this.transport.close();
+  async disconnect(options: AcpDisconnectOptions = {}): Promise<void> {
+    await this.transport.close(options.deleteServer !== false);
   }
 
   get closed(): Promise<void> {
@@ -336,6 +375,15 @@ export class AcpHttpClient {
   get clientSideConnection(): ClientSideConnection {
     return this.connection;
   }
+
+  /**
+   * Whether a request id seen on the wire (for example `requestId` of a turn
+   * notification) belongs to a request this client sent. Outbound ids carry a
+   * per-client prefix.
+   */
+  isOwnWireRequestId(requestId: string | number): boolean {
+    return this.transport.isOwnWireRequestId(requestId);
+  }
 }
 
 type StreamableHttpAcpTransportOptions = {
@@ -344,6 +392,11 @@ type StreamableHttpAcpTransportOptions = {
   token?: string;
   defaultHeaders?: HeadersInit;
   onEnvelope?: AcpEnvelopeObserver;
+  /**
+   * Called when the event stream stops for good (for example the server was
+   * deleted), so state that waits for further events can be finished.
+   */
+  onEventStreamStopped?: () => void;
   transport?: AcpHttpTransportOptions;
 };
 
@@ -356,12 +409,18 @@ class StreamableHttpAcpTransport {
   private readonly token?: string;
   private readonly defaultHeaders?: HeadersInit;
   private readonly onEnvelope?: AcpEnvelopeObserver;
+  private readonly onEventStreamStopped?: () => void;
   private readonly bootstrapQuery: URLSearchParams | null;
 
   private readableController: ReadableStreamDefaultController<AnyMessage> | null = null;
   private sseAbortController: AbortController | null = null;
   private sseLoop: Promise<void> | null = null;
   private lastEventId: string | null = null;
+  private serverGeneration: string | undefined;
+  // Highest event id received, to notice skipped events, and whether a skip
+  // has not been reported to the observer yet.
+  private lastReceivedSequence: bigint | undefined;
+  private pendingStreamGap = false;
   private closed = false;
   private closingPromise: Promise<void> | null = null;
   private postedOnce = false;
@@ -397,6 +456,7 @@ class StreamableHttpAcpTransport {
     this.token = options.token;
     this.defaultHeaders = options.defaultHeaders;
     this.onEnvelope = options.onEnvelope;
+    this.onEventStreamStopped = options.onEventStreamStopped;
     this.bootstrapQuery = options.transport?.bootstrapQuery ? buildQueryParams(options.transport.bootstrapQuery) : null;
     if (options.transport?.skipBufferedEvents) {
       // Last-Event-ID asks for events after the given id. The largest id the
@@ -427,16 +487,20 @@ class StreamableHttpAcpTransport {
     };
   }
 
-  async close(): Promise<void> {
+  isOwnWireRequestId(requestId: string | number): boolean {
+    return String(requestId).startsWith(this.wireIdPrefix);
+  }
+
+  async close(deleteServer = true): Promise<void> {
     if (this.closingPromise) {
       return this.closingPromise;
     }
 
-    this.closingPromise = this.closeImpl();
+    this.closingPromise = this.closeImpl(deleteServer);
     return this.closingPromise;
   }
 
-  private async closeImpl(): Promise<void> {
+  private async closeImpl(deleteServer: boolean): Promise<void> {
     if (this.closed) {
       return;
     }
@@ -448,7 +512,7 @@ class StreamableHttpAcpTransport {
       this.sseAbortController.abort();
     }
 
-    if (!this.postedOnce) {
+    if (!this.postedOnce || !deleteServer) {
       try {
         this.readableController?.close();
       } catch {
@@ -654,6 +718,14 @@ class StreamableHttpAcpTransport {
           throw new Error("SSE stream is not readable in this environment.");
         }
 
+        const generation = response.headers.get(SERVER_GENERATION_HEADER) ?? undefined;
+        if (generation !== this.serverGeneration) {
+          // A different server instance (or the first connect): its event ids
+          // start over, so earlier ids say nothing about gaps.
+          this.lastReceivedSequence = undefined;
+          this.pendingStreamGap = false;
+        }
+        this.serverGeneration = generation;
         this.sseConnected = true;
         this.sseEverConnected = true;
         this.sseFailures = 0;
@@ -683,6 +755,7 @@ class StreamableHttpAcpTransport {
         this.notifySseStateChange();
         if (isTerminalSseError(error, this.sseEverConnected) || this.sseFailures >= SSE_MAX_CONSECUTIVE_FAILURES) {
           this.failAsyncPending(error);
+          this.onEventStreamStopped?.();
           return;
         }
         await delay(Math.min(SSE_RECONNECT_BASE_MS * 2 ** (this.sseFailures - 1), SSE_RECONNECT_MAX_MS));
@@ -767,6 +840,15 @@ class StreamableHttpAcpTransport {
 
     if (eventId) {
       this.lastEventId = eventId;
+      if (/^\d+$/.test(eventId)) {
+        const sequence = BigInt(eventId);
+        if (this.lastReceivedSequence !== undefined && sequence > this.lastReceivedSequence + 1n) {
+          this.pendingStreamGap = true;
+        }
+        if (this.lastReceivedSequence === undefined || sequence > this.lastReceivedSequence) {
+          this.lastReceivedSequence = sequence;
+        }
+      }
     }
 
     if (eventName !== "message" || dataLines.length === 0) {
@@ -779,10 +861,10 @@ class StreamableHttpAcpTransport {
     }
 
     const envelope = JSON.parse(payloadText) as AnyMessage;
-    this.pushInbound(envelope);
+    this.pushInbound(envelope, eventId ?? undefined);
   }
 
-  private pushInbound(envelope: AnyMessage): void {
+  private pushInbound(envelope: AnyMessage, eventId?: string): void {
     if (this.closed) {
       return;
     }
@@ -799,7 +881,15 @@ class StreamableHttpAcpTransport {
       envelope = { ...(envelope as Record<string, unknown>), id: originalId } as AnyMessage;
     }
 
-    this.observeEnvelope(envelope, "inbound");
+    let meta: AcpEnvelopeMeta | undefined;
+    if (eventId !== undefined) {
+      meta = { eventId, serverGeneration: this.serverGeneration };
+      if (this.pendingStreamGap) {
+        meta.streamGap = true;
+        this.pendingStreamGap = false;
+      }
+    }
+    this.observeEnvelope(envelope, "inbound", meta);
 
     try {
       this.readableController?.enqueue(envelope);
@@ -829,12 +919,12 @@ class StreamableHttpAcpTransport {
     }
   }
 
-  private observeEnvelope(message: AnyMessage, direction: AcpEnvelopeDirection): void {
+  private observeEnvelope(message: AnyMessage, direction: AcpEnvelopeDirection, meta?: AcpEnvelopeMeta): void {
     if (!this.onEnvelope) {
       return;
     }
 
-    this.onEnvelope(message, direction);
+    this.onEnvelope(message, direction, meta);
   }
 
   private buildHeaders(extra?: HeadersInit): Headers {
@@ -924,6 +1014,7 @@ function responseEnvelopeId(message: AnyMessage): string | null {
 }
 
 const ASYNC_PROMPT_HEADER = "x-sandboxagent-async-prompt";
+const SERVER_GENERATION_HEADER = "x-sandboxagent-server-generation";
 const MAX_SSE_EVENT_ID = "18446744073709551615";
 const SSE_RECONNECT_BASE_MS = 150;
 const SSE_RECONNECT_MAX_MS = 5_000;

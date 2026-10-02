@@ -143,6 +143,9 @@ impl AcpProxyRuntime {
             .read()
             .await
             .values()
+            // An agent server whose agent process exited is gone even if its
+            // exit reaper has not removed it yet.
+            .filter(|instance| !instance.runtime.has_exited())
             .map(|instance| AcpServerInstanceInfo {
                 server_id: instance.server_id.clone(),
                 agent: instance.agent,
@@ -244,12 +247,15 @@ impl AcpProxyRuntime {
         }
     }
 
+    /// Returns the instance generation (its `created_at_ms`) with the stream,
+    /// so clients can tell a later server that reuses the same id apart.
     pub async fn sse(
         &self,
         server_id: &str,
         last_event_id: Option<u64>,
-    ) -> Result<PinBoxSseStream, SandboxError> {
+    ) -> Result<(i64, PinBoxSseStream), SandboxError> {
         let instance = self.get_instance(server_id).await?;
+        let generation = instance.created_at_ms;
         let stream =
             instance
                 .annotated_payload_stream(last_event_id)
@@ -260,7 +266,7 @@ impl AcpProxyRuntime {
                         .id(sequence.to_string())
                         .data(payload.to_string()))
                 });
-        Ok(Box::pin(stream))
+        Ok((generation, Box::pin(stream)))
     }
 
     pub async fn delete(&self, server_id: &str) -> Result<(), SandboxError> {
@@ -286,15 +292,43 @@ impl AcpProxyRuntime {
     }
 
     async fn get_instance(&self, server_id: &str) -> Result<Arc<ProxyInstance>, SandboxError> {
-        self.inner
-            .instances
-            .read()
+        self.live_instance(server_id)
             .await
-            .get(server_id)
-            .cloned()
             .ok_or_else(|| SandboxError::SessionNotFound {
                 session_id: server_id.to_string(),
             })
+    }
+
+    /// The instance for `server_id` if its agent process is still running. An
+    /// instance whose agent process exited is removed and reported as missing,
+    /// so it is never reused: requests for it are rejected before reaching any
+    /// agent, and the id can be bootstrapped again.
+    async fn live_instance(&self, server_id: &str) -> Option<Arc<ProxyInstance>> {
+        let existing = self.inner.instances.read().await.get(server_id).cloned()?;
+        if !existing.runtime.has_exited() {
+            return Some(existing);
+        }
+        remove_exited_instance(&self.inner, &existing).await;
+        None
+    }
+
+    /// Removes `instance` as soon as its agent process exits, so a crashed agent
+    /// server does not stay listed until someone touches it.
+    fn spawn_exit_reaper(&self, instance: &Arc<ProxyInstance>) {
+        // Weak references only: the reaper must not keep the proxy runtime or
+        // the instance alive.
+        let inner = Arc::downgrade(&self.inner);
+        let weak_instance = Arc::downgrade(instance);
+        let mut exit_watch = instance.runtime.exit_watch();
+        tokio::spawn(async move {
+            if exit_watch.wait_for(|exited| *exited).await.is_err() {
+                return;
+            }
+            let (Some(inner), Some(instance)) = (inner.upgrade(), weak_instance.upgrade()) else {
+                return;
+            };
+            remove_exited_instance(&inner, &instance).await;
+        });
     }
 
     async fn get_or_create_instance(
@@ -303,7 +337,7 @@ impl AcpProxyRuntime {
         bootstrap_agent: Option<AgentId>,
         turn_events: bool,
     ) -> Result<Arc<ProxyInstance>, SandboxError> {
-        if let Some(existing) = self.inner.instances.read().await.get(server_id).cloned() {
+        if let Some(existing) = self.live_instance(server_id).await {
             if let Some(agent) = bootstrap_agent {
                 if agent != existing.agent {
                     return Err(SandboxError::Conflict {
@@ -326,7 +360,7 @@ impl AcpProxyRuntime {
         };
         let _guard = lock.lock().await;
 
-        if let Some(existing) = self.inner.instances.read().await.get(server_id).cloned() {
+        if let Some(existing) = self.live_instance(server_id).await {
             if let Some(agent) = bootstrap_agent {
                 if agent != existing.agent {
                     return Err(SandboxError::Conflict {
@@ -352,6 +386,7 @@ impl AcpProxyRuntime {
             .write()
             .await
             .insert(server_id.to_string(), created.clone());
+        self.spawn_exit_reaper(&created);
 
         Ok(created)
     }
@@ -567,6 +602,31 @@ impl AcpDispatch for AcpProxyRuntime {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         let server_id = server_id.to_string();
         Box::pin(async move { self.delete(&server_id).await.map_err(|err| err.to_string()) })
+    }
+}
+
+/// Removes `instance` from the server map if it is still the entry for its id
+/// (a newer instance under the same id is left alone). The runtime is not shut
+/// down: its process already exited, and the exit watcher still publishes the
+/// final events to open event streams, which end once it is done.
+async fn remove_exited_instance(inner: &AcpProxyRuntimeInner, instance: &Arc<ProxyInstance>) {
+    let removed = {
+        let mut instances = inner.instances.write().await;
+        let is_current = instances
+            .get(&instance.server_id)
+            .is_some_and(|current| Arc::ptr_eq(current, instance));
+        if is_current {
+            instances.remove(&instance.server_id)
+        } else {
+            None
+        }
+    };
+    if removed.is_some() {
+        tracing::warn!(
+            server_id = instance.server_id.as_str(),
+            agent = instance.agent.as_str(),
+            "acp_proxy: agent process exited; server removed"
+        );
     }
 }
 

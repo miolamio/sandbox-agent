@@ -20,6 +20,16 @@ Store every `SessionRecord` field the SDK gives you and return it unchanged:
 
 `serverId` is optional, so records written by older SDK versions still load. Without it, a restored session is recreated. If your driver uses a fixed schema, add a nullable column for it. The SQLite and Postgres examples do this with an `ALTER TABLE ... ADD COLUMN` migration on startup.
 
+### Event ids and shared drivers
+
+`insertEvent` must be idempotent per event `id`: if an event with the same `id` is already stored, keep the stored record and return without an error. Do not overwrite it.
+
+Several clients can share one driver, for example an author that sends prompts and an observer that attached with `resumeSession()`. Every client attached to a session receives the agent's output, so each of them inserts it. Events the agent server streams get an id built from the server id, the server's creation time, and the server's own event number (`<serverId>@<generation>:<n>`, where the generation is the server's creation time `createdAtMs`, sent with its event stream), so all clients produce the same id for the same event, and an idempotent driver stores it once. The creation time keeps the ids of a later server that reuses the same server id apart. Two separate events with identical content still get different ids and are both kept. The same applies when a client reconnects and receives an event again.
+
+While a turn runs, only the client that sent its prompt stores the turn's events. The other clients keep them. After the turn ended (or their connection to it closed), they write nothing while the prompting client is still storing the turn: they are done once the turn's prompt result or all of its events are stored. Only if the turn is still incomplete and nothing changed in the store for 2 seconds do they treat the prompting client as gone and store the missing events after the highest stored `eventIndex`. Servers that do not send their generation with the event stream get it from the server list. While that list cannot be read, a client stores events under `<serverId>:<n>` and does not keep other clients' turns, so such an event can be stored twice if another client stored it under the full id. Each client picks the next `eventIndex` after the highest stored one when it starts a prompt or stores an event outside its own turn, so a turn's events follow the events stored before it.
+
+The built-in in-memory driver (which also remembers recently trimmed ids) and the SQLite, Postgres, IndexedDB, and Rivet examples follow this rule (`ON CONFLICT (id) DO NOTHING` in SQL). A driver that appends every insert stores one copy per client.
+
 ## Persistence drivers
 
 ### Rivet

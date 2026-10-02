@@ -1078,6 +1078,10 @@ export interface operations {
     responses: {
       /** @description SSE stream of ACP envelopes */
       200: {
+        headers: {
+          /** @description Creation time (ms) of this server instance, the same as `createdAtMs` in `GET /v1/acp`; differs for a later server that reuses the id */
+          "x-sandboxagent-server-generation"?: string;
+        };
         content: never;
       };
       /** @description Invalid request */

@@ -285,6 +285,8 @@ fn parse_sse_event_id(chunk: &str) -> u64 {
 
 #[path = "v1_api/acp_transport.rs"]
 mod acp_transport;
+#[path = "v1_api/agent_exit.rs"]
+mod agent_exit;
 #[path = "v1_api/config_endpoints.rs"]
 mod config_endpoints;
 #[path = "v1_api/control_plane.rs"]
