@@ -81,7 +81,9 @@ async fn assert_all_gone(pids: [u32; 3]) {
     let names = ["agent", "agent child", "agent child ignoring SIGTERM"];
     let mut survivors = Vec::new();
     for (pid, name) in pids.iter().zip(names) {
-        if !wait_until_gone(*pid, Duration::from_secs(1)).await {
+        // The stub ignores SIGTERM, so it only goes away with the SIGKILL that
+        // follows the 1 s grace period; leave room for that plus polling.
+        if !wait_until_gone(*pid, Duration::from_secs(3)).await {
             survivors.push(format!("{name} (pid {pid})"));
         }
     }
