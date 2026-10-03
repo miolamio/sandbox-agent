@@ -26,7 +26,7 @@ sandbox-agent server [OPTIONS]
 | `-A, --cors-allow-header <HEADER>` | all | Allowed CORS header (repeatable) |
 | `-C, --cors-allow-credentials` | false | Enable CORS credentials |
 | `--no-telemetry` | false | Disable anonymous telemetry |
-| `--shutdown-timeout-ms <MS>` | `5000` | Total time from the first shutdown signal to exit (stopping agents and processes, then draining connections) |
+| `--shutdown-timeout-ms <MS>` | `5000` | Total time from the first shutdown signal to exit (stopping agents and processes, then draining connections). Must be at least 1 |
 | `--acp-request-timeout-ms <MS>` | `7200000` (2 hours) | Max time one agent request, including a whole prompt turn, may wait for the agent before failing with a timeout |
 
 ```bash
@@ -38,7 +38,7 @@ Notes:
 - Server logs are redirected to files by default.
 - Set `SANDBOX_AGENT_LOG_STDOUT=1` to force stdout/stderr logging.
 - Use `SANDBOX_AGENT_LOG_DIR` to override log directory.
-- `SIGTERM` and `SIGINT` (Ctrl+C) trigger a graceful shutdown: running agents and processes started through `/v1/processes` are stopped first, then open connections are drained. Processes get `SIGTERM` and, if still running after up to 1 second, `SIGKILL`. The whole shutdown, from the first signal to exit, fits in one budget set by `--shutdown-timeout-ms` (or `SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS`; the flag wins; an invalid env value falls back to the default). Long-lived streams such as followed process logs are cut off when the budget runs out, and the server exits with code 0. A second signal exits immediately with code 1.
+- `SIGTERM` and `SIGINT` (Ctrl+C) trigger a graceful shutdown: running agents, processes started through `/v1/processes` and in-flight `/v1/processes/run` commands are stopped first, then open connections are drained. Each agent and process runs in its own process group, so everything it started is stopped with it: the group gets `SIGTERM` and, if anything in it is still running after up to 1 second, `SIGKILL`. From the first signal on, requests that would start a new agent or process are rejected with `409`. Followed process logs end once the processes are stopped. The whole shutdown, from the first signal to exit, fits in one budget set by `--shutdown-timeout-ms` (or `SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS`; the flag wins; an invalid or zero env value falls back to the default). Connections still open when the budget runs out are cut off, and the server exits with code 0. A second signal exits immediately with code 1.
 - Agent requests (including a whole prompt turn) fail with a `504` timeout error after `--acp-request-timeout-ms` (or `SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS`; the flag wins). The default is 2 hours. An invalid or zero env value falls back to the default. With the async prompt header the POST still returns `202` right away, and the timeout error arrives on the event stream with the same request id.
 
 ## install

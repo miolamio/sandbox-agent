@@ -117,8 +117,11 @@ pub struct ServerArgs {
 
     /// Total time budget (ms) from the first SIGTERM/SIGINT to process exit,
     /// covering stopping agents and processes and draining connections.
-    /// Overrides SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS. Default 5000.
-    #[arg(long = "shutdown-timeout-ms")]
+    /// Overrides SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS. Default 5000, minimum 1.
+    #[arg(
+        long = "shutdown-timeout-ms",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     shutdown_timeout_ms: Option<u64>,
 
     /// Max time (ms) one agent request, including a whole prompt turn, may wait
@@ -559,15 +562,16 @@ const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(5000);
 const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_millis(1000);
 
 /// Resolves the total shutdown budget: `--shutdown-timeout-ms` wins, then
-/// `SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS`, then the default. An unparsable env
-/// value falls back to the default.
+/// `SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS`, then the default. An unparsable or
+/// zero value falls back to the default (a zero budget would exit without
+/// stopping anything).
 pub(crate) fn shutdown_timeout_from_env_or_flag(flag: Option<u64>, env: Option<&str>) -> Duration {
-    if let Some(ms) = flag {
+    if let Some(ms) = flag.filter(|ms| *ms > 0) {
         return Duration::from_millis(ms);
     }
     match env.map(|raw| raw.trim().parse::<u64>()) {
-        Some(Ok(ms)) => Duration::from_millis(ms),
-        Some(Err(_)) => {
+        Some(Ok(ms)) if ms > 0 => Duration::from_millis(ms),
+        Some(_) => {
             tracing::warn!(
                 env = SHUTDOWN_TIMEOUT_ENV,
                 value = env.unwrap_or_default(),
@@ -617,6 +621,9 @@ async fn shutdown_signal(
             "agent shutdown used up the shutdown budget"
         );
     }
+    // Followed process logs never end on their own; with the processes gone
+    // there is nothing left to follow.
+    state.process_runtime().end_log_follows();
 
     tracing::info!("draining open connections");
     tokio::spawn(async move {
@@ -1938,7 +1945,7 @@ mod tests {
 
     #[test]
     fn shutdown_timeout_invalid_env_falls_back_to_default() {
-        for raw in ["", "abc", "-5", "1.5"] {
+        for raw in ["", "abc", "-5", "1.5", "0", " 0 "] {
             assert_eq!(
                 shutdown_timeout_from_env_or_flag(None, Some(raw)),
                 DEFAULT_SHUTDOWN_TIMEOUT,
@@ -1968,6 +1975,17 @@ mod tests {
             Command::Server(args) => assert_eq!(args.shutdown_timeout_ms, Some(1200)),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn server_rejects_zero_shutdown_timeout_flag() {
+        let parsed = SandboxAgentCli::try_parse_from([
+            "sandbox-agent",
+            "server",
+            "--shutdown-timeout-ms",
+            "0",
+        ]);
+        assert!(parsed.is_err(), "a zero shutdown budget must be rejected");
     }
 
     #[test]

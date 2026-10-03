@@ -113,6 +113,8 @@ curl "http://127.0.0.1:2468/v1/processes/proc_1"
 
 ### Stop, kill, and delete
 
+Each process runs in its own process group. Stop and kill signal the whole group, so child processes the command started (for example the commands of a shell script) are stopped too.
+
 <CodeGroup>
 ```ts TypeScript
 // SIGTERM with optional wait

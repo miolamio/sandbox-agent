@@ -33,6 +33,24 @@ const PLATFORM_PACKAGES: Record<string, string> = {
 const TRUST_PACKAGES =
   "@sandbox-agent/cli-linux-x64 @sandbox-agent/cli-linux-arm64 @sandbox-agent/cli-darwin-arm64 @sandbox-agent/cli-darwin-x64 @sandbox-agent/cli-win32-x64";
 
+const SHUTDOWN_TIMEOUT_ENV = "SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS";
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
+const SHUTDOWN_WAIT_MARGIN_MS = 2_000;
+
+/**
+ * How long `dispose()` waits after SIGTERM before falling back to SIGKILL: the
+ * server's whole shutdown budget (`SANDBOX_AGENT_SHUTDOWN_TIMEOUT_MS`, default
+ * 5000, resolved the way the server does) plus a margin, like `daemon stop`.
+ * Killing earlier would cut the server off while it is still stopping agents
+ * and processes, leaving them behind.
+ */
+export function shutdownWaitMs(raw: string | undefined): number {
+  const trimmed = raw?.trim() ?? "";
+  const parsed = /^\d+$/.test(trimmed) ? Number(trimmed) : 0;
+  const budget = parsed > 0 ? parsed : DEFAULT_SHUTDOWN_TIMEOUT_MS;
+  return budget + SHUTDOWN_WAIT_MARGIN_MS;
+}
+
 export function isNodeRuntime(): boolean {
   return typeof process !== "undefined" && !!process.versions?.node;
 }
@@ -107,7 +125,8 @@ export async function spawnSandboxAgent(options: SandboxAgentSpawnOptions, fetch
       return;
     }
     child.kill("SIGTERM");
-    const exited = await waitForExit(child, 5_000);
+    const env = { ...process.env, ...(options.env ?? {}) };
+    const exited = await waitForExit(child, shutdownWaitMs(env[SHUTDOWN_TIMEOUT_ENV]));
     if (!exited) {
       child.kill("SIGKILL");
     }

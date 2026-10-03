@@ -424,16 +424,21 @@ async fn opencode_unavailable() -> Response {
 }
 
 /// Stops agents, sidecars and the desktop, and in parallel the processes
-/// started through `/v1/processes` (SIGTERM, then SIGKILL after
-/// `process_grace`).
+/// started through `/v1/processes` and `/v1/processes/run`. Agents and
+/// processes get SIGTERM to their whole process group, then SIGKILL after
+/// `process_grace`.
 pub async fn shutdown_servers(state: &Arc<AppState>, process_grace: std::time::Duration) {
+    let acp_proxy = state.acp_proxy();
     let services = async {
-        state.acp_proxy().shutdown_all().await;
         state.opencode_server_manager().shutdown().await;
         state.desktop_runtime().shutdown().await;
     };
     let process_runtime = state.process_runtime();
-    tokio::join!(services, process_runtime.shutdown_all(process_grace));
+    tokio::join!(
+        acp_proxy.shutdown_all(process_grace),
+        services,
+        process_runtime.shutdown_all(process_grace)
+    );
 }
 
 #[derive(OpenApi)]
@@ -2609,7 +2614,11 @@ async fn get_v1_process_logs(
             }
         });
 
-        let stream = replay_stream.chain(follow_stream);
+        // Server shutdown ends the stream once processes are stopped, so it
+        // does not hold the connection drain open.
+        let stream = replay_stream
+            .chain(follow_stream)
+            .take_until(runtime.log_follows_ended());
         let response =
             Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
         return Ok(response.into_response());

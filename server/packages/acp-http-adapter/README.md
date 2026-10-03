@@ -31,11 +31,21 @@ cargo run -p acp-http-adapter -- \
 - single registry entry (`{"id":"...","distribution":...}`)
 - direct distribution object (`{"npx":...}` or `{"binary":...}`)
 
+## Shutdown
+
+The agent runs in its own process group. On `SIGTERM` or `SIGINT` the adapter
+sends `SIGTERM` to that group (the agent and everything it started), then
+`SIGKILL` to whatever is left after up to 1 second, and drains open
+connections. Open SSE streams never end on their own, so the whole shutdown is
+bounded by `--shutdown-timeout-ms` (default 5000, counted from the first
+signal); when it runs out the adapter exits with code 0. A second signal exits
+immediately with code 1.
+
 ## Library
 
 ```rust
 use std::time::Duration;
-use acp_http_adapter::{run_server, ServerConfig};
+use acp_http_adapter::{run_server, ServerConfig, DEFAULT_SHUTDOWN_TIMEOUT};
 
 run_server(ServerConfig {
     host: "127.0.0.1".to_string(),
@@ -43,5 +53,6 @@ run_server(ServerConfig {
     registry_json: r#"{"distribution":{"npx":{"package":"@zed-industries/codex-acp"}}}"#.to_string(),
     registry_agent_id: None,
     rpc_timeout: Duration::from_secs(120),
+    shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
 }).await?;
 ```

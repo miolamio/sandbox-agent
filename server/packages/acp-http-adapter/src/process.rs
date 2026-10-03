@@ -240,6 +240,9 @@ pub struct AdapterRuntime {
     // Becomes true once the agent process has exited (or its status could not
     // be read), before pending requests are failed.
     exited: Arc<watch::Sender<bool>>,
+    // The agent leads its own process group (same id as its PID), so shutdown
+    // reaches every process it started.
+    process_group: Option<u32>,
 }
 
 impl AdapterRuntime {
@@ -263,6 +266,8 @@ impl AdapterRuntime {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
 
         for (key, value) in &launch.env {
             command.env(key, value);
@@ -309,6 +314,7 @@ impl AdapterRuntime {
             stderr_tail: Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_SIZE))),
             exit_info: Arc::new(Mutex::new(None)),
             exited: Arc::new(watch::channel(false).0),
+            process_group: cfg!(unix).then_some(pid).filter(|pid| *pid > 0),
         };
 
         runtime.spawn_stdout_loop(stdout);
@@ -647,7 +653,17 @@ impl AdapterRuntime {
             .map(|(_sequence, payload)| payload)
     }
 
+    /// Stops the agent with the default grace period
+    /// ([`crate::process_group::DEFAULT_GRACE`]).
     pub async fn shutdown(&self) {
+        self.shutdown_with_grace(crate::process_group::DEFAULT_GRACE)
+            .await;
+    }
+
+    /// Fails pending requests, then stops the agent and every process it
+    /// started: SIGTERM to its process group, SIGKILL to whatever is still
+    /// there after `grace`.
+    pub async fn shutdown_with_grace(&self, grace: Duration) {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -668,6 +684,12 @@ impl AdapterRuntime {
         match child.try_wait() {
             Ok(Some(_)) => {}
             Ok(None) => {
+                #[cfg(unix)]
+                if let Some(pgid) = self.process_group {
+                    stop_process_group(&mut child, pgid, grace).await;
+                    return;
+                }
+                let _ = grace;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
             }
@@ -985,6 +1007,36 @@ impl AdapterRuntime {
     pub fn exit_watch(&self) -> watch::Receiver<bool> {
         self.exited.subscribe()
     }
+}
+
+/// SIGTERM to the agent's process group; once the agent has exited and the
+/// group is empty we are done, otherwise SIGKILL the group after `grace`.
+/// The caller holds the child lock, so the leader is reaped here.
+#[cfg(unix)]
+async fn stop_process_group(child: &mut Child, pgid: u32, grace: Duration) {
+    use crate::process_group::{group_alive, signal_group, POLL_INTERVAL, SIGKILL, SIGTERM};
+
+    if let Err(err) = signal_group(pgid, SIGTERM) {
+        tracing::warn!(pgid, error = %err, "failed to send SIGTERM to agent process group");
+    }
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        let leader_exited = !matches!(child.try_wait(), Ok(None));
+        if leader_exited && !group_alive(pgid) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    tracing::warn!(
+        pgid,
+        "agent process group still running after SIGTERM; sending SIGKILL"
+    );
+    let _ = signal_group(pgid, SIGKILL);
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 async fn stderr_tail_text(stderr_tail: &Mutex<VecDeque<String>>) -> Option<String> {

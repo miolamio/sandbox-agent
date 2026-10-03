@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use acp_http_adapter::{run_server, ServerConfig};
+use acp_http_adapter::{run_server, ServerConfig, DEFAULT_SHUTDOWN_TIMEOUT};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -21,6 +21,11 @@ struct Cli {
 
     #[arg(long)]
     rpc_timeout_ms: Option<u64>,
+
+    /// Total time (ms) from the first SIGTERM/SIGINT to exit, covering
+    /// stopping the agent and draining connections. Default 5000.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    shutdown_timeout_ms: Option<u64>,
 }
 
 #[tokio::main]
@@ -57,6 +62,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .rpc_timeout_ms
             .map(Duration::from_millis)
             .unwrap_or_else(|| Duration::from_secs(120)),
+        shutdown_timeout: cli
+            .shutdown_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT),
     })
     .await
 }

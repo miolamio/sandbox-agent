@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +62,8 @@ struct AcpProxyRuntimeInner {
     instances: RwLock<HashMap<String, Arc<ProxyInstance>>>,
     instance_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     install_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
+    /// Set by `shutdown_all`; no new agent process is started from then on.
+    shutting_down: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -132,6 +135,7 @@ impl AcpProxyRuntime {
                 instances: RwLock::new(HashMap::new()),
                 instance_locks: Mutex::new(HashMap::new()),
                 install_locks: Mutex::new(HashMap::new()),
+                shutting_down: AtomicBool::new(false),
             }),
         }
     }
@@ -277,18 +281,27 @@ impl AcpProxyRuntime {
         Ok(())
     }
 
-    pub async fn shutdown_all(&self) {
+    /// Stops every agent process and its process group in parallel (SIGTERM,
+    /// SIGKILL after `grace`). Agents requested from then on are refused.
+    pub async fn shutdown_all(&self, grace: Duration) {
         let instances = {
             let mut guard = self.inner.instances.write().await;
+            // Set under the lock: `get_or_create_instance` checks it under the
+            // same lock before inserting, so a new agent is either drained here
+            // or never inserted.
+            self.inner.shutting_down.store(true, Ordering::SeqCst);
             guard
                 .drain()
                 .map(|(_, instance)| instance)
                 .collect::<Vec<_>>()
         };
 
-        for instance in instances {
-            instance.runtime.shutdown().await;
-        }
+        futures::future::join_all(
+            instances
+                .iter()
+                .map(|instance| instance.runtime.shutdown_with_grace(grace)),
+        )
+        .await;
     }
 
     async fn get_instance(&self, server_id: &str) -> Result<Arc<ProxyInstance>, SandboxError> {
@@ -380,12 +393,19 @@ impl AcpProxyRuntime {
             ),
         })?;
 
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(shutting_down_error());
+        }
         let created = self.create_instance(server_id, agent, turn_events).await?;
-        self.inner
-            .instances
-            .write()
-            .await
-            .insert(server_id.to_string(), created.clone());
+        {
+            let mut instances = self.inner.instances.write().await;
+            if self.inner.shutting_down.load(Ordering::SeqCst) {
+                drop(instances);
+                created.runtime.shutdown().await;
+                return Err(shutting_down_error());
+            }
+            instances.insert(server_id.to_string(), created.clone());
+        }
         self.spawn_exit_reaper(&created);
 
         Ok(created)
@@ -609,6 +629,12 @@ impl AcpDispatch for AcpProxyRuntime {
 /// (a newer instance under the same id is left alone). The runtime is not shut
 /// down: its process already exited, and the exit watcher still publishes the
 /// final events to open event streams, which end once it is done.
+fn shutting_down_error() -> SandboxError {
+    SandboxError::Conflict {
+        message: "server is shutting down".to_string(),
+    }
+}
+
 async fn remove_exited_instance(inner: &AcpProxyRuntimeInner, instance: &Arc<ProxyInstance>) {
     let removed = {
         let mut instances = inner.instances.write().await;

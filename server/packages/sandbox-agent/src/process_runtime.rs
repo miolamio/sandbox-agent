@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -8,7 +8,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
 use sandbox_agent_error::SandboxError;
 
@@ -138,6 +138,12 @@ pub struct ProcessRuntime {
 struct ProcessRuntimeInner {
     next_id: AtomicU64,
     processes: RwLock<HashMap<String, Arc<ManagedProcess>>>,
+    /// Process groups of in-flight `run_once` calls.
+    runs: std::sync::Mutex<HashSet<u32>>,
+    /// Set by `shutdown_all`; new processes and runs are rejected from then on.
+    shutting_down: AtomicBool,
+    /// Becomes true when followed log streams must end (server shutdown).
+    log_follows_ended: watch::Sender<bool>,
 }
 
 #[derive(Debug)]
@@ -211,6 +217,9 @@ impl ProcessRuntime {
             inner: Arc::new(ProcessRuntimeInner {
                 next_id: AtomicU64::new(1),
                 processes: RwLock::new(HashMap::new()),
+                runs: std::sync::Mutex::new(HashSet::new()),
+                shutting_down: AtomicBool::new(false),
+                log_follows_ended: watch::channel(false).0,
             }),
         }
     }
@@ -301,12 +310,20 @@ impl ProcessRuntime {
             stop_requested: AtomicBool::new(false),
         });
 
+        self.reject_if_shutting_down()?;
         self.spawn_existing_process(process.clone()).await?;
-        self.inner
-            .processes
-            .write()
-            .await
-            .insert(id, process.clone());
+        {
+            // `shutdown_all` sets the flag before it snapshots the processes
+            // under this lock, so a process inserted here is either in its
+            // snapshot or sees the flag and is killed.
+            let mut processes = self.inner.processes.write().await;
+            if self.inner.shutting_down.load(Ordering::SeqCst) {
+                drop(processes);
+                let _ = process.signal_group(SIGKILL).await;
+                return Err(shutting_down_error());
+            }
+            processes.insert(id, process.clone());
+        }
         Ok(process.snapshot().await)
     }
 
@@ -329,11 +346,14 @@ impl ProcessRuntime {
             .unwrap_or(config.max_output_bytes)
             .min(config.max_output_bytes);
 
+        self.reject_if_shutting_down()?;
         let mut cmd = Command::new(&spec.command);
         cmd.args(&spec.args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
@@ -349,6 +369,22 @@ impl ProcessRuntime {
         let mut child = cmd.spawn().map_err(|err| SandboxError::StreamError {
             message: format!("failed to spawn process: {err}"),
         })?;
+        // Registered so `shutdown_all` reaches the run; dropping the guard
+        // early (the request was cancelled) kills the run's process group.
+        let mut guard = RunGroupGuard {
+            inner: self.inner.clone(),
+            pgid: child.id(),
+            finished: false,
+        };
+        if let Some(pgid) = guard.pgid {
+            let mut runs = self.inner.runs.lock().unwrap_or_else(|e| e.into_inner());
+            if self.inner.shutting_down.load(Ordering::SeqCst) {
+                // The guard (dropped after this lock) kills the group.
+                drop(runs);
+                return Err(shutting_down_error());
+            }
+            runs.insert(pgid);
+        }
 
         let stdout = child
             .stdout
@@ -379,6 +415,9 @@ impl ProcessRuntime {
                 });
             }
             Err(_) => {
+                if let Some(pgid) = guard.pgid {
+                    let _ = signal_process_group(pgid, SIGKILL);
+                }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 (None, true)
@@ -393,6 +432,7 @@ impl ProcessRuntime {
             Ok(Ok(captured)) => captured,
             _ => (Vec::new(), false),
         };
+        guard.finished = true;
 
         Ok(RunOutput {
             exit_code,
@@ -449,7 +489,7 @@ impl ProcessRuntime {
     ) -> Result<ProcessSnapshot, SandboxError> {
         let process = self.lookup_process(id).await?;
         process.stop_requested.store(true, Ordering::SeqCst);
-        process.send_signal(SIGTERM).await?;
+        process.signal_group(SIGTERM).await?;
         maybe_wait_for_exit(process.clone(), wait_ms.unwrap_or(2_000)).await;
         Ok(process.snapshot().await)
     }
@@ -461,43 +501,66 @@ impl ProcessRuntime {
     ) -> Result<ProcessSnapshot, SandboxError> {
         let process = self.lookup_process(id).await?;
         process.stop_requested.store(true, Ordering::SeqCst);
-        process.send_signal(SIGKILL).await?;
+        process.signal_group(SIGKILL).await?;
         maybe_wait_for_exit(process.clone(), wait_ms.unwrap_or(1_000)).await;
         Ok(process.snapshot().await)
     }
 
-    /// Stops every running process on server shutdown: SIGTERM, wait up to
-    /// `grace` for all of them to exit, then SIGKILL whatever is left. Without
-    /// this they outlive the server as orphans when it runs outside a container.
+    /// Stops every running process and in-flight `run_once` on server
+    /// shutdown, with all their descendants: SIGTERM to each process group,
+    /// wait up to `grace` for the groups to empty, then SIGKILL whatever is
+    /// left. Without this they outlive the server as orphans when it runs
+    /// outside a container. From here on new processes and runs are rejected.
     pub async fn shutdown_all(&self, grace: std::time::Duration) {
-        let running: Vec<Arc<ManagedProcess>> = {
+        // Set before taking the snapshots below; see `start_process` and
+        // `run_once` for the other half of this handshake.
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+        let mut running: Vec<Arc<ManagedProcess>> = Vec::new();
+        let mut groups: Vec<u32> = Vec::new();
+        {
             let processes = self.inner.processes.read().await;
-            let mut running = Vec::new();
             for process in processes.values() {
                 if process.status.read().await.status == ProcessStatus::Running {
+                    if let Some(pid) = process.runtime.lock().await.pid {
+                        groups.push(pid);
+                    }
                     running.push(process.clone());
                 }
             }
-            running
-        };
-        if running.is_empty() {
+        }
+        let runs: Vec<u32> = self
+            .inner
+            .runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        groups.extend(&runs);
+        if running.is_empty() && groups.is_empty() {
             return;
         }
-        tracing::info!(count = running.len(), "stopping running processes");
+        tracing::info!(
+            processes = running.len(),
+            runs = runs.len(),
+            "stopping running processes"
+        );
 
         for process in &running {
             process.stop_requested.store(true, Ordering::SeqCst);
-            let _ = process.send_signal(SIGTERM).await;
+        }
+        for &pgid in &groups {
+            let _ = signal_process_group(pgid, SIGTERM);
         }
 
         let deadline = tokio::time::Instant::now() + grace;
         loop {
-            let mut all_exited = true;
+            let mut all_exited = groups.iter().all(|pgid| !process_group_alive(*pgid));
             for process in &running {
-                if process.status.read().await.status == ProcessStatus::Running {
-                    all_exited = false;
+                if !all_exited {
                     break;
                 }
+                all_exited = process.status.read().await.status != ProcessStatus::Running;
             }
             if all_exited {
                 return;
@@ -508,15 +571,41 @@ impl ProcessRuntime {
             tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
         }
 
-        for process in &running {
-            if process.status.read().await.status == ProcessStatus::Running {
-                tracing::warn!(id = %process.id, "process ignored SIGTERM; sending SIGKILL");
-                let _ = process.send_signal(SIGKILL).await;
+        for &pgid in &groups {
+            if process_group_alive(pgid) {
+                tracing::warn!(pgid, "process group ignored SIGTERM; sending SIGKILL");
+                let _ = signal_process_group(pgid, SIGKILL);
             }
+        }
+        for process in &running {
+            // Without process groups (non-unix) only the leader can be killed.
+            let _ = process.send_signal(SIGKILL).await;
         }
         for process in running {
             maybe_wait_for_exit(process, 500).await;
         }
+    }
+
+    /// Ends every followed log stream (and any opened later). Called once the
+    /// shutdown has stopped the processes, so streams do not hold the
+    /// connection drain open until the shutdown budget runs out.
+    pub fn end_log_follows(&self) {
+        self.inner.log_follows_ended.send_replace(true);
+    }
+
+    /// Resolves once [`Self::end_log_follows`] was called.
+    pub fn log_follows_ended(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut ended = self.inner.log_follows_ended.subscribe();
+        async move {
+            let _ = ended.wait_for(|ended| *ended).await;
+        }
+    }
+
+    fn reject_if_shutting_down(&self) -> Result<(), SandboxError> {
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(shutting_down_error());
+        }
+        Ok(())
     }
 
     pub async fn write_input(&self, id: &str, data: &[u8]) -> Result<usize, SandboxError> {
@@ -658,6 +747,9 @@ impl ProcessRuntime {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // Own process group, so stop/kill/shutdown reach its descendants.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
@@ -927,6 +1019,18 @@ impl ManagedProcess {
         send_signal(pid, signal)
     }
 
+    /// Signals the process and everything it started (its process group).
+    async fn signal_group(&self, signal: i32) -> Result<(), SandboxError> {
+        if self.status.read().await.status != ProcessStatus::Running {
+            return Ok(());
+        }
+        let Some(pid) = self.runtime.lock().await.pid else {
+            return Ok(());
+        };
+
+        signal_process_group(pid, signal)
+    }
+
     async fn resize_pty(&self, cols: u16, rows: u16) -> Result<(), SandboxError> {
         if !self.tty {
             return Ok(());
@@ -1101,6 +1205,67 @@ fn send_signal(pid: u32, signal: i32) -> Result<(), SandboxError> {
     Err(SandboxError::StreamError {
         message: format!("failed to signal process {pid}: {err}"),
     })
+}
+
+/// Signals the process group led by `pgid`. Every process spawned here leads
+/// its own group (pipe mode: `process_group(0)`, tty mode: `setsid`), so this
+/// reaches its descendants too. Falls back to the PID alone if the group may
+/// not be signalled.
+#[cfg(unix)]
+fn signal_process_group(pgid: u32, signal: i32) -> Result<(), SandboxError> {
+    match acp_http_adapter::process_group::signal_group(pgid, signal) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => send_signal(pgid, signal),
+        Err(err) => Err(SandboxError::StreamError {
+            message: format!("failed to signal process group {pgid}: {err}"),
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn process_group_alive(pgid: u32) -> bool {
+    acp_http_adapter::process_group::group_alive(pgid)
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(pgid: u32, signal: i32) -> Result<(), SandboxError> {
+    send_signal(pgid, signal)
+}
+
+#[cfg(not(unix))]
+fn process_group_alive(_pgid: u32) -> bool {
+    false
+}
+
+fn shutting_down_error() -> SandboxError {
+    SandboxError::Conflict {
+        message: "server is shutting down".to_string(),
+    }
+}
+
+/// Keeps an in-flight `run_once` registered for `shutdown_all`. Dropped
+/// before the run finished (the request was cancelled), it kills the run's
+/// process group instead of leaving it behind.
+struct RunGroupGuard {
+    inner: Arc<ProcessRuntimeInner>,
+    pgid: Option<u32>,
+    finished: bool,
+}
+
+impl Drop for RunGroupGuard {
+    fn drop(&mut self) {
+        let Some(pgid) = self.pgid else {
+            return;
+        };
+        self.inner
+            .runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&pgid);
+        if !self.finished {
+            let _ = signal_process_group(pgid, SIGKILL);
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -1305,6 +1470,160 @@ mod tests {
         assert!(
             wait_until_gone(pid, Duration::from_millis(500)).await,
             "pid {pid} survived SIGKILL"
+        );
+    }
+
+    /// Script that starts two descendants (one of them ignores SIGTERM),
+    /// records their PIDs in `dir` and waits for them.
+    fn tree_script(dir: &std::path::Path) -> String {
+        let dir = dir.display();
+        format!(
+            "sleep 293 & echo $! > '{dir}/child.pid'\n\
+             sh -c \"trap '' TERM; exec sleep 294\" & echo $! > '{dir}/stubborn.pid'\n\
+             echo $$ > '{dir}/leader.pid'\n\
+             wait\n"
+        )
+    }
+
+    /// `[leader, child, stubborn]` once the script wrote them.
+    async fn read_tree_pids(dir: &std::path::Path) -> [u32; 3] {
+        let read = |name: &str| -> Option<u32> {
+            std::fs::read_to_string(dir.join(name))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        for _ in 0..500 {
+            if let (Some(leader), Some(child), Some(stubborn)) =
+                (read("leader.pid"), read("child.pid"), read("stubborn.pid"))
+            {
+                return [leader, child, stubborn];
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("process never wrote its pids");
+    }
+
+    async fn assert_tree_gone(pids: [u32; 3]) {
+        let mut survivors = Vec::new();
+        for pid in pids {
+            if !wait_until_gone(pid, Duration::from_secs(1)).await {
+                survivors.push(pid);
+            }
+        }
+        for pid in &survivors {
+            unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(
+            survivors.is_empty(),
+            "pids {survivors:?} of {pids:?} outlived the process"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_kills_process_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProcessRuntime::new();
+        runtime
+            .start_process(sh_spec(&tree_script(dir.path())))
+            .await
+            .unwrap();
+        let pids = read_tree_pids(dir.path()).await;
+
+        runtime.shutdown_all(Duration::from_millis(300)).await;
+
+        assert_tree_gone(pids).await;
+    }
+
+    #[tokio::test]
+    async fn stop_process_signals_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProcessRuntime::new();
+        let snapshot = runtime
+            .start_process(sh_spec(&tree_script(dir.path())))
+            .await
+            .unwrap();
+        let [leader, child, stubborn] = read_tree_pids(dir.path()).await;
+
+        runtime
+            .stop_process(&snapshot.id, Some(2_000))
+            .await
+            .unwrap();
+        assert!(wait_until_gone(child, Duration::from_secs(1)).await);
+        assert!(wait_until_gone(leader, Duration::from_secs(1)).await);
+
+        runtime
+            .kill_process(&snapshot.id, Some(1_000))
+            .await
+            .unwrap();
+        // The leader is gone, so kill has no group to reach any more; the
+        // stubborn descendant is cleaned up here.
+        unsafe { libc::kill(stubborn as libc::pid_t, libc::SIGKILL) };
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_kills_in_flight_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProcessRuntime::new();
+        let run = {
+            let runtime = runtime.clone();
+            let script = tree_script(dir.path());
+            tokio::spawn(async move {
+                runtime
+                    .run_once(RunSpec {
+                        command: "sh".to_string(),
+                        args: vec!["-c".to_string(), script],
+                        cwd: None,
+                        env: HashMap::new(),
+                        timeout_ms: Some(60_000),
+                        max_output_bytes: None,
+                    })
+                    .await
+            })
+        };
+        let pids = read_tree_pids(dir.path()).await;
+
+        runtime.shutdown_all(Duration::from_millis(300)).await;
+
+        let finished = tokio::time::timeout(Duration::from_secs(3), run).await;
+        assert_tree_gone(pids).await;
+        let output = finished
+            .expect("run must finish once shutdown killed it")
+            .expect("run task")
+            .expect("run output");
+        assert!(!output.timed_out);
+    }
+
+    #[tokio::test]
+    async fn processes_are_rejected_once_shutdown_started() {
+        let runtime = ProcessRuntime::new();
+        runtime.shutdown_all(Duration::from_millis(100)).await;
+
+        let started = runtime.start_process(sh_spec("exec sleep 60")).await;
+        if let Ok(snapshot) = &started {
+            if let Some(pid) = snapshot.pid {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+        assert!(
+            matches!(started, Err(SandboxError::Conflict { .. })),
+            "start_process during shutdown: {started:?}"
+        );
+
+        let run = runtime
+            .run_once(RunSpec {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "echo ran".to_string()],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: Some(5_000),
+                max_output_bytes: None,
+            })
+            .await;
+        assert!(
+            matches!(run, Err(SandboxError::Conflict { .. })),
+            "run_once during shutdown: {run:?}"
         );
     }
 }
