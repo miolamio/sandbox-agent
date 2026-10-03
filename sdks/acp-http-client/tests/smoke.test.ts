@@ -531,6 +531,104 @@ describe("AcpHttpClient integration", () => {
     await client.disconnect();
   });
 
+  it("resolves an async prompt whose result is replayed after lost events", async () => {
+    const serverId = `acp-http-client-sse-gap-replay-${Date.now().toString(36)}`;
+    let sseHeld = false;
+    let sseConnects = 0;
+    let promptPosted = false;
+    const activeSse: { close: (() => void) | null } = { close: null };
+    const fetcher: typeof fetch = async (input, init) => {
+      if (init?.method !== "GET") {
+        const isPrompt = typeof init?.body === "string" && (JSON.parse(init.body) as { method?: string }).method === "session/prompt";
+        if (isPrompt) {
+          // Take the event stream down before the server starts the turn, so
+          // the turn's output overflows the replay buffer while it is down.
+          promptPosted = new Headers(init?.headers).get("x-sandboxagent-async-prompt") !== null;
+          sseHeld = true;
+          activeSse.close?.();
+        }
+        return globalThis.fetch(input, init);
+      }
+      while (sseHeld) {
+        if (init.signal?.aborted) {
+          throw new DOMException("aborted", "AbortError");
+        }
+        await sleep(10);
+      }
+      const response = await globalThis.fetch(input, init);
+      if (!response.ok || !response.body) {
+        return response;
+      }
+      sseConnects += 1;
+      const reader = response.body.getReader();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          activeSse.close = () => {
+            try {
+              controller.close();
+            } catch {}
+            reader.cancel().catch(() => {});
+          };
+        },
+        async pull(controller) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              controller.close();
+            } else {
+              controller.enqueue(value);
+            }
+          } catch {
+            try {
+              controller.close();
+            } catch {}
+          }
+        },
+        cancel() {
+          reader.cancel().catch(() => {});
+        },
+      });
+      return new Response(body, { status: response.status, headers: response.headers });
+    };
+
+    let gapSeen = false;
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: fetcher,
+      transport: { path: `/v1/acp/${encodeURIComponent(serverId)}`, bootstrapQuery: { agent: "mock" } },
+      onEnvelope: (_envelope, _direction, meta) => {
+        if (meta?.streamGap) {
+          gapSeen = true;
+        }
+      },
+    });
+
+    try {
+      await client.initialize();
+      const session = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await waitFor(() => (sseConnects > 0 ? true : undefined));
+      await sleep(25);
+
+      const outcome = client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "__flood__" }] }).then(
+        (response) => response,
+        (error: unknown) => error,
+      );
+      await waitFor(() => (promptPosted ? true : undefined));
+      // Let the turn finish while the event stream is down.
+      await sleep(1_500);
+      sseHeld = false;
+
+      const result = await Promise.race([outcome, sleep(5_000).then(() => "timed out")]);
+      expect(result).not.toBe("timed out");
+      expect(result).not.toBeInstanceOf(Error);
+      expect((result as { stopReason?: unknown }).stopReason).toBe("end_turn");
+      expect(gapSeen).toBe(true);
+    } finally {
+      await client.disconnect();
+    }
+  });
+
   it("rejects an in-flight async prompt when events were lost while the event stream was down", async () => {
     const serverId = `acp-http-client-sse-gap-${Date.now().toString(36)}`;
     const path = `/v1/acp/${encodeURIComponent(serverId)}`;

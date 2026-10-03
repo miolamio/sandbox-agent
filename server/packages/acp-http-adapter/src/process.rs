@@ -40,7 +40,10 @@ pub const AWAITING_INPUT_METHOD: &str = "_sandboxagent/session/awaiting_input";
 pub const INPUT_RESOLVED_METHOD: &str = "_sandboxagent/session/input_resolved";
 /// Sent in place of events a stream can no longer deliver because the replay
 /// buffer moved past them. Params `{fromSequence, toSequence}` give the
-/// inclusive range of lost event ids. The marker itself has no event id.
+/// inclusive range of lost event ids; `replayThrough` is the id of the last
+/// buffered event the stream replays right after the marker (a client knows
+/// everything that survived the gap once it has seen that event). The marker
+/// itself has no event id.
 pub const STREAM_GAP_METHOD: &str = "_sandboxagent/stream/gap";
 /// `_meta` key under which prompt responses carry `{sessionId, sequence}`.
 pub const META_KEY: &str = "sandboxagent.dev";
@@ -248,7 +251,7 @@ fn replay_after(
                 None,
                 notification(
                     STREAM_GAP_METHOD,
-                    json!({ "fromSequence": from, "toSequence": to }),
+                    json!({ "fromSequence": from, "toSequence": to, "replayThrough": newest }),
                 ),
             ));
         }
@@ -2329,7 +2332,10 @@ exit 7
         let (gap_id, gap) = next_event(&mut stream).await;
         assert_eq!(gap_id, 0, "gap marker has no event id");
         assert_eq!(method_of(&gap), STREAM_GAP_METHOD, "first item: {gap:?}");
-        assert_eq!(gap["params"], json!({"fromSequence": 1, "toSequence": 79}));
+        assert_eq!(
+            gap["params"],
+            json!({"fromSequence": 1, "toSequence": 79, "replayThrough": 1103})
+        );
         let events = collect_turn(&mut stream).await;
         assert_eq!(events[0].0, 80);
         assert_eq!(events.len(), 1024);
@@ -2350,7 +2356,10 @@ exit 7
         let (gap_id, gap) = next_event(&mut stream).await;
         assert_eq!(gap_id, 0, "gap marker has no event id");
         assert_eq!(method_of(&gap), STREAM_GAP_METHOD, "first item: {gap:?}");
-        assert_eq!(gap["params"], json!({"fromSequence": 3, "toSequence": 79}));
+        assert_eq!(
+            gap["params"],
+            json!({"fromSequence": 3, "toSequence": 79, "replayThrough": 1103})
+        );
         let events = collect_turn(&mut stream).await;
         assert_eq!(events[0].0, 80);
         assert_sequences_are_consecutive(&events);

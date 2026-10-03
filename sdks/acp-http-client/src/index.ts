@@ -66,8 +66,9 @@ export interface AcpEnvelopeMeta {
    * True on the first envelope after events were lost on the event stream
    * (the server reported a gap, or the event id jumped, for example because
    * the server's event buffer moved past a reconnecting client), so earlier
-   * state may be incomplete. Prompts waiting for a result over the event
-   * stream are rejected at that point, since their result may have been lost.
+   * state may be incomplete. When the server reports the gap, prompts waiting
+   * for a result over the event stream are rejected unless the events the
+   * server still had deliver it.
    */
   streamGap?: boolean;
 }
@@ -109,9 +110,11 @@ export const SANDBOX_AGENT_INPUT_RESOLVED = "_sandboxagent/session/input_resolve
 /**
  * Marker a Sandbox Agent server sends on the event stream in place of events
  * it can no longer deliver, with params `{fromSequence, toSequence}` (the
- * inclusive range of lost event ids). The transport handles it: it is not
- * delivered, the next envelope is flagged with `streamGap`, and prompts
- * waiting for a result over the event stream are rejected.
+ * inclusive range of lost event ids) and `replayThrough` (id of the last
+ * buffered event replayed right after the marker). The transport handles it:
+ * it is not delivered, the next envelope is flagged with `streamGap`, and
+ * prompts that were waiting for a result over the event stream are rejected
+ * if the replay up to `replayThrough` did not deliver it.
  */
 export const SANDBOX_AGENT_STREAM_GAP = "_sandboxagent/stream/gap";
 /** `_meta` key of the metadata the server adds to `session/prompt` responses. */
@@ -431,6 +434,11 @@ class StreamableHttpAcpTransport {
   // has not been reported to the observer yet.
   private lastReceivedSequence: bigint | undefined;
   private pendingStreamGap = false;
+  // Async prompts that were pending when the server reported lost events.
+  // Their result may still follow in the replay after the gap marker, so they
+  // are rejected only once the event with id `through` (the last replayed
+  // one) was processed without delivering it.
+  private gapRejection: { through: bigint; range: string; ids: Set<string> } | null = null;
   private closed = false;
   private closingPromise: Promise<void> | null = null;
   private postedOnce = false;
@@ -734,6 +742,8 @@ class StreamableHttpAcpTransport {
           // start over, so earlier ids say nothing about gaps.
           this.lastReceivedSequence = undefined;
           this.pendingStreamGap = false;
+          // The replay that could still deliver these results is gone.
+          this.settleGapRejection();
         }
         this.serverGeneration = generation;
         this.sseConnected = true;
@@ -779,20 +789,47 @@ class StreamableHttpAcpTransport {
   }
 
   /**
-   * Events `range` were lost on the event stream. A prompt result delivered
-   * only over the stream may have been among them, so pending async prompts
-   * are rejected instead of waiting forever.
+   * The server reported lost events. A prompt result delivered only over the
+   * event stream may have been among them, so the async prompts pending now
+   * are rejected instead of waiting forever, unless their result arrives in
+   * the replay that follows the marker (through event id `through`).
    */
-  private rejectAsyncPendingAfterGap(range: string): void {
-    this.rejectAsyncPending(`ACP event stream lost events ${range}; the prompt result may have been lost`);
+  private handleStreamGap(gap: StreamGap): void {
+    this.pendingStreamGap = true;
+    const ids = new Set(this.asyncPendingIds.keys());
+    if (this.gapRejection) {
+      for (const id of this.gapRejection.ids) {
+        ids.add(id);
+      }
+    }
+    if (gap.replayThrough === undefined || gap.replayThrough <= gap.toSequence) {
+      // Nothing is replayed after the marker.
+      this.gapRejection = { through: 0n, range: gap.range, ids };
+      this.settleGapRejection();
+      return;
+    }
+    const through = this.gapRejection && this.gapRejection.through > gap.replayThrough ? this.gapRejection.through : gap.replayThrough;
+    this.gapRejection = { through, range: gap.range, ids };
   }
 
-  private rejectAsyncPending(message: string): void {
+  /** Rejects the prompts of a reported gap whose result did not arrive. */
+  private settleGapRejection(): void {
+    const rejection = this.gapRejection;
+    if (!rejection) {
+      return;
+    }
+    this.gapRejection = null;
+    this.rejectAsyncPending(`ACP event stream lost events ${rejection.range}; the prompt result may have been lost`, rejection.ids);
+  }
+
+  private rejectAsyncPending(message: string, only?: Set<string>): void {
     if (this.asyncPendingIds.size === 0) {
       return;
     }
-    const ids = [...this.asyncPendingIds.values()];
-    this.asyncPendingIds.clear();
+    const ids = [...this.asyncPendingIds.values()].filter((id) => only === undefined || only.has(id));
+    for (const id of ids) {
+      this.asyncPendingIds.delete(id);
+    }
     for (const id of ids) {
       this.pushInbound({
         jsonrpc: "2.0",
@@ -858,13 +895,15 @@ class StreamableHttpAcpTransport {
       }
     }
 
-    let skipped: string | undefined;
+    let sequence: bigint | undefined;
     if (eventId) {
       this.lastEventId = eventId;
       if (/^\d+$/.test(eventId)) {
-        const sequence = BigInt(eventId);
+        sequence = BigInt(eventId);
         if (this.lastReceivedSequence !== undefined && sequence > this.lastReceivedSequence + 1n) {
-          skipped = `${this.lastReceivedSequence + 1n}-${sequence - 1n}`;
+          // Servers without gap markers: the id jump is the only sign of
+          // loss. Only flag it; a pending prompt is not rejected on a guess.
+          this.pendingStreamGap = true;
         }
         if (this.lastReceivedSequence === undefined || sequence > this.lastReceivedSequence) {
           this.lastReceivedSequence = sequence;
@@ -882,23 +921,17 @@ class StreamableHttpAcpTransport {
     }
 
     const envelope = JSON.parse(payloadText) as AnyMessage;
-    const gap = streamGapRange(envelope);
+    const gap = parseStreamGap(envelope);
     if (gap !== null) {
       // The server's marker for events it can no longer deliver. It has no
       // event id; the transport handles it and does not deliver it.
-      this.pendingStreamGap = true;
-      this.rejectAsyncPendingAfterGap(gap);
+      this.handleStreamGap(gap);
       return;
     }
-    if (skipped === undefined) {
-      this.pushInbound(envelope, eventId ?? undefined);
-      return;
-    }
-    // Servers without gap markers: the id jump is the only sign of loss.
-    // Deliver this event first, in case it is the awaited prompt result.
-    this.pendingStreamGap = true;
     this.pushInbound(envelope, eventId ?? undefined);
-    this.rejectAsyncPendingAfterGap(skipped);
+    if (this.gapRejection && sequence !== undefined && sequence >= this.gapRejection.through) {
+      this.settleGapRejection();
+    }
   }
 
   private pushInbound(envelope: AnyMessage, eventId?: string): void {
@@ -1032,13 +1065,29 @@ function buildClientHandlers(client?: Partial<Client>): Client {
   };
 }
 
-/** `from-to` range of a stream gap marker, or null for any other envelope. */
-function streamGapRange(message: AnyMessage): string | null {
-  const record = message as { method?: unknown; params?: { fromSequence?: unknown; toSequence?: unknown } };
+interface StreamGap {
+  /** `from-to` range of lost event ids, for messages. */
+  range: string;
+  toSequence: bigint;
+  replayThrough?: bigint;
+}
+
+function toSequence(value: unknown): bigint | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : undefined;
+}
+
+/** Params of a stream gap marker, or null for any other envelope. */
+function parseStreamGap(message: AnyMessage): StreamGap | null {
+  const record = message as { method?: unknown; params?: { fromSequence?: unknown; toSequence?: unknown; replayThrough?: unknown } };
   if (record.method !== SANDBOX_AGENT_STREAM_GAP) {
     return null;
   }
-  return `${String(record.params?.fromSequence ?? "?")}-${String(record.params?.toSequence ?? "?")}`;
+  const to = toSequence(record.params?.toSequence);
+  return {
+    range: `${String(record.params?.fromSequence ?? "?")}-${String(record.params?.toSequence ?? "?")}`,
+    toSequence: to ?? 0n,
+    replayThrough: to === undefined ? undefined : toSequence(record.params?.replayThrough),
+  };
 }
 
 function responseEnvelopeId(message: AnyMessage): string | null {

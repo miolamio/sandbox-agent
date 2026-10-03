@@ -3819,6 +3819,15 @@ async fn acp_sse_translation_task(
                 break;
             }
 
+            // --- Lost events: the event stream already logs the gap ---
+            Some("_sandboxagent/stream/gap") => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    params = ?payload.get("params"),
+                    "ACP SSE: events lost before this point"
+                );
+            }
+
             // --- Not a notification: might be a response to session/prompt ---
             // Responses to initialize/session/new are also broadcast (they
             // arrive in order before prompt responses).  Only treat it as a
