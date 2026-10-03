@@ -188,6 +188,23 @@ rl.on("line", (line) => {
       },
     });
 
+    // "__flood__" emits more updates than the server's event replay buffer holds.
+    if (text.includes("__flood__")) {
+      for (let index = 0; index < 1100; index += 1) {
+        emit({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "flood " + index },
+            },
+          },
+        });
+      }
+    }
+
     if (Array.isArray(authMethods)) {
       emit({
         jsonrpc: "2.0",

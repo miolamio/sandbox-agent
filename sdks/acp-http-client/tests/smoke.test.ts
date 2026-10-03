@@ -531,6 +531,107 @@ describe("AcpHttpClient integration", () => {
     await client.disconnect();
   });
 
+  it("rejects an in-flight async prompt when events were lost while the event stream was down", async () => {
+    const serverId = `acp-http-client-sse-gap-${Date.now().toString(36)}`;
+    const path = `/v1/acp/${encodeURIComponent(serverId)}`;
+    let sseHeld = false;
+    let sseConnects = 0;
+    const activeSse: { close: (() => void) | null } = { close: null };
+    const holdingFetch: typeof fetch = async (input, init) => {
+      if (init?.method !== "GET") {
+        return globalThis.fetch(input, init);
+      }
+      while (sseHeld) {
+        if (init.signal?.aborted) {
+          throw new DOMException("aborted", "AbortError");
+        }
+        await sleep(10);
+      }
+      const response = await globalThis.fetch(input, init);
+      if (!response.ok || !response.body) {
+        return response;
+      }
+      sseConnects += 1;
+      // Pass the real SSE body through a stream the test can end on demand.
+      const reader = response.body.getReader();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          activeSse.close = () => {
+            try {
+              controller.close();
+            } catch {}
+            reader.cancel().catch(() => {});
+          };
+        },
+        async pull(controller) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              controller.close();
+            } else {
+              controller.enqueue(value);
+            }
+          } catch {
+            try {
+              controller.close();
+            } catch {}
+          }
+        },
+        cancel() {
+          reader.cancel().catch(() => {});
+        },
+      });
+      return new Response(body, { status: response.status, headers: response.headers });
+    };
+
+    let permissionSeen = false;
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: holdingFetch,
+      transport: { path, bootstrapQuery: { agent: "mock" } },
+      client: {
+        // Never answer, so the prompt stays pending on the server.
+        requestPermission: () => {
+          permissionSeen = true;
+          return new Promise(() => {});
+        },
+      },
+    });
+    const flooder = new AcpHttpClient({ baseUrl, token, transport: { path, bootstrapQuery: { agent: "mock" } } });
+
+    try {
+      await client.initialize();
+      const session = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await waitFor(() => (sseConnects > 0 ? true : undefined));
+      await sleep(25);
+
+      const outcome = client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "please trigger permission" }] }).then(
+        () => "resolved",
+        (error: unknown) => error,
+      );
+      await waitFor(() => (permissionSeen ? true : undefined));
+
+      // Take the event stream down, then publish more events than the server
+      // buffers for replay.
+      sseHeld = true;
+      activeSse.close?.();
+      await flooder.initialize();
+      const floodSession = await flooder.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await withTimeout(flooder.prompt({ sessionId: floodSession.sessionId, prompt: [{ type: "text", text: "__flood__" }] }), "flood prompt", 15_000);
+
+      // The reconnect replays from an event the server no longer has.
+      sseHeld = false;
+      const result = await Promise.race([outcome, sleep(5_000).then(() => "timed out")]);
+      expect(result).not.toBe("timed out");
+      expect(result).not.toBe("resolved");
+      expect(String((result as { message?: unknown }).message)).toMatch(/lost/i);
+    } finally {
+      await flooder.disconnect({ deleteServer: false }).catch(() => {});
+      await client.disconnect();
+    }
+  });
+
   it("rejects an in-flight async prompt when the event stream cannot be restored", async () => {
     const serverId = `acp-http-client-sse-lost-${Date.now().toString(36)}`;
     let sseConnected = false;

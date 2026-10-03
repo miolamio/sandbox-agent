@@ -152,6 +152,8 @@ console.log(prompt.stopReason);
 
 `session.prompt(...)` resolves when the whole turn ends, which can take as long as the server's agent request timeout (2 hours by default, see `--acp-request-timeout-ms` in the [CLI reference](/cli)). The SDK receives the result over the session's event stream, so a long turn is not cut off by HTTP client timeouts such as the 300 second response-header timeout of Node.js `fetch`. If the event stream is still connecting or reconnecting, the prompt waits up to 10 seconds for it. If the stream cannot connect (for example, the server is unreachable), the prompt is sent as a plain request whose result comes in the HTTP response, and HTTP client timeouts apply again.
 
+The server keeps the most recent 1024 events of each agent server for clients that reconnect. A client that falls behind while connected catches up from these buffered events. If more events were produced while a client was disconnected, the older ones are gone: the server then tells the client which events were lost, and a pending `session.prompt(...)` whose result may have been among them fails with an error saying the events were lost, instead of waiting forever. The turn itself may still be running on the server.
+
 Load and destroy:
 
 ```ts

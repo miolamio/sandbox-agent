@@ -11,7 +11,6 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, oneshot, watch, Mutex};
-use tokio_stream::wrappers::BroadcastStream;
 
 use crate::registry::LaunchSpec;
 
@@ -39,6 +38,10 @@ pub const AWAITING_INPUT_METHOD: &str = "_sandboxagent/session/awaiting_input";
 /// Published once per awaited input: when the client answers it, or when the
 /// turn ends or the agent stops without an answer.
 pub const INPUT_RESOLVED_METHOD: &str = "_sandboxagent/session/input_resolved";
+/// Sent in place of events a stream can no longer deliver because the replay
+/// buffer moved past them. Params `{fromSequence, toSequence}` give the
+/// inclusive range of lost event ids. The marker itself has no event id.
+pub const STREAM_GAP_METHOD: &str = "_sandboxagent/stream/gap";
 /// `_meta` key under which prompt responses carry `{sessionId, sequence}`.
 pub const META_KEY: &str = "sandboxagent.dev";
 
@@ -220,6 +223,94 @@ impl EventLog {
         }
         self.sequence.store(sequence, Ordering::SeqCst);
         payloads
+    }
+}
+
+/// Buffered events after `after` (all of them when `None`), preceded by a gap
+/// marker when the buffer no longer holds the event right after `after`.
+/// Also returns the newest buffered event id: live events up to it are
+/// covered by this replay (or were deliberately skipped by an `after` past it).
+fn replay_after(
+    ring: &VecDeque<StreamMessage>,
+    after: Option<u64>,
+) -> (Vec<(Option<u64>, Value)>, u64) {
+    let newest = ring.back().map(|message| message.sequence).unwrap_or(0);
+    let mut items = Vec::new();
+    if let (Some(after), Some(oldest)) = (after, ring.front()) {
+        if oldest.sequence > after.saturating_add(1) && after < newest {
+            let (from, to) = (after + 1, oldest.sequence - 1);
+            tracing::warn!(
+                from_sequence = from,
+                to_sequence = to,
+                "event stream subscriber is behind the replay buffer; events lost"
+            );
+            items.push((
+                None,
+                notification(
+                    STREAM_GAP_METHOD,
+                    json!({ "fromSequence": from, "toSequence": to }),
+                ),
+            ));
+        }
+    }
+    items.extend(
+        ring.iter()
+            .filter(|message| after.is_none_or(|after| message.sequence > after))
+            .map(|message| (Some(message.sequence), message.payload.clone())),
+    );
+    (items, newest)
+}
+
+/// SSE framing of a stream item. Gap markers carry no event id, so a client's
+/// `Last-Event-ID` keeps pointing at the last real event it received.
+pub fn sse_event(event_id: Option<u64>, payload: &Value) -> Event {
+    let event = Event::default().event("message").data(payload.to_string());
+    match event_id {
+        Some(event_id) => event.id(event_id.to_string()),
+        None => event,
+    }
+}
+
+/// Read position of one event stream.
+struct StreamCursor {
+    ring: Arc<Mutex<VecDeque<StreamMessage>>>,
+    receiver: broadcast::Receiver<StreamMessage>,
+    /// Newest event id delivered or covered by a replay.
+    position: u64,
+    queue: VecDeque<(Option<u64>, Value)>,
+}
+
+impl StreamCursor {
+    async fn next(&mut self) -> Option<(Option<u64>, Value)> {
+        loop {
+            if let Some(item) = self.queue.pop_front() {
+                return Some(item);
+            }
+            match self.receiver.recv().await {
+                Ok(message) => {
+                    if message.sequence > self.position {
+                        self.position = message.sequence;
+                        return Some((Some(message.sequence), message.payload));
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The live channel dropped events for this subscriber.
+                    // Resume from the replay buffer, which holds more. As in
+                    // `payload_stream`, subscribe before taking the snapshot.
+                    tracing::debug!(
+                        skipped,
+                        position = self.position,
+                        "event stream subscriber lagged; resuming from replay buffer"
+                    );
+                    self.receiver = self.receiver.resubscribe();
+                    let (replay, newest) =
+                        replay_after(&*self.ring.lock().await, Some(self.position));
+                    self.position = self.position.max(newest);
+                    self.queue.extend(replay);
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
     }
 }
 
@@ -593,52 +684,46 @@ impl AdapterRuntime {
         });
     }
 
-    async fn subscribe(
-        &self,
-        last_event_id: Option<u64>,
-    ) -> (Vec<(u64, Value)>, u64, broadcast::Receiver<StreamMessage>) {
-        // Subscribe before taking the replay snapshot so a concurrently published
-        // message appears in at least one source. The watermark drops duplicates.
-        let receiver = self.events.sender.subscribe();
-        let ring = self.events.ring.lock().await;
-        let replay_watermark = ring.back().map(|message| message.sequence).unwrap_or(0);
-        let replay = ring
-            .iter()
-            .filter(|message| last_event_id.is_none_or(|last| message.sequence > last))
-            .map(|message| (message.sequence, message.payload.clone()))
-            .collect::<Vec<_>>();
-        (replay, replay_watermark, receiver)
-    }
-
     pub async fn sse_stream(
         self: Arc<Self>,
         last_event_id: Option<u64>,
     ) -> impl Stream<Item = Result<Event, Infallible>> + Send + 'static {
         self.payload_stream(last_event_id)
             .await
-            .map(|(sequence, payload)| {
-                Ok(Event::default()
-                    .event("message")
-                    .id(sequence.to_string())
-                    .data(payload.to_string()))
-            })
+            .map(|(event_id, payload)| Ok(sse_event(event_id, &payload)))
     }
 
-    /// Stream of sequenced raw JSON-RPC payloads (replay followed by live).
+    /// Stream of raw JSON-RPC payloads with their event ids: replay of the
+    /// buffered events after `last_event_id` (all of them when `None`),
+    /// followed by live events.
+    ///
+    /// Events are never skipped silently. A subscriber that falls behind the
+    /// live channel catches up from the replay buffer. When the buffer no
+    /// longer holds the next event (on replay or after falling behind), the
+    /// lost range is reported by a [`STREAM_GAP_METHOD`] marker, which has no
+    /// event id (`None`).
     pub async fn payload_stream(
         self: Arc<Self>,
         last_event_id: Option<u64>,
-    ) -> impl Stream<Item = (u64, Value)> + Send + 'static {
-        let (replay, replay_watermark, rx) = self.subscribe(last_event_id).await;
-        let live_stream = BroadcastStream::new(rx).filter_map(move |item| async move {
-            match item {
-                Ok(message) if message.sequence > replay_watermark => {
-                    Some((message.sequence, message.payload))
-                }
-                _ => None,
-            }
-        });
-        stream::iter(replay).chain(live_stream)
+    ) -> impl Stream<Item = (Option<u64>, Value)> + Send + 'static {
+        // Hold only the ring and a receiver: holding the sender would keep the
+        // stream open after the runtime is dropped.
+        let ring = self.events.ring.clone();
+        // Subscribe before taking the replay snapshot so a concurrently
+        // published event appears in at least one source. The position drops
+        // duplicates.
+        let receiver = self.events.sender.subscribe();
+        let (replay, position) = replay_after(&*ring.lock().await, last_event_id);
+        let cursor = StreamCursor {
+            ring,
+            receiver,
+            position,
+            queue: replay.into(),
+        };
+        stream::unfold(cursor, |mut cursor| async move {
+            let item = cursor.next().await?;
+            Some((item, cursor))
+        })
     }
 
     /// Stream of raw JSON-RPC `Value` payloads (without SSE framing).
@@ -650,7 +735,7 @@ impl AdapterRuntime {
     ) -> impl Stream<Item = Value> + Send + 'static {
         self.payload_stream(last_event_id)
             .await
-            .map(|(_sequence, payload)| payload)
+            .map(|(_event_id, payload)| payload)
     }
 
     /// Stops the agent with the default grace period
@@ -1548,8 +1633,19 @@ exit 7
 
     type PayloadStream = std::pin::Pin<Box<dyn Stream<Item = (u64, Value)> + Send>>;
 
+    /// Stream from `last_event_id`, with gap markers (no event id) as id 0.
+    async fn stream_from(runtime: &Arc<AdapterRuntime>, last_event_id: u64) -> PayloadStream {
+        Box::pin(
+            runtime
+                .clone()
+                .payload_stream(Some(last_event_id))
+                .await
+                .map(|(event_id, payload)| (event_id.unwrap_or(0), payload)),
+        )
+    }
+
     async fn open_stream(runtime: &Arc<AdapterRuntime>) -> PayloadStream {
-        Box::pin(runtime.clone().payload_stream(Some(0)).await)
+        stream_from(runtime, 0).await
     }
 
     async fn next_event(stream: &mut PayloadStream) -> (u64, Value) {
@@ -2174,5 +2270,107 @@ exit 7
             .expect("pending post wakes after shutdown")
             .expect("join");
         assert!(result.is_err(), "pending post should fail: {result:?}");
+    }
+
+    // ---- Lost events (SBA-45) ----
+
+    /// Agent that answers the first request with `updates` session updates
+    /// followed by the response for request id `response_id`.
+    async fn flooding_runtime(updates: usize, response_id: u64) -> Arc<AdapterRuntime> {
+        let script = format!(
+            "IFS= read -r line; i=0; while [ $i -lt {updates} ]; do {}i=$((i+1)); done; {}IFS= read -r _never",
+            emit(UPDATE_S1),
+            emit(&format!(
+                r#"{{"jsonrpc":"2.0","id":{response_id},"result":{{"stopReason":"end_turn"}}}}"#
+            ))
+        );
+        Arc::new(
+            AdapterRuntime::start(sh(&script), Duration::from_secs(10))
+                .await
+                .expect("start adapter"),
+        )
+    }
+
+    #[tokio::test]
+    async fn lagging_subscriber_catches_up_from_replay_buffer() {
+        // More events than the live channel holds, fewer than the replay buffer.
+        let runtime = flooding_runtime(700, 5).await;
+        let mut stream = open_stream(&runtime).await;
+
+        // The stream is not read while the turn runs, so it falls behind.
+        runtime
+            .post(session_prompt(json!(5), "s1"))
+            .await
+            .expect("prompt response");
+
+        let events = collect_turn(&mut stream).await;
+        assert_eq!(
+            events.len(),
+            703,
+            "turn_started + 700 updates + response + turn_ended"
+        );
+        assert_eq!(events[0].0, 1);
+        assert_sequences_are_consecutive(&events);
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lagging_subscriber_past_replay_buffer_gets_gap_marker() {
+        let runtime = flooding_runtime(1100, 5).await;
+        let mut stream = open_stream(&runtime).await;
+
+        runtime
+            .post(session_prompt(json!(5), "s1"))
+            .await
+            .expect("prompt response");
+
+        // 1103 events were published, the buffer keeps the last 1024.
+        let (gap_id, gap) = next_event(&mut stream).await;
+        assert_eq!(gap_id, 0, "gap marker has no event id");
+        assert_eq!(method_of(&gap), STREAM_GAP_METHOD, "first item: {gap:?}");
+        assert_eq!(gap["params"], json!({"fromSequence": 1, "toSequence": 79}));
+        let events = collect_turn(&mut stream).await;
+        assert_eq!(events[0].0, 80);
+        assert_eq!(events.len(), 1024);
+        assert_sequences_are_consecutive(&events);
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_from_evicted_event_id_starts_with_gap_marker() {
+        let runtime = flooding_runtime(1100, 5).await;
+        runtime
+            .post(session_prompt(json!(5), "s1"))
+            .await
+            .expect("prompt response");
+
+        let mut stream = stream_from(&runtime, 2).await;
+        let (gap_id, gap) = next_event(&mut stream).await;
+        assert_eq!(gap_id, 0, "gap marker has no event id");
+        assert_eq!(method_of(&gap), STREAM_GAP_METHOD, "first item: {gap:?}");
+        assert_eq!(gap["params"], json!({"fromSequence": 3, "toSequence": 79}));
+        let events = collect_turn(&mut stream).await;
+        assert_eq!(events[0].0, 80);
+        assert_sequences_are_consecutive(&events);
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_without_lost_events_has_no_gap_marker() {
+        let runtime = flooding_runtime(1100, 5).await;
+        runtime
+            .post(session_prompt(json!(5), "s1"))
+            .await
+            .expect("prompt response");
+
+        let mut stream = stream_from(&runtime, 79).await;
+        let events = collect_turn(&mut stream).await;
+        assert_eq!(events[0].0, 80);
+        assert_eq!(events.len(), 1024);
+
+        runtime.shutdown().await;
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use acp_http_adapter::process::{
-    AdapterError, AdapterRuntime, PostMode, PostOutcome, RuntimeOptions,
+    sse_event, AdapterError, AdapterRuntime, PostMode, PostOutcome, RuntimeOptions,
 };
 use acp_http_adapter::registry::LaunchSpec;
 use axum::response::sse::Event;
@@ -89,7 +89,8 @@ pub struct AcpServerInstanceInfo {
 
 pub type PinBoxSseStream =
     std::pin::Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>;
-type PinBoxPayloadStream = std::pin::Pin<Box<dyn Stream<Item = (u64, Value)> + Send>>;
+/// Payloads with their event ids; `None` for unnumbered gap markers.
+type PinBoxPayloadStream = std::pin::Pin<Box<dyn Stream<Item = (Option<u64>, Value)> + Send>>;
 
 impl ProxyInstance {
     /// Stream payloads with the same error diagnostics that POST responses get,
@@ -101,7 +102,7 @@ impl ProxyInstance {
         // its broadcast sender) alive, so the stream would never close after
         // DELETE/shutdown and the runtime would leak.
         let runtime = Arc::downgrade(&self.runtime);
-        Box::pin(stream.then(move |(sequence, value)| {
+        Box::pin(stream.then(move |(event_id, value)| {
             let runtime = runtime.upgrade();
             async move {
                 let value = annotate_agent_error(agent, value);
@@ -109,7 +110,7 @@ impl ProxyInstance {
                     Some(runtime) => annotate_agent_stderr(value, &runtime).await,
                     None => value,
                 };
-                (sequence, value)
+                (event_id, value)
             }
         }))
     }
@@ -260,16 +261,10 @@ impl AcpProxyRuntime {
     ) -> Result<(i64, PinBoxSseStream), SandboxError> {
         let instance = self.get_instance(server_id).await?;
         let generation = instance.created_at_ms;
-        let stream =
-            instance
-                .annotated_payload_stream(last_event_id)
-                .await
-                .map(|(sequence, payload)| {
-                    Ok(Event::default()
-                        .event("message")
-                        .id(sequence.to_string())
-                        .data(payload.to_string()))
-                });
+        let stream = instance
+            .annotated_payload_stream(last_event_id)
+            .await
+            .map(|(event_id, payload)| Ok(sse_event(event_id, &payload)));
         Ok((generation, Box::pin(stream)))
     }
 
@@ -611,7 +606,7 @@ impl AcpDispatch for AcpProxyRuntime {
             let stream = instance
                 .annotated_payload_stream(last_event_id)
                 .await
-                .map(|(_sequence, payload)| payload);
+                .map(|(_event_id, payload)| payload);
             Ok(Box::pin(stream) as AcpPayloadStream)
         })
     }

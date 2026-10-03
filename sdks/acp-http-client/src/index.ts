@@ -63,9 +63,11 @@ export interface AcpEnvelopeMeta {
    */
   serverGeneration?: string;
   /**
-   * True on the first envelope after events were skipped on the event stream
-   * (the event id jumped, for example because the server's event buffer moved
-   * past a reconnecting client), so earlier state may be incomplete.
+   * True on the first envelope after events were lost on the event stream
+   * (the server reported a gap, or the event id jumped, for example because
+   * the server's event buffer moved past a reconnecting client), so earlier
+   * state may be incomplete. Prompts waiting for a result over the event
+   * stream are rejected at that point, since their result may have been lost.
    */
   streamGap?: boolean;
 }
@@ -104,6 +106,14 @@ export const SANDBOX_AGENT_TURN_STARTED = "_sandboxagent/session/turn_started";
 export const SANDBOX_AGENT_TURN_ENDED = "_sandboxagent/session/turn_ended";
 export const SANDBOX_AGENT_AWAITING_INPUT = "_sandboxagent/session/awaiting_input";
 export const SANDBOX_AGENT_INPUT_RESOLVED = "_sandboxagent/session/input_resolved";
+/**
+ * Marker a Sandbox Agent server sends on the event stream in place of events
+ * it can no longer deliver, with params `{fromSequence, toSequence}` (the
+ * inclusive range of lost event ids). The transport handles it: it is not
+ * delivered, the next envelope is flagged with `streamGap`, and prompts
+ * waiting for a result over the event stream are rejected.
+ */
+export const SANDBOX_AGENT_STREAM_GAP = "_sandboxagent/stream/gap";
 /** `_meta` key of the metadata the server adds to `session/prompt` responses. */
 export const SANDBOX_AGENT_META_KEY = "sandboxagent.dev";
 
@@ -764,20 +774,30 @@ class StreamableHttpAcpTransport {
   }
 
   private failAsyncPending(cause: unknown): void {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    this.rejectAsyncPending(`ACP event stream unavailable; the prompt result could not be delivered (${reason})`);
+  }
+
+  /**
+   * Events `range` were lost on the event stream. A prompt result delivered
+   * only over the stream may have been among them, so pending async prompts
+   * are rejected instead of waiting forever.
+   */
+  private rejectAsyncPendingAfterGap(range: string): void {
+    this.rejectAsyncPending(`ACP event stream lost events ${range}; the prompt result may have been lost`);
+  }
+
+  private rejectAsyncPending(message: string): void {
     if (this.asyncPendingIds.size === 0) {
       return;
     }
-    const reason = cause instanceof Error ? cause.message : String(cause);
     const ids = [...this.asyncPendingIds.values()];
     this.asyncPendingIds.clear();
     for (const id of ids) {
       this.pushInbound({
         jsonrpc: "2.0",
         id,
-        error: {
-          code: -32603,
-          message: `ACP event stream unavailable; the prompt result could not be delivered (${reason})`,
-        },
+        error: { code: -32603, message },
       } as AnyMessage);
     }
   }
@@ -838,12 +858,13 @@ class StreamableHttpAcpTransport {
       }
     }
 
+    let skipped: string | undefined;
     if (eventId) {
       this.lastEventId = eventId;
       if (/^\d+$/.test(eventId)) {
         const sequence = BigInt(eventId);
         if (this.lastReceivedSequence !== undefined && sequence > this.lastReceivedSequence + 1n) {
-          this.pendingStreamGap = true;
+          skipped = `${this.lastReceivedSequence + 1n}-${sequence - 1n}`;
         }
         if (this.lastReceivedSequence === undefined || sequence > this.lastReceivedSequence) {
           this.lastReceivedSequence = sequence;
@@ -861,7 +882,23 @@ class StreamableHttpAcpTransport {
     }
 
     const envelope = JSON.parse(payloadText) as AnyMessage;
+    const gap = streamGapRange(envelope);
+    if (gap !== null) {
+      // The server's marker for events it can no longer deliver. It has no
+      // event id; the transport handles it and does not deliver it.
+      this.pendingStreamGap = true;
+      this.rejectAsyncPendingAfterGap(gap);
+      return;
+    }
+    if (skipped === undefined) {
+      this.pushInbound(envelope, eventId ?? undefined);
+      return;
+    }
+    // Servers without gap markers: the id jump is the only sign of loss.
+    // Deliver this event first, in case it is the awaited prompt result.
+    this.pendingStreamGap = true;
     this.pushInbound(envelope, eventId ?? undefined);
+    this.rejectAsyncPendingAfterGap(skipped);
   }
 
   private pushInbound(envelope: AnyMessage, eventId?: string): void {
@@ -993,6 +1030,15 @@ function buildClientHandlers(client?: Partial<Client>): Client {
       }
     },
   };
+}
+
+/** `from-to` range of a stream gap marker, or null for any other envelope. */
+function streamGapRange(message: AnyMessage): string | null {
+  const record = message as { method?: unknown; params?: { fromSequence?: unknown; toSequence?: unknown } };
+  if (record.method !== SANDBOX_AGENT_STREAM_GAP) {
+    return null;
+  }
+  return `${String(record.params?.fromSequence ?? "?")}-${String(record.params?.toSequence ?? "?")}`;
 }
 
 function responseEnvelopeId(message: AnyMessage): string | null {
