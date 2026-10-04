@@ -2837,7 +2837,10 @@ export class SandboxAgent {
           }
         }
         if (attached) {
-          if (!(await this.isAcpServerListedForOtherAgent(preferred, agent))) {
+          const otherAgent = await this.isAcpServerListedForOtherAgent(preferred, agent);
+          // dispose() may have run during the list call and closed `attached`.
+          this.assertNotDisposed();
+          if (!otherAgent) {
             return attached;
           }
           // The id now belongs to a server of another agent: leave it running
@@ -2846,6 +2849,8 @@ export class SandboxAgent {
         }
       }
     }
+    // The checks above await the server; nothing is reused or started after dispose().
+    this.assertNotDisposed();
 
     for (const connection of this.liveConnections.values()) {
       if (connection.agent === agent) {
