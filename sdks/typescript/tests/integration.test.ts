@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -154,6 +154,35 @@ async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 15
       throw new Error(`${label} timed out after ${timeoutMs}ms`);
     }),
   ]);
+}
+
+/** Settles a promise to its outcome, so it can be awaited with a deadline without an unhandled rejection. */
+function settle<T>(promise: Promise<T>): Promise<{ ok: true; value: T } | { ok: false; error: Error }> {
+  return promise.then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error: error instanceof Error ? error : new Error(String(error)) }),
+  );
+}
+
+/** Ids of the agent servers the server lists right now. */
+async function listServerIds(baseUrl: string, token: string | undefined): Promise<string[]> {
+  const response = await fetch(`${baseUrl}/v1/acp`, { headers: token ? { Authorization: `Bearer ${token}` } : undefined });
+  expect(response.ok).toBe(true);
+  const body = (await response.json()) as { servers: Array<{ serverId: string }> };
+  return body.servers.map((server) => server.serverId);
+}
+
+/**
+ * A fetch that passes every request to the server unchanged and calls `onRequest`
+ * first, so a test can act (for example dispose a client) at a precise moment.
+ */
+function createObservingFetch(onRequest: (method: string, url: URL) => void | Promise<void>): typeof fetch {
+  return async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+    await onRequest(method, url);
+    return fetch(input, init);
+  };
 }
 
 async function deleteAcpServer(baseUrl: string, token: string | undefined, serverId: string): Promise<void> {
@@ -1744,6 +1773,225 @@ describe("Integration: TypeScript SDK flat session API", () => {
     } finally {
       await observer.dispose();
       await author.dispose();
+    }
+  });
+
+  it("rejects a prompt in flight when its client is disposed", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const turnEvents: SessionTurnEvent[] = [];
+      session.onTurnEvent((event) => turnEvents.push(event));
+      const prompt = settle(session.prompt([{ type: "text", text: "held delay:10000" }]));
+      await waitFor(() => turnEvents.find((event) => event.type === "turn_started"));
+
+      await sdk.dispose();
+
+      const outcome = await withTimeout(prompt, "prompt after dispose", 3_000);
+      expect(outcome.ok).toBe(false);
+      expect((outcome as { error: Error }).error.name).toBe("SandboxAgentDisposedError");
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("rejects a prompt in flight when an attached client is disposed, and the owner's turn goes on", async () => {
+    const { author, observer, session, watched } = await connectAuthorAndObserver();
+    try {
+      const turnEvents: SessionTurnEvent[] = [];
+      watched.onTurnEvent((event) => turnEvents.push(event));
+      const prompt = settle(watched.prompt([{ type: "text", text: "held delay:10000" }]));
+      await waitFor(() => turnEvents.find((event) => event.type === "turn_started"));
+
+      await observer.dispose();
+
+      const outcome = await withTimeout(prompt, "observer prompt after dispose", 3_000);
+      expect(outcome.ok).toBe(false);
+      expect((outcome as { error: Error }).error.name).toBe("SandboxAgentDisposedError");
+      expect(await listServerIds(baseUrl, token)).toContain(session.serverId);
+      await expect(withTimeout(session.prompt([{ type: "text", text: "author goes on" }]), "author prompt")).resolves.toMatchObject({
+        stopReason: "end_turn",
+      });
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("does not start an agent server for session calls after dispose", async () => {
+    const persist = new InMemorySessionPersistDriver();
+    const sdk = await SandboxAgent.connect({ baseUrl, token, persist });
+    const session = await sdk.createSession({ agent: "mock" });
+    await sdk.dispose();
+    expect(await listServerIds(baseUrl, token)).toEqual([]);
+
+    const calls = {
+      prompt: settle(session.prompt([{ type: "text", text: "after dispose" }])),
+      setMode: settle(session.setMode("plan")),
+      resumeSession: settle(sdk.resumeSession(session.id)),
+      createSession: settle(sdk.createSession({ agent: "mock" })),
+    };
+    for (const [name, call] of Object.entries(calls)) {
+      const outcome = await withTimeout(call, `${name} after dispose`, 5_000);
+      expect(outcome.ok, name).toBe(false);
+      expect((outcome as { error: Error }).error.name, name).toBe("SandboxAgentDisposedError");
+    }
+    expect(await listServerIds(baseUrl, token)).toEqual([]);
+    expect((await persist.getSession(session.id))?.serverId).toBe(session.serverId);
+  });
+
+  it("disposing while a session restore checks the server list leaves no server behind", async () => {
+    const persist = new InMemorySessionPersistDriver();
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const session = await author.createSession({ agent: "mock" });
+    await author.dispose();
+
+    let disposeOnList = true;
+    let client: SandboxAgent | undefined;
+    const fetcher = createObservingFetch(async (method, url) => {
+      if (disposeOnList && method === "GET" && url.pathname === "/v1/acp") {
+        disposeOnList = false;
+        await client!.dispose();
+      }
+    });
+    client = await SandboxAgent.connect({ baseUrl, token, persist, fetch: fetcher });
+    try {
+      const outcome = await withTimeout(settle(client.resumeSession(session.id)), "resume during dispose", 5_000);
+      expect(disposeOnList).toBe(false);
+      expect(outcome.ok).toBe(false);
+      expect((outcome as { error: Error }).error.name).toBe("SandboxAgentDisposedError");
+      await sleep(200);
+      expect(await listServerIds(baseUrl, token)).toEqual([]);
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it("disposing while a session restore starts its agent server leaves no server behind", async () => {
+    const persist = new InMemorySessionPersistDriver();
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const session = await author.createSession({ agent: "mock" });
+    await author.dispose();
+
+    let disposing: Promise<void> | undefined;
+    let client: SandboxAgent | undefined;
+    const fetcher = createObservingFetch((method, url) => {
+      // The first POST to a new server carries the agent so the server creates it.
+      if (!disposing && method === "POST" && url.searchParams.get("agent") === "mock") {
+        disposing = client!.dispose();
+      }
+    });
+    client = await SandboxAgent.connect({ baseUrl, token, persist, fetch: fetcher });
+    try {
+      const outcome = await withTimeout(settle(client.resumeSession(session.id)), "resume during dispose", 5_000);
+      expect(disposing).toBeDefined();
+      await withTimeout(disposing!, "dispose");
+      expect(outcome.ok).toBe(false);
+      expect((outcome as { error: Error }).error.name).toBe("SandboxAgentDisposedError");
+      await sleep(200);
+      expect(await listServerIds(baseUrl, token)).toEqual([]);
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it("restores a session once when two prompts need the restore at the same time", async () => {
+    const persist = new InMemorySessionPersistDriver();
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const session = await author.createSession({ agent: "mock" });
+    await author.dispose();
+
+    const client = await SandboxAgent.connect({ baseUrl, token, persist });
+    try {
+      const handle = (await client.getSession(session.id))!;
+      const results = await withTimeout(
+        Promise.all([handle.prompt([{ type: "text", text: "parallel one" }]), handle.prompt([{ type: "text", text: "parallel two" }])]),
+        "parallel prompts",
+      );
+      expect(results.map((result) => result.stopReason)).toEqual(["end_turn", "end_turn"]);
+
+      const record = await persist.getSession(session.id);
+      expect(await listServerIds(baseUrl, token)).toEqual([record?.serverId]);
+      const handleAfter = await client.getSession(session.id);
+      expect(handleAfter?.agentSessionId).toBe(record?.agentSessionId);
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it("a late session-not-found for an older agent session does not undo a newer restore", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      const firstAgentSessionId = session.agentSessionId;
+      // Fails with "session not found" for the first agent session 1.5 s later.
+      const late = settle(session.prompt([{ type: "text", text: "late notfound-after:1500" }]));
+      await sleep(200);
+
+      // The agent forgets the session: the next prompt restores it on a new agent session.
+      await session.rawSend("_mock/forget_session", {});
+      await expect(withTimeout(session.prompt([{ type: "text", text: "after forget" }]), "prompt after forget")).resolves.toMatchObject({
+        stopReason: "end_turn",
+      });
+      const restoredAgentSessionId = (await sdk.getSession(session.id))?.agentSessionId;
+      expect(restoredAgentSessionId).toBeTruthy();
+      expect(restoredAgentSessionId).not.toBe(firstAgentSessionId);
+
+      // The late error is about the old agent session: the restored session is kept
+      // and the prompt, which the agent did not run, is sent on it.
+      const outcome = await withTimeout(late, "late prompt", 10_000);
+      expect(outcome.ok).toBe(true);
+      expect((await sdk.getSession(session.id))?.agentSessionId).toBe(restoredAgentSessionId);
+      await expect(withTimeout(session.prompt([{ type: "text", text: "still restored" }]), "prompt after late error")).resolves.toMatchObject({
+        stopReason: "end_turn",
+      });
+      expect((await sdk.getSession(session.id))?.agentSessionId).toBe(restoredAgentSessionId);
+    } finally {
+      await sdk.dispose();
+    }
+  });
+
+  it("does not replace a session with a new one when resuming it fails for a transient reason", async () => {
+    const persist = new InMemorySessionPersistDriver();
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist });
+    try {
+      const session = await author.createSession({ agent: "mock" });
+      await session.prompt([{ type: "text", text: "history" }]);
+      await session.rawSend("_mock/fail_next_resume", { code: -32603, message: "temporary failure" });
+
+      const outcome = await withTimeout(settle(observer.resumeSession(session.id)), "resume with transient failure");
+      expect(outcome.ok).toBe(false);
+      expect((outcome as { error: Error }).error.message).toContain("temporary failure");
+      expect((await persist.getSession(session.id))?.agentSessionId).toBe(session.agentSessionId);
+
+      // Trying again resumes the same agent session.
+      const watched = await withTimeout(observer.resumeSession(session.id), "second resume");
+      expect(watched.agentSessionId).toBe(session.agentSessionId);
+      expect(watched.serverId).toBe(session.serverId);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("delivers turn events to every listener when one listener throws", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const session = await sdk.createSession({ agent: "mock" });
+      session.onTurnEvent(() => {
+        throw new Error("listener failure");
+      });
+      const received: SessionTurnEvent[] = [];
+      session.onTurnEvent((event) => received.push(event));
+
+      await withTimeout(session.prompt([{ type: "text", text: "listeners" }]), "prompt");
+      await waitFor(() => received.find((event) => event.type === "turn_ended"));
+      expect(received.map((event) => event.type)).toEqual(["turn_started", "turn_ended"]);
+    } finally {
+      errors.mockRestore();
+      await sdk.dispose();
     }
   });
 

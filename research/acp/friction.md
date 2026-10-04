@@ -423,3 +423,11 @@ Update this file continuously during the migration.
 - Owner: Unassigned.
 - Status: resolved
 - Links: `sdks/typescript/src/client.ts`, `sdks/acp-http-client/src/index.ts`, `server/packages/sandbox-agent/src/cli.rs`, `sdks/typescript/tests/integration.test.ts`
+
+- Date: 2026-10-04
+- Area: SDK `dispose()` lifecycle and restore races (SBA-55, SBA-48)
+- Issue: `@agentclientprotocol/sdk` 0.16.1 only aborts its signal when the stream ends; requests still pending, and requests whose write fails after close, never settle. So a prompt in flight hung forever after `dispose()`. After `dispose()` a session call could also start a new, unmanaged agent server (lazy restore), and `dispose()` racing a restore left the restore hanging on a closed connection. A late "session not found" for an older agent session unbound the newer one and started a second restore from a stale record; any error from `session/resume` (also transient ones) replaced the agent session and lost its history.
+- Decision: `acp-http-client` races every request with a rejection that fires when the transport closes (`disconnect()` or a failed readable) and rejects requests sent afterwards, with `AcpClientClosedError`. The SDK refuses session calls after `dispose()` and turns failures of calls cut off by `dispose()` into `SandboxAgentDisposedError` (no recovery, no resend, SBA-27 rule). A connection that finishes opening after `dispose()` is closed at once (deleting its server only if it created it). Unbinding on "session not found" checks the agent session id; `restoreSession` re-reads the record and reuses a restore that finished meanwhile; restore-internal calls never start a nested restore. Resume falls back to a new agent session only on -32601/-32002/-32602. "Session not found" text heuristics ignore HTTP (-32003) rejections. Out of scope: the replay containing the resent prompt (SBA-57).
+- Owner: Unassigned.
+- Status: resolved
+- Links: `sdks/acp-http-client/src/index.ts`, `sdks/typescript/src/client.ts`, `sdks/typescript/tests/integration.test.ts`, `sdks/acp-http-client/tests/smoke.test.ts`, `docs/sdk-overview.mdx`, `docs/session-restoration.mdx`

@@ -452,6 +452,19 @@ export class SessionRequestInterruptedError extends Error {
   }
 }
 
+/**
+ * Thrown by session calls made after `dispose()` (they never start an agent
+ * server or restore a session), and by a request that was still running when
+ * `dispose()` was called. Such a request is not repeated, because the agent
+ * may already have run it.
+ */
+export class SandboxAgentDisposedError extends Error {
+  constructor(options?: { cause?: unknown }) {
+    super("SandboxAgent was disposed", options);
+    this.name = "SandboxAgentDisposedError";
+  }
+}
+
 export class Session {
   private record: SessionRecord;
   private readonly sandbox: SandboxAgent;
@@ -711,7 +724,8 @@ export class LiveAcpConnection {
     attach?: boolean;
     onObservedEnvelope: ObservedEnvelopeHandler;
     onPermissionRequest: PermissionRequestHandler;
-    onTurnEvent: TurnNotificationHandler;
+    /** Receives turn lifecycle notifications. Optional; they are dropped without it. */
+    onTurnEvent?: TurnNotificationHandler;
   }): Promise<LiveAcpConnection> {
     const connectionId = randomId();
     const attach = options.attach === true;
@@ -778,7 +792,7 @@ export class LiveAcpConnection {
       acp,
       options.onObservedEnvelope,
       options.onPermissionRequest,
-      options.onTurnEvent,
+      options.onTurnEvent ?? (() => {}),
     );
 
     if (initResult.authMethods && initResult.authMethods.length > 0) {
@@ -821,8 +835,16 @@ export class LiveAcpConnection {
     this.localByAgentSessionId.set(agentSessionId, localSessionId);
   }
 
-  unbindSession(localSessionId: string): void {
+  /**
+   * Forgets the agent session bound to a local session. With
+   * `expectedAgentSessionId`, only when that is still the bound one, so a late
+   * error about an older agent session does not drop a newer binding.
+   */
+  unbindSession(localSessionId: string, expectedAgentSessionId?: string): void {
     const agentSessionId = this.sessionByLocalId.get(localSessionId);
+    if (expectedAgentSessionId !== undefined && agentSessionId !== expectedAgentSessionId) {
+      return;
+    }
     if (agentSessionId && this.localByAgentSessionId.get(agentSessionId) === localSessionId) {
       this.localByAgentSessionId.delete(agentSessionId);
     }
@@ -1566,12 +1588,18 @@ export class SandboxAgent {
     if (!request.agent.trim()) {
       throw new Error("createSession requires a non-empty agent");
     }
+    this.assertNotDisposed();
 
     const localSessionId = request.id?.trim() || randomId();
-    const live = await this.getLiveConnection(request.agent.trim());
     const sessionInit = normalizeSessionInit(request.sessionInit, request.cwd, this.sandboxProvider?.defaultCwd);
-
-    const response = await live.createRemoteSession(localSessionId, sessionInit);
+    let live: LiveAcpConnection;
+    let response: NewSessionResponse;
+    try {
+      live = await this.getLiveConnection(request.agent.trim());
+      response = await live.createRemoteSession(localSessionId, sessionInit);
+    } catch (error) {
+      throw this.disposedErrorOr(error);
+    }
 
     const record: SessionRecord = {
       id: localSessionId,
@@ -1613,6 +1641,7 @@ export class SandboxAgent {
   }
 
   async resumeSession(id: string): Promise<Session> {
+    this.assertNotDisposed();
     const existing = await this.persist.getSession(id);
     if (!existing) {
       throw new Error(`session '${id}' not found`);
@@ -1634,12 +1663,26 @@ export class SandboxAgent {
    * the previous mode and config options are applied again.
    */
   private restoreSession(existing: SessionRecord): Promise<Session> {
+    if (this.disposed) {
+      return Promise.reject(new SandboxAgentDisposedError());
+    }
     const pending = this.pendingSessionRestores.get(existing.id);
     if (pending) {
       return pending;
     }
 
     const restoring = (async () => {
+      // The caller's record can be stale: a restore that finished after it was
+      // read already bound the session again here. Use that one instead of
+      // starting a second restore (an orphaned agent session and a second replay).
+      const latest = await this.persist.getSession(existing.id);
+      if (latest && (latest.agentSessionId !== existing.agentSessionId || latest.lastConnectionId !== existing.lastConnectionId)) {
+        const bound = this.findBoundLiveConnection(latest);
+        if (bound && latest.lastConnectionId === bound.connectionId) {
+          return this.upsertSessionHandle(latest);
+        }
+      }
+
       const live = await this.getLiveConnection(existing.agent, existing.serverId);
       const sessionInit = normalizeSessionInit(existing.sessionInit, undefined, this.sandboxProvider?.defaultCwd);
 
@@ -1647,7 +1690,9 @@ export class SandboxAgent {
       const restored = resumed ?? (await this.recreateRemoteSession(existing, live, sessionInit));
 
       return this.reapplySessionSettings(existing, restored);
-    })();
+    })().catch((error: unknown) => {
+      throw this.disposedErrorOr(error);
+    });
 
     this.pendingSessionRestores.set(existing.id, restoring);
     return restoring.finally(() => {
@@ -1666,11 +1711,13 @@ export class SandboxAgent {
     try {
       response = await live.resumeRemoteSession(existing.id, existing.agentSessionId, sessionInit);
     } catch (error) {
-      if (error instanceof AcpRpcError) {
-        // The agent cannot resume this session (unknown, expired, or not
-        // supported here). Fall back to creating a new one.
+      if (error instanceof AcpRpcError && RESUME_FALLBACK_ERROR_CODES.has(error.code)) {
+        // The agent cannot resume this session (not supported, unknown or
+        // expired, or rejected as invalid). Fall back to creating a new one.
         return null;
       }
+      // Anything else (a transport failure, an internal agent error) may be
+      // temporary: creating a new session would lose the agent's history.
       throw error;
     }
 
@@ -1994,6 +2041,7 @@ export class SandboxAgent {
     if (method === SESSION_CANCEL_METHOD && !allowManagedCancel) {
       throw new Error(MANUAL_CANCEL_ERROR);
     }
+    this.assertNotDisposed();
 
     const record = await this.persist.getSession(sessionId);
     if (!record) {
@@ -2002,6 +2050,11 @@ export class SandboxAgent {
 
     const live = this.findBoundLiveConnection(record);
     if (!live) {
+      if (!recover) {
+        // Called from a restore (or right after one): restoring again here
+        // would wait for the restore in progress, that is for itself.
+        throw new Error(`session '${record.id}' is no longer bound to an agent session`);
+      }
       // The persisted session points at a stale connection; restore lazily.
       const restored = await this.restoreSession(record);
       return this.sendSessionMethodInternal(restored.id, method, params, options, allowManagedCancel, false);
@@ -2011,6 +2064,11 @@ export class SandboxAgent {
     try {
       response = await live.sendSessionMethod(record.id, method, params, options);
     } catch (error) {
+      if (this.disposed) {
+        // Closed by dispose(): the request may have reached the agent, and the
+        // session is not restored, so it is not repeated.
+        throw this.disposedErrorOr(error);
+      }
       const recovery = recover && method !== SESSION_CANCEL_METHOD ? await this.prepareSessionRecovery(live, record, error) : null;
       if (!recovery) {
         throw error;
@@ -2061,7 +2119,7 @@ export class SandboxAgent {
     error: unknown,
   ): Promise<"session_missing" | "not_delivered" | "server_gone" | null> {
     if (error instanceof AcpRpcError && isMissingRemoteSessionError(error, record.agentSessionId)) {
-      live.unbindSession(record.id);
+      live.unbindSession(record.id, record.agentSessionId);
       return "session_missing";
     }
 
@@ -2756,6 +2814,7 @@ export class SandboxAgent {
    * If the list cannot be read then, the attach error is thrown instead.
    */
   private async getLiveConnection(agent: string, preferredServerId?: string): Promise<LiveAcpConnection> {
+    this.assertNotDisposed();
     await this.awaitHealthy();
 
     const preferred = preferredServerId?.trim();
@@ -2828,6 +2887,7 @@ export class SandboxAgent {
   }
 
   private async openLiveConnection(agent: string, serverId: string, attach: boolean): Promise<LiveAcpConnection> {
+    this.assertNotDisposed();
     const pending = this.pendingLiveConnections.get(serverId);
     if (pending) {
       return pending;
@@ -2857,6 +2917,13 @@ export class SandboxAgent {
           void this.enqueueTurnEvent(localSessionId, notification);
         },
       });
+
+      if (this.disposed) {
+        // dispose() ran while connecting: close it here (deleting the server
+        // only if this connection created it) instead of leaving it running.
+        await created.close();
+        throw new SandboxAgentDisposedError();
+      }
 
       created.onForeignTurnFinished = (connection, localSessionId, foreignTurn, responseEventId) =>
         this.scheduleForeignTurnCheck(foreignTurnBufferKey(localSessionId, connection, foreignTurn), localSessionId, responseEventId);
@@ -3160,7 +3227,12 @@ export class SandboxAgent {
     }
     const event = toSessionTurnEvent(localSessionId, notification);
     for (const listener of listeners) {
-      listener(event);
+      try {
+        listener(event);
+      } catch (error) {
+        // One failing listener must not keep the event from the others.
+        console.error("Session turn event listener failed", error);
+      }
     }
   }
 
@@ -3536,6 +3608,20 @@ export class SandboxAgent {
     });
   }
 
+  private assertNotDisposed(): void {
+    if (this.disposed) {
+      throw new SandboxAgentDisposedError();
+    }
+  }
+
+  /** After dispose(), a failure of an ACP call becomes SandboxAgentDisposedError. */
+  private disposedErrorOr(error: unknown): unknown {
+    if (!this.disposed || error instanceof SandboxAgentDisposedError) {
+      return error;
+    }
+    return new SandboxAgentDisposedError({ cause: error });
+  }
+
   private async awaitHealthy(signal?: AbortSignal): Promise<void> {
     if (!this.healthPromise) {
       throwIfAborted(signal);
@@ -3877,6 +3963,11 @@ function nonEmptyString(value: unknown): string | undefined {
   return trimmed || undefined;
 }
 
+// Errors with which an agent says it cannot resume a session: method not
+// supported, session not found, invalid params. Only these lead to a new
+// agent session (and a replay of history) instead of the resumed one.
+const RESUME_FALLBACK_ERROR_CODES = new Set([-32601, -32002, -32602]);
+
 // Requests that only set state, so repeating one after the session was
 // restored has the same effect as sending it once.
 const RETRY_SAFE_SESSION_METHODS = new Set(["session/set_mode", "session/set_config_option"]);
@@ -3888,6 +3979,12 @@ const RETRY_SAFE_SESSION_METHODS = new Set(["session/set_mode", "session/set_con
  * session-specific message.
  */
 function isMissingRemoteSessionError(error: AcpRpcError, agentSessionId: string): boolean {
+  if (error.code === ACP_HTTP_TRANSPORT_ERROR_CODE) {
+    // An HTTP rejection by Sandbox Agent (for example 404 "Session Not Found"
+    // for a server that is gone), not the agent: server loss is checked
+    // separately, against the server list.
+    return false;
+  }
   const message = error.message.toLowerCase();
   if (message.includes("session not found") || message.includes("unknown session") || message.includes("session does not exist")) {
     return true;

@@ -36,6 +36,11 @@ const delayedPrompts = new Map();
 // Sessions this process created. Prompts and resume requests for any other
 // session id fail like a real agent that lost its session state.
 const knownSessions = new Set();
+// Error the next session/resume fails with (set by "_mock/fail_next_resume").
+let nextResumeError = null;
+// The "notfound-after" hook fires once per process, so a resent prompt with the
+// same text runs normally.
+let lateNotFoundUsed = false;
 
 function sessionNotFound(id, sessionId) {
   emit({
@@ -333,6 +338,12 @@ rl.on("line", (line) => {
 
   if (method === "session/resume") {
     const sessionId = msg?.params?.sessionId;
+    if (nextResumeError) {
+      const error = nextResumeError;
+      nextResumeError = null;
+      emit({ jsonrpc: "2.0", id: msg.id, error });
+      return;
+    }
     if (!knownSessions.has(sessionId)) {
       sessionNotFound(msg.id, sessionId);
       return;
@@ -356,6 +367,16 @@ rl.on("line", (line) => {
         data: { uri: "/tmp/missing.txt" },
       },
     });
+    return;
+  }
+
+  // Test hook: the next session/resume fails with the given error code.
+  if (method === "_mock/fail_next_resume") {
+    nextResumeError = {
+      code: typeof msg?.params?.code === "number" ? msg.params.code : -32603,
+      message: typeof msg?.params?.message === "string" ? msg.params.message : "mock resume failure",
+    };
+    emit({ jsonrpc: "2.0", id: msg.id, result: {} });
     return;
   }
 
@@ -386,6 +407,15 @@ rl.on("line", (line) => {
     // Test hook: "crash:now" in the prompt text makes the agent process exit mid-turn.
     if (text.includes("crash:now")) {
       process.exit(3);
+    }
+    // Test hook: "notfound-after:<ms>" fails the prompt that much later as if
+    // the agent did not know its session (a late "session not found").
+    const notFoundMatch = /notfound-after:(\d+)/.exec(text);
+    if (notFoundMatch && !lateNotFoundUsed) {
+      lateNotFoundUsed = true;
+      const sessionId = msg?.params?.sessionId;
+      setTimeout(() => sessionNotFound(msg.id, sessionId), Number(notFoundMatch[1]));
+      return;
     }
     // Test hook: "delay:<ms>" in the prompt text holds the turn open that long
     // (or until session/cancel for the session).

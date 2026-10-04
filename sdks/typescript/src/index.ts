@@ -8,6 +8,7 @@ export {
   UnsupportedPermissionReplyError,
   SessionConfigRestoreError,
   SessionRequestInterruptedError,
+  SandboxAgentDisposedError,
   UnsupportedSessionCategoryError,
   UnsupportedSessionConfigOptionError,
   UnsupportedSessionValueError,

@@ -258,6 +258,19 @@ export class AcpRpcError extends Error {
   }
 }
 
+/**
+ * Thrown for a request that was still waiting for its response when the client
+ * was closed (`disconnect()`, or the transport failed), and for any request
+ * sent after that. The request is not repeated: it may already have reached
+ * the agent.
+ */
+export class AcpClientClosedError extends Error {
+  constructor(message = "ACP client was closed before the response arrived") {
+    super(message);
+    this.name = "AcpClientClosedError";
+  }
+}
+
 function isRpcErrorResponse(value: unknown): value is RpcErrorResponse {
   return (
     typeof value === "object" &&
@@ -318,63 +331,80 @@ export class AcpHttpClient {
       params._meta = request._meta;
     }
 
-    return wrapRpc(this.connection.initialize(params));
+    return this.call(() => this.connection.initialize(params));
   }
 
   async authenticate(request: AuthenticateRequest): Promise<AuthenticateResponse> {
-    return wrapRpc(this.connection.authenticate(request));
+    return this.call(() => this.connection.authenticate(request));
   }
 
   async newSession(request: NewSessionRequest): Promise<NewSessionResponse> {
-    return wrapRpc(this.connection.newSession(request));
+    return this.call(() => this.connection.newSession(request));
   }
 
   async loadSession(request: LoadSessionRequest): Promise<LoadSessionResponse> {
-    return wrapRpc(this.connection.loadSession(request));
+    return this.call(() => this.connection.loadSession(request));
   }
 
   async prompt(request: PromptRequest): Promise<PromptResponse> {
-    return wrapRpc(this.connection.prompt(request));
+    return this.call(() => this.connection.prompt(request));
   }
 
   async cancel(notification: CancelNotification): Promise<void> {
-    return this.connection.cancel(notification);
+    return this.call(() => this.connection.cancel(notification));
   }
 
   async setSessionMode(request: SetSessionModeRequest): Promise<SetSessionModeResponse | void> {
-    return wrapRpc(this.connection.setSessionMode(request));
+    return this.call(() => this.connection.setSessionMode(request));
   }
 
   async setSessionConfigOption(request: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
-    return wrapRpc(this.connection.setSessionConfigOption(request));
+    return this.call(() => this.connection.setSessionConfigOption(request));
   }
 
   async listSessions(request: ListSessionsRequest): Promise<ListSessionsResponse> {
-    return wrapRpc(this.connection.listSessions(request));
+    return this.call(() => this.connection.listSessions(request));
   }
 
   async unstableForkSession(request: ForkSessionRequest): Promise<ForkSessionResponse> {
-    return wrapRpc(this.connection.unstable_forkSession(request));
+    return this.call(() => this.connection.unstable_forkSession(request));
   }
 
   async unstableResumeSession(request: ResumeSessionRequest): Promise<ResumeSessionResponse> {
-    return wrapRpc(this.connection.unstable_resumeSession(request));
+    return this.call(() => this.connection.unstable_resumeSession(request));
   }
 
   async unstableSetSessionModel(request: SetSessionModelRequest): Promise<SetSessionModelResponse | void> {
-    return wrapRpc(this.connection.unstable_setSessionModel(request));
+    return this.call(() => this.connection.unstable_setSessionModel(request));
   }
 
   async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return wrapRpc(this.connection.extMethod(method, params));
+    return this.call(() => this.connection.extMethod(method, params));
   }
 
   async extNotification(method: string, params: Record<string, unknown>): Promise<void> {
-    return this.connection.extNotification(method, params);
+    return this.call(() => this.connection.extNotification(method, params));
   }
 
+  /**
+   * Closes the client. Requests still waiting for a response fail with
+   * `AcpClientClosedError`, as does every request sent afterwards.
+   */
   async disconnect(options: AcpDisconnectOptions = {}): Promise<void> {
     await this.transport.close(options.deleteServer !== false);
+  }
+
+  /**
+   * Sends a request, failing it with `AcpClientClosedError` when the transport
+   * is or becomes closed before the response arrives. The underlying
+   * connection only aborts its signal when its stream ends and leaves pending
+   * requests unsettled, and drops writes after close the same way.
+   */
+  private async call<T>(send: () => Promise<T>): Promise<T> {
+    if (this.transport.isClosed) {
+      throw new AcpClientClosedError("ACP client is closed");
+    }
+    return wrapRpc(Promise.race([send(), this.transport.closedRejection]));
   }
 
   get closed(): Promise<void> {
@@ -441,6 +471,9 @@ class StreamableHttpAcpTransport {
   private gapRejection: { through: bigint; range: string; ids: Set<string> } | null = null;
   private closed = false;
   private closingPromise: Promise<void> | null = null;
+  /** Rejects with `AcpClientClosedError` once the transport closes; never resolves. */
+  readonly closedRejection: Promise<never>;
+  private rejectClosed!: (error: Error) => void;
   private postedOnce = false;
   // True while an SSE response is open. Only then is it safe to ask the server
   // to deliver prompt responses exclusively over SSE.
@@ -468,6 +501,11 @@ class StreamableHttpAcpTransport {
   private readonly pendingRequestIds = new Map<string, number | string>();
 
   constructor(options: StreamableHttpAcpTransportOptions) {
+    this.closedRejection = new Promise<never>((_, reject) => {
+      this.rejectClosed = reject;
+    });
+    // Only observed through races with requests; never an unhandled rejection.
+    this.closedRejection.catch(() => {});
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.path = normalizePath(options.transport?.path ?? DEFAULT_ACP_PATH);
     this.fetcher = options.fetcher;
@@ -509,6 +547,18 @@ class StreamableHttpAcpTransport {
     return String(requestId).startsWith(this.wireIdPrefix);
   }
 
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  /** Fails every request still waiting for a response, and later ones. */
+  private rejectPendingRequests(): void {
+    this.pendingRequestIds.clear();
+    this.asyncPendingIds.clear();
+    this.gapRejection = null;
+    this.rejectClosed(new AcpClientClosedError());
+  }
+
   async close(deleteServer = true): Promise<void> {
     if (this.closingPromise) {
       return this.closingPromise;
@@ -524,6 +574,7 @@ class StreamableHttpAcpTransport {
     }
 
     this.closed = true;
+    this.rejectPendingRequests();
     this.notifySseStateChange();
 
     if (this.sseAbortController) {
@@ -974,6 +1025,7 @@ class StreamableHttpAcpTransport {
     }
 
     this.closed = true;
+    this.rejectPendingRequests();
     this.notifySseStateChange();
 
     try {

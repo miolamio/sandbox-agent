@@ -1003,4 +1003,92 @@ describe("AcpHttpClient integration", () => {
       await client.disconnect();
     }
   });
+
+  // Settles a promise to its outcome, so a test can wait for it with a deadline
+  // without an unhandled rejection.
+  function settle<T>(promise: Promise<T>): Promise<{ ok: true; value: T } | { ok: false; error: unknown }> {
+    return promise.then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+  }
+
+  it("rejects an in-flight async prompt when the client disconnects", async () => {
+    const serverId = `acp-http-client-close-async-${Date.now().toString(36)}`;
+    let sseConnected = false;
+    const recordingFetch: typeof fetch = async (input, init) => {
+      const response = await globalThis.fetch(input, init);
+      if (init?.method === "GET" && response.ok) {
+        sseConnected = true;
+      }
+      return response;
+    };
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: recordingFetch,
+      transport: { path: `/v1/acp/${encodeURIComponent(serverId)}`, bootstrapQuery: { agent: "mock" } },
+    });
+
+    await client.initialize();
+    const session = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await waitFor(() => (sseConnected ? true : undefined));
+
+    const prompt = settle(client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "held delay:10000" }] }));
+    await sleep(200);
+    await client.disconnect();
+
+    const outcome = await withTimeout(prompt, "prompt after disconnect", 3_000);
+    expect(outcome.ok).toBe(false);
+    expect((outcome as { error: Error }).error.name).toBe("AcpClientClosedError");
+  });
+
+  it("rejects an in-flight synchronous prompt when the client disconnects", async () => {
+    const serverId = `acp-http-client-close-sync-${Date.now().toString(36)}`;
+    // No event stream: the prompt result can only arrive in the POST response.
+    const noSseFetch: typeof fetch = async (input, init) => {
+      if (init?.method === "GET") {
+        return new Response(null, { status: 503 });
+      }
+      return globalThis.fetch(input, init);
+    };
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      fetch: noSseFetch,
+      transport: { path: `/v1/acp/${encodeURIComponent(serverId)}`, bootstrapQuery: { agent: "mock" } },
+    });
+
+    await client.initialize();
+    const session = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    const prompt = settle(client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "held delay:10000" }] }));
+    await sleep(200);
+    await client.disconnect();
+
+    const outcome = await withTimeout(prompt, "prompt after disconnect", 3_000);
+    expect(outcome.ok).toBe(false);
+    expect((outcome as { error: Error }).error.name).toBe("AcpClientClosedError");
+  });
+
+  it("rejects a request sent after the client disconnected", async () => {
+    const serverId = `acp-http-client-after-close-${Date.now().toString(36)}`;
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      transport: { path: `/v1/acp/${encodeURIComponent(serverId)}`, bootstrapQuery: { agent: "mock" } },
+    });
+
+    await client.initialize();
+    const session = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await client.disconnect();
+
+    const outcome = await withTimeout(
+      settle(client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "after close" }] })),
+      "prompt sent after disconnect",
+      3_000,
+    );
+    expect(outcome.ok).toBe(false);
+    expect((outcome as { error: Error }).error.name).toBe("AcpClientClosedError");
+  });
 });

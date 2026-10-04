@@ -135,6 +135,8 @@ A method chosen through `methodId` or `selectMethod` must be one the agent lists
 
 Use `sdk.dispose()` to disconnect without changing sandbox state, `sdk.pauseSandbox()` for graceful suspension when supported, or `sdk.killSandbox()` for permanent deletion.
 
+After `sdk.dispose()`, the client does not start agent servers or restore sessions any more: session calls such as `session.prompt(...)`, `createSession(...)`, and `resumeSession(...)` throw `SandboxAgentDisposedError`. A prompt or other session request that is still running when `dispose()` is called also fails with `SandboxAgentDisposedError` instead of waiting forever. It is not sent again, because the agent may already have run it. If another client still uses the agent server, the turn may keep running there.
+
 ## Session flow
 
 ```ts
@@ -266,7 +268,7 @@ const off = session.onTurnEvent((event: SessionTurnEvent) => {
 | `awaiting_input` | The agent asked for a permission decision (`kind: "permission"`) and waits for the reply. |
 | `input_resolved` | That request was answered, or the turn ended without an answer. |
 
-A turn's `turn_ended` is delivered after the turn's other session events. Turn events are not stored in the session history (`getEvents`). See [Agent Sessions](/agent-sessions#track-turn-progress) for the outcomes in detail.
+A turn's `turn_ended` is delivered after the turn's other session events. A listener that throws is logged and does not keep the event from the other listeners. Turn events are not stored in the session history (`getEvents`). See [Agent Sessions](/agent-sessions#track-turn-progress) for the outcomes in detail.
 
 ## Control-plane and HTTP helpers
 
@@ -336,6 +338,26 @@ try {
   if (error instanceof SandboxAgentError) {
     console.error(error.status, error.problem);
   }
+}
+```
+
+Session calls can also throw these errors:
+
+| Error | When |
+|-------|------|
+| `SessionRequestInterruptedError` | The session's agent server went away while the request was running. The session was restored (`error.session`), but the request was not sent again because the agent may already have run it. See [Session Restoration](/session-restoration). |
+| `SessionConfigRestoreError` | The session was restored, but some of its previous settings could not be applied again (`error.session`, `error.failures`). |
+| `SandboxAgentDisposedError` | The client was disposed before or while the call ran. Nothing is sent again or restored. |
+
+```ts
+import { SessionRequestInterruptedError } from "sandbox-agent";
+
+try {
+  await session.prompt([{ type: "text", text: "Run the migration." }]);
+} catch (error) {
+  if (!(error instanceof SessionRequestInterruptedError)) throw error;
+  // Decide whether to send the prompt again on the restored session.
+  await error.session.prompt([{ type: "text", text: "Run the migration." }]);
 }
 ```
 

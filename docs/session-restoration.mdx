@@ -12,7 +12,7 @@ This is driven by the configured `SessionPersistDriver` (`inMemory`, IndexedDB, 
 When you call `session.prompt(...)` (or `resumeSession(...)`) and the saved session points to a stale connection, the SDK:
 
 1. Reattaches to the agent server the session last ran on (`serverId`), for example after your client process restarted. Reattaching never starts a server. Only if the server rejects the client because that agent server does not exist does the SDK check the server's list of agent servers and, once the list confirms it is gone, start a new one.
-2. Resumes the existing agent session when the agent supports it. The conversation continues as is and nothing is replayed.
+2. Resumes the existing agent session when the agent supports it. The conversation continues as is and nothing is replayed. If resuming fails for another reason than the agent not supporting it or not knowing the session (for example a temporary error), the error is thrown and the session is left as it was, so a later attempt can still resume it.
 3. Otherwise, creates a fresh session for the same local session id, rebinds the local session to the new runtime session id, and replays recent persisted events into the next prompt as context.
 4. Applies the previously selected mode and config options (model, thought level, and others) again where the agent reports different values.
 
