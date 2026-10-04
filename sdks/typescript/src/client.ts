@@ -2015,7 +2015,8 @@ export class SandboxAgent {
       if (!recovery) {
         throw error;
       }
-      const restored = await this.restoreSession(record);
+      // When the list just confirmed the server is gone, do not try to attach to it again.
+      const restored = await this.restoreSession(recovery === "session_missing" ? record : { ...record, serverId: undefined });
       if (recovery === "server_gone" && !RETRY_SAFE_SESSION_METHODS.has(method)) {
         // The agent may have received and run the request before its server
         // went away, so repeating it could run it twice. Let the caller decide.
@@ -2748,10 +2749,11 @@ export class SandboxAgent {
 
   /**
    * Live connection for an agent. With `preferredServerId` (the server a
-   * persisted session last ran on), attach to that server if it still exists so
-   * its agent process and sessions are reused. Otherwise reuse any connection
-   * for the agent, or start a new server. If the server list cannot be read,
-   * the error is thrown instead of starting a new server.
+   * persisted session last ran on), attach to that server first so its agent
+   * process and sessions are reused; attaching never creates a server. Only
+   * when the server rejects the attach as unknown, and the server list confirms
+   * it is gone, is any connection for the agent reused or a new server started.
+   * If the list cannot be read then, the attach error is thrown instead.
    */
   private async getLiveConnection(agent: string, preferredServerId?: string): Promise<LiveAcpConnection> {
     await this.awaitHealthy();
@@ -2762,16 +2764,26 @@ export class SandboxAgent {
       if (existing && existing.agent === agent) {
         return existing;
       }
-      if (await this.isAcpServerRunning(preferred, agent)) {
+      if (!existing) {
+        let attached: LiveAcpConnection | undefined;
         try {
-          return await this.openLiveConnection(agent, preferred, true);
+          attached = await this.openLiveConnection(agent, preferred, true);
         } catch (error) {
-          // Only a server that went away after it was listed is replaced by a
-          // new one below. Any other failure (network, auth, server error) is
-          // thrown, so the session is not forked onto a second server.
+          // Only a server confirmed gone by the list is replaced by a new one
+          // below. Any other failure (network, auth, server error, or a list
+          // that cannot be read) is thrown, so the session is not forked onto a
+          // second server.
           if (!isMissingServerRejection(error) || (await this.isAcpServerListedOrThrow(preferred, error))) {
             throw error;
           }
+        }
+        if (attached) {
+          if (!(await this.isAcpServerListedForOtherAgent(preferred, agent))) {
+            return attached;
+          }
+          // The id now belongs to a server of another agent: leave it running
+          // and use a server for this agent instead.
+          await this.discardLiveConnection(attached);
         }
       }
     }
@@ -2801,13 +2813,18 @@ export class SandboxAgent {
   }
 
   /**
-   * Whether the server is listed for the agent. A failed list is thrown, not
-   * taken to mean the server is gone: only a list that was read can confirm
-   * that, and a session is never moved to a new server on a guess.
+   * Whether the server list shows the server running a different agent. A list
+   * that cannot be read counts as no: the attached server stays in use, since a
+   * session is never moved to a new server on a guess.
    */
-  private async isAcpServerRunning(serverId: string, agent: string): Promise<boolean> {
-    const { servers } = await this.listAcpServers();
-    return servers.some((server) => server.serverId === serverId && server.agent === agent);
+  private async isAcpServerListedForOtherAgent(serverId: string, agent: string): Promise<boolean> {
+    let servers: AcpServerListResponse;
+    try {
+      servers = await this.listAcpServers();
+    } catch {
+      return false;
+    }
+    return servers.servers.some((server) => server.serverId === serverId && server.agent !== agent);
   }
 
   private async openLiveConnection(agent: string, serverId: string, attach: boolean): Promise<LiveAcpConnection> {

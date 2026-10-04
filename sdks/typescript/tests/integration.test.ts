@@ -18,6 +18,7 @@ import {
 import { isNodeRuntime } from "../src/spawn.ts";
 import { createDockerTestLayout, disposeDockerTestLayout, startDockerSandboxAgent, type DockerSandboxAgentHandle } from "./helpers/docker.ts";
 import { prepareMockAgentDataHome } from "./helpers/mock-agent.ts";
+import { startFaultProxy } from "./helpers/fault-proxy.ts";
 import WebSocket from "ws";
 
 function sleep(ms: number): Promise<void> {
@@ -279,31 +280,6 @@ function nodeCommand(source: string): { command: string; args: string[] } {
   return {
     command: "node",
     args: ["-e", source],
-  };
-}
-
-/**
- * A fetch that answers 503 to the selected requests instead of passing them to
- * the server: `GET /v1/acp` (the server list) while `failList` is set, and
- * POSTs to the server `failPostTo` while it is set.
- */
-function createFailingFetch(state: { failList: boolean; failPostTo?: string; failedLists: number }): typeof fetch {
-  return async (input, init) => {
-    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
-    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
-    const fail = () =>
-      new Response(JSON.stringify({ type: "about:blank", title: "Service Unavailable", status: 503 }), {
-        status: 503,
-        headers: { "Content-Type": "application/problem+json" },
-      });
-    if (state.failList && method === "GET" && url.pathname === "/v1/acp") {
-      state.failedLists += 1;
-      return fail();
-    }
-    if (state.failPostTo && method === "POST" && url.pathname === `/v1/acp/${encodeURIComponent(state.failPostTo)}`) {
-      return fail();
-    }
-    return fetch(input, init);
   };
 }
 
@@ -1556,22 +1532,17 @@ describe("Integration: TypeScript SDK flat session API", () => {
   it("does not fork a session when attaching to its server fails for another reason", async () => {
     const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
     const author = await SandboxAgent.connect({ baseUrl, token, persist });
-    const session = await author.createSession({ agent: "mock" });
-    const serverId = session.serverId!;
-    let failed = false;
-    // A network failure on the first request to the existing server.
-    const flakyFetch: typeof fetch = async (input, init) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (!failed && init?.method === "POST" && url.includes(`/v1/acp/${encodeURIComponent(serverId)}`)) {
-        failed = true;
-        throw new TypeError("simulated network failure");
-      }
-      return fetch(input, init);
-    };
-    const observer = await SandboxAgent.connect({ baseUrl, token, persist, fetch: flakyFetch });
+    const proxy = await startFaultProxy(baseUrl);
+    const observer = await SandboxAgent.connect({ baseUrl: proxy.baseUrl, token, persist });
     try {
+      const session = await author.createSession({ agent: "mock" });
+      const serverId = session.serverId!;
+      // A network failure on the first request to the existing server.
+      proxy.rule = ({ method, path }) =>
+        proxy.faults.length === 0 && method === "POST" && path === `/v1/acp/${encodeURIComponent(serverId)}` ? "drop" : "forward";
+
       await expect(observer.resumeSession(session.id)).rejects.toBeTruthy();
-      expect(failed).toBe(true);
+      expect(proxy.faults).toHaveLength(1);
 
       const record = await persist.getSession(session.id);
       expect(record?.serverId).toBe(serverId);
@@ -1585,46 +1556,79 @@ describe("Integration: TypeScript SDK flat session API", () => {
     } finally {
       await observer.dispose();
       await author.dispose();
+      await proxy.close();
     }
   });
 
-  it("does not fork a session onto a new server when listing servers fails during resume", async () => {
+  it("resumes a session on its server while listing servers fails", async () => {
     const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
     const author = await SandboxAgent.connect({ baseUrl, token, persist });
-    const state = { failList: true, failedLists: 0 };
-    const observer = await SandboxAgent.connect({ baseUrl, token, persist, fetch: createFailingFetch(state) });
+    const proxy = await startFaultProxy(baseUrl);
+    let failList = true;
+    proxy.rule = ({ method, path }) => (failList && method === "GET" && path === "/v1/acp" ? "unavailable" : "forward");
+    const observer = await SandboxAgent.connect({ baseUrl: proxy.baseUrl, token, persist });
+    const sender = await SandboxAgent.connect({ baseUrl: proxy.baseUrl, token, persist });
+    const late = await SandboxAgent.connect({ baseUrl: proxy.baseUrl, token, persist });
     try {
       const session = await author.createSession({ agent: "mock" });
       await session.prompt([{ type: "text", text: "before list failure" }]);
       const serverId = session.serverId!;
-      const before = await persist.getSession(session.id);
 
-      await expect(observer.resumeSession(session.id)).rejects.toBeTruthy();
-      expect(state.failedLists).toBeGreaterThan(0);
-      expect(await persist.getSession(session.id)).toEqual(before);
-      expect((await author.listAcpServers()).servers.map((server) => server.serverId)).toEqual([serverId]);
-
-      // A request that restores the session on its own (no resumeSession first) fails the same way.
-      await expect(observer.rawSendSessionMethod(session.id, "session/prompt", { prompt: [{ type: "text", text: "while list fails" }] })).rejects.toBeTruthy();
-      expect(await persist.getSession(session.id)).toEqual(before);
-      expect((await author.listAcpServers()).servers.map((server) => server.serverId)).toEqual([serverId]);
-      expect(await clientPromptsWithText(author, session.id, "while list fails")).toHaveLength(0);
-
-      state.failList = false;
-      const watched = await observer.resumeSession(session.id);
+      // The server is alive: resuming attaches to it without needing the list.
+      const watched = await withTimeout(observer.resumeSession(session.id), "resume while list fails");
       expect(watched.serverId).toBe(serverId);
       expect(watched.agentSessionId).toBe(session.agentSessionId);
+      expect((await persist.getSession(session.id))?.serverId).toBe(serverId);
+
+      // A request that restores the session on its own (no resumeSession first) is delivered there too.
+      const prompted = await withTimeout(
+        sender.rawSendSessionMethod(session.id, "session/prompt", { prompt: [{ type: "text", text: "while list fails" }] }),
+        "prompt while list fails",
+      );
+      expect((prompted.response as { stopReason?: string }).stopReason).toBe("end_turn");
+      expect(await clientPromptsWithText(author, session.id, "while list fails")).toHaveLength(1);
+      expect((await persist.getSession(session.id))?.serverId).toBe(serverId);
       expect((await author.listAcpServers()).servers.map((server) => server.serverId)).toEqual([serverId]);
+
+      // The server is gone, but while the list fails that cannot be confirmed:
+      // resuming fails and no new server is started.
+      await deleteAcpServer(baseUrl, token, serverId);
+      const before = await persist.getSession(session.id);
+      const failedLists = proxy.faults.length;
+      await expect(late.resumeSession(session.id)).rejects.toBeTruthy();
+      expect(proxy.faults.length).toBeGreaterThan(failedLists);
+      expect(await persist.getSession(session.id)).toEqual(before);
+      expect((await author.listAcpServers()).servers).toEqual([]);
+
+      // Once the list confirms the server is gone, the session moves to a new one.
+      failList = false;
+      const moved = await withTimeout(late.resumeSession(session.id), "resume after list recovers");
+      expect(moved.serverId).not.toBe(serverId);
+      expect((await author.listAcpServers()).servers.map((server) => server.serverId)).toEqual([moved.serverId]);
     } finally {
+      await late.dispose();
+      await sender.dispose();
       await observer.dispose();
       await author.dispose();
+      await proxy.close();
     }
   });
 
   it("does not recover a failed prompt while listing servers fails", async () => {
     const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 1000 });
-    const state: { failList: boolean; failPostTo?: string; failedLists: number } = { failList: false, failedLists: 0 };
-    const sdk = await SandboxAgent.connect({ baseUrl, token, persist, fetch: createFailingFetch(state) });
+    const proxy = await startFaultProxy(baseUrl);
+    let failList = false;
+    let failPostTo: string | undefined;
+    proxy.rule = ({ method, path }) => {
+      if (failList && method === "GET" && path === "/v1/acp") {
+        return "unavailable";
+      }
+      if (failPostTo && method === "POST" && path === `/v1/acp/${encodeURIComponent(failPostTo)}`) {
+        return "unavailable";
+      }
+      return "forward";
+    };
+    const sdk = await SandboxAgent.connect({ baseUrl: proxy.baseUrl, token, persist });
     try {
       const session = await sdk.createSession({ agent: "mock" });
       await session.prompt([{ type: "text", text: "before failures" }]);
@@ -1633,14 +1637,14 @@ describe("Integration: TypeScript SDK flat session API", () => {
 
       // The server is alive but the prompt and the list both fail: the prompt
       // fails, and the session stays on its server.
-      state.failList = true;
-      state.failPostTo = serverId;
+      failList = true;
+      failPostTo = serverId;
       await expect(session.prompt([{ type: "text", text: "rejected prompt" }])).rejects.not.toBeInstanceOf(SessionRequestInterruptedError);
-      expect(state.failedLists).toBeGreaterThan(0);
+      expect(proxy.faults.some((fault) => fault.method === "GET" && fault.path === "/v1/acp")).toBe(true);
       expect(await persist.getSession(session.id)).toEqual(before);
-      state.failPostTo = undefined;
+      failPostTo = undefined;
       expect(await sdk.listAcpServers().catch(() => null)).toBeNull();
-      state.failList = false;
+      failList = false;
       expect((await sdk.listAcpServers()).servers.map((server) => server.serverId)).toEqual([serverId]);
 
       const retried = await withTimeout(session.prompt([{ type: "text", text: "after failures" }]), "prompt after failures");
@@ -1650,11 +1654,11 @@ describe("Integration: TypeScript SDK flat session API", () => {
       // The server is gone, but while the list fails that cannot be confirmed:
       // the prompt fails and no new server is started.
       await deleteAcpServer(baseUrl, token, serverId);
-      state.failList = true;
+      failList = true;
       const lostBefore = await persist.getSession(session.id);
       await expect(session.prompt([{ type: "text", text: "server unconfirmed" }])).rejects.not.toBeInstanceOf(SessionRequestInterruptedError);
       expect(await persist.getSession(session.id)).toEqual(lostBefore);
-      state.failList = false;
+      failList = false;
       expect((await sdk.listAcpServers()).servers).toEqual([]);
 
       // Once the list confirms the server is gone, the session is restored and
@@ -1670,6 +1674,7 @@ describe("Integration: TypeScript SDK flat session API", () => {
       expect((await sdk.listAcpServers()).servers.map((server) => server.serverId)).toEqual([restored!.serverId]);
     } finally {
       await sdk.dispose();
+      await proxy.close();
     }
   });
 
