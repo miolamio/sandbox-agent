@@ -1091,4 +1091,30 @@ describe("AcpHttpClient integration", () => {
     expect(outcome.ok).toBe(false);
     expect((outcome as { error: Error }).error.name).toBe("AcpClientClosedError");
   });
+
+  it("keeps no per-request state for requests that completed", async () => {
+    const serverId = `acp-http-client-request-state-${Date.now().toString(36)}`;
+    const client = new AcpHttpClient({
+      baseUrl,
+      token,
+      transport: { path: `/v1/acp/${encodeURIComponent(serverId)}`, bootstrapQuery: { agent: "mock" } },
+    });
+    try {
+      await client.initialize();
+      const session = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+      for (let index = 0; index < 50; index += 1) {
+        await client.extMethod("_mock/echo", { index });
+      }
+      await client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "done" }] });
+      expect(client.inFlightRequestCount).toBe(0);
+
+      const held = settle(client.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "held delay:10000" }] }));
+      await waitFor(() => (client.inFlightRequestCount === 1 ? true : undefined));
+      await client.disconnect();
+      expect((await withTimeout(held, "held prompt after disconnect", 3_000)).ok).toBe(false);
+      expect(client.inFlightRequestCount).toBe(0);
+    } finally {
+      await client.disconnect();
+    }
+  });
 });

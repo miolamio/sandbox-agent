@@ -404,7 +404,22 @@ export class AcpHttpClient {
     if (this.transport.isClosed) {
       throw new AcpClientClosedError("ACP client is closed");
     }
-    return wrapRpc(Promise.race([send(), this.transport.closedRejection]));
+    // One rejection per request, dropped when the request settles, so a
+    // long-lived client keeps nothing per finished request.
+    let release = () => {};
+    const closed = new Promise<never>((_, reject) => {
+      release = this.transport.onClose(reject);
+    });
+    try {
+      return await wrapRpc(Promise.race([send(), closed]));
+    } finally {
+      release();
+    }
+  }
+
+  /** Requests sent through this client that are still waiting for their response. */
+  get inFlightRequestCount(): number {
+    return this.transport.closeWaiterCount;
   }
 
   get closed(): Promise<void> {
@@ -471,9 +486,8 @@ class StreamableHttpAcpTransport {
   private gapRejection: { through: bigint; range: string; ids: Set<string> } | null = null;
   private closed = false;
   private closingPromise: Promise<void> | null = null;
-  /** Rejects with `AcpClientClosedError` once the transport closes; never resolves. */
-  readonly closedRejection: Promise<never>;
-  private rejectClosed!: (error: Error) => void;
+  // Rejection callbacks of the requests in flight, called when the transport closes.
+  private readonly closeWaiters = new Set<(error: Error) => void>();
   private postedOnce = false;
   // True while an SSE response is open. Only then is it safe to ask the server
   // to deliver prompt responses exclusively over SSE.
@@ -501,11 +515,6 @@ class StreamableHttpAcpTransport {
   private readonly pendingRequestIds = new Map<string, number | string>();
 
   constructor(options: StreamableHttpAcpTransportOptions) {
-    this.closedRejection = new Promise<never>((_, reject) => {
-      this.rejectClosed = reject;
-    });
-    // Only observed through races with requests; never an unhandled rejection.
-    this.closedRejection.catch(() => {});
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.path = normalizePath(options.transport?.path ?? DEFAULT_ACP_PATH);
     this.fetcher = options.fetcher;
@@ -551,12 +560,35 @@ class StreamableHttpAcpTransport {
     return this.closed;
   }
 
+  get closeWaiterCount(): number {
+    return this.closeWaiters.size;
+  }
+
+  /**
+   * Registers a request's rejection to be called when the transport closes
+   * (at once if it already is). Returns the function that unregisters it.
+   */
+  onClose(reject: (error: Error) => void): () => void {
+    if (this.closed) {
+      reject(new AcpClientClosedError("ACP client is closed"));
+      return () => {};
+    }
+    this.closeWaiters.add(reject);
+    return () => {
+      this.closeWaiters.delete(reject);
+    };
+  }
+
   /** Fails every request still waiting for a response, and later ones. */
   private rejectPendingRequests(): void {
     this.pendingRequestIds.clear();
     this.asyncPendingIds.clear();
     this.gapRejection = null;
-    this.rejectClosed(new AcpClientClosedError());
+    const waiters = [...this.closeWaiters];
+    this.closeWaiters.clear();
+    for (const reject of waiters) {
+      reject(new AcpClientClosedError());
+    }
   }
 
   async close(deleteServer = true): Promise<void> {

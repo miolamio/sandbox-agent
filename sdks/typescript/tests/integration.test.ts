@@ -1938,7 +1938,10 @@ describe("Integration: TypeScript SDK flat session API", () => {
       expect(restoredAgentSessionId).not.toBe(firstAgentSessionId);
 
       // The late error is about the old agent session: the restored session is kept
-      // and the prompt, which the agent did not run, is sent on it.
+      // and the prompt, which the agent did not run, is sent on it. Its recovery
+      // starts a restore with the record read before the first restore finished;
+      // that restore must reuse the finished one instead of creating a third
+      // agent session (with only the unbind check it would).
       const outcome = await withTimeout(late, "late prompt", 10_000);
       expect(outcome.ok).toBe(true);
       expect((await sdk.getSession(session.id))?.agentSessionId).toBe(restoredAgentSessionId);
@@ -1969,6 +1972,24 @@ describe("Integration: TypeScript SDK flat session API", () => {
       const watched = await withTimeout(observer.resumeSession(session.id), "second resume");
       expect(watched.agentSessionId).toBe(session.agentSessionId);
       expect(watched.serverId).toBe(session.serverId);
+    } finally {
+      await observer.dispose();
+      await author.dispose();
+    }
+  });
+
+  it("replaces a session when resuming it fails with a plain session-not-found error", async () => {
+    const persist = new InMemorySessionPersistDriver();
+    const author = await SandboxAgent.connect({ baseUrl, token, persist });
+    const observer = await SandboxAgent.connect({ baseUrl, token, persist });
+    try {
+      const session = await author.createSession({ agent: "mock" });
+      // Some agents report an unknown session as an internal error with that text.
+      await session.rawSend("_mock/fail_next_resume", { code: -32603, message: "Session not found" });
+
+      const watched = await withTimeout(observer.resumeSession(session.id), "resume of an unknown session");
+      expect(watched.agentSessionId).not.toBe(session.agentSessionId);
+      expect((await persist.getSession(session.id))?.agentSessionId).toBe(watched.agentSessionId);
     } finally {
       await observer.dispose();
       await author.dispose();

@@ -1711,9 +1711,10 @@ export class SandboxAgent {
     try {
       response = await live.resumeRemoteSession(existing.id, existing.agentSessionId, sessionInit);
     } catch (error) {
-      if (error instanceof AcpRpcError && RESUME_FALLBACK_ERROR_CODES.has(error.code)) {
+      if (error instanceof AcpRpcError && (RESUME_FALLBACK_ERROR_CODES.has(error.code) || isMissingRemoteSessionError(error, existing.agentSessionId))) {
         // The agent cannot resume this session (not supported, unknown or
-        // expired, or rejected as invalid). Fall back to creating a new one.
+        // expired, or rejected as invalid; some agents report an unknown
+        // session only by message). Fall back to creating a new one.
         return null;
       }
       // Anything else (a transport failure, an internal agent error) may be
