@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use sandbox_agent_agent_management::agents::AgentId;
 use sandbox_agent_error::SandboxError;
@@ -6,6 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
+
+use super::secrets::{redact_mcp_servers, MCP_SECRET_FIELDS, SECRET_MASK};
 
 /// One agent profile. `agent` and `name` are optional in request bodies (the
 /// path names the profile) and required in the `--profiles` file.
@@ -26,7 +29,7 @@ pub struct AgentProfile {
 }
 
 /// Applied when the agent process starts.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileProcess {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -37,6 +40,22 @@ pub struct ProfileProcess {
     pub config: Option<Value>,
 }
 
+/// Secrets (`env` values) are printed as `"***"`.
+impl fmt::Debug for ProfileProcess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env: BTreeMap<&str, &str> = self
+            .env
+            .keys()
+            .map(|key| (key.as_str(), SECRET_MASK))
+            .collect();
+        f.debug_struct("ProfileProcess")
+            .field("env", &env)
+            .field("args", &self.args)
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
 impl ProfileProcess {
     pub fn is_empty(&self) -> bool {
         self.env.is_empty() && self.args.is_none() && self.config.is_none()
@@ -44,7 +63,7 @@ impl ProfileProcess {
 }
 
 /// Applied to every session of the agent process.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,6 +77,25 @@ pub struct ProfileSession {
     pub plugins: Vec<ProfilePlugin>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugin_configs: BTreeMap<String, Value>,
+}
+
+/// Secrets (`pluginConfigs` values and `mcpServers` `env`/`headers` values)
+/// are printed as `"***"`.
+impl fmt::Debug for ProfileSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let plugin_configs: BTreeMap<&str, &str> = self
+            .plugin_configs
+            .keys()
+            .map(|key| (key.as_str(), SECRET_MASK))
+            .collect();
+        f.debug_struct("ProfileSession")
+            .field("system_prompt", &self.system_prompt)
+            .field("mcp_servers", &redact_mcp_servers(&self.mcp_servers))
+            .field("skills", &self.skills)
+            .field("plugins", &self.plugins)
+            .field("plugin_configs", &plugin_configs)
+            .finish()
+    }
 }
 
 impl ProfileSession {
@@ -156,6 +194,11 @@ pub fn validate_profile_shape(profile: &AgentProfile) -> Result<(), SandboxError
                 &["session.mcpServers"],
             ));
         }
+        for field in MCP_SECRET_FIELDS {
+            if let Some(entries) = server.get(field) {
+                validate_mcp_name_value_list(name, field, entries)?;
+            }
+        }
         if !names.insert(name.to_string()) {
             return Err(profile_invalid(
                 format!("session.mcpServers has two servers named '{name}'"),
@@ -179,6 +222,33 @@ pub fn validate_profile_shape(profile: &AgentProfile) -> Result<(), SandboxError
         }
     }
     Ok(())
+}
+
+/// `env` (stdio) and `headers` (http/sse) of an MCP server must be lists of
+/// `{ "name": string, "value": string }`, as in the session request format.
+/// Other shapes would carry secrets past masking.
+fn validate_mcp_name_value_list(
+    server: &str,
+    field: &str,
+    entries: &Value,
+) -> Result<(), SandboxError> {
+    let valid = entries.as_array().is_some_and(|entries| {
+        entries.iter().all(|entry| {
+            entry.as_object().is_some_and(|entry| {
+                entry.len() == 2
+                    && entry.get("name").is_some_and(Value::is_string)
+                    && entry.get("value").is_some_and(Value::is_string)
+            })
+        })
+    });
+    if valid {
+        return Ok(());
+    }
+    let path = format!("session.mcpServers.{server}.{field}");
+    Err(profile_invalid(
+        format!("{path} must be a list of {{ \"name\": string, \"value\": string }}"),
+        &[path.as_str()],
+    ))
 }
 
 #[cfg(test)]
@@ -277,5 +347,79 @@ mod tests {
         let c = profile(json!({ "process": { "env": { "A": "2" } } }));
         assert_eq!(a.process_fingerprint(), b.process_fingerprint());
         assert_ne!(a.process_fingerprint(), c.process_fingerprint());
+    }
+
+    #[test]
+    fn validate_shape_requires_acp_env_and_header_lists() {
+        let cases = [
+            (
+                json!({ "name": "fs", "command": "node", "env": { "FS_TOKEN": "s3cret" } }),
+                "session.mcpServers.fs.env",
+            ),
+            (
+                json!({ "type": "http", "name": "gh", "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer s3cret" } }),
+                "session.mcpServers.gh.headers",
+            ),
+            (
+                json!({ "name": "fs", "command": "node", "env": [{ "name": "FS_TOKEN", "value": 987654 }] }),
+                "session.mcpServers.fs.env",
+            ),
+            (
+                json!({ "name": "fs", "command": "node", "env": [{ "name": 1, "value": "v" }] }),
+                "session.mcpServers.fs.env",
+            ),
+            (
+                json!({ "name": "fs", "command": "node", "env": [{ "name": "K", "value": "v", "extra": "x" }] }),
+                "session.mcpServers.fs.env",
+            ),
+            (
+                json!({ "name": "fs", "command": "node", "env": ["K=v"] }),
+                "session.mcpServers.fs.env",
+            ),
+            (
+                json!({ "name": "fs", "command": "node", "env": null }),
+                "session.mcpServers.fs.env",
+            ),
+            (
+                json!({ "type": "sse", "name": "gh", "url": "https://example.com/mcp", "headers": [{ "name": "Authorization" }] }),
+                "session.mcpServers.gh.headers",
+            ),
+        ];
+        for (server, field) in cases {
+            let invalid = profile(json!({ "session": { "mcpServers": [server.clone()] } }));
+            assert_eq!(
+                invalid_fields(validate_profile_shape(&invalid).unwrap_err()),
+                vec![field],
+                "{server}"
+            );
+        }
+        let valid = profile(json!({ "session": { "mcpServers": [
+            { "name": "fs", "command": "node", "env": [{ "name": "FS_TOKEN", "value": "s3cret" }] },
+            { "type": "http", "name": "gh", "url": "https://example.com/mcp", "headers": [{ "name": "Authorization", "value": "" }] }
+        ] } }));
+        assert!(validate_profile_shape(&valid).is_ok());
+    }
+
+    #[test]
+    fn debug_output_hides_secrets() {
+        let secret_profile = profile(json!({
+            "process": { "env": { "TOKEN": "s3cret-process" } },
+            "session": {
+                "pluginConfigs": { "mod": { "key": "s3cret-plugin" } },
+                "mcpServers": [
+                    { "name": "fs", "command": "node", "env": [{ "name": "FS_TOKEN", "value": "s3cret-env" }] },
+                    { "type": "http", "name": "gh", "url": "https://example.com/mcp", "headers": [{ "name": "Authorization", "value": "Bearer s3cret-header" }] }
+                ]
+            }
+        }));
+        let text = format!(
+            "{secret_profile:?} {:?} {:?}",
+            secret_profile.process, secret_profile.session
+        );
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(
+            text.contains("TOKEN") && text.contains("FS_TOKEN") && text.contains("Authorization"),
+            "{text}"
+        );
     }
 }
