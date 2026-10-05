@@ -2015,6 +2015,7 @@ dependencies = [
  "tracing",
  "tracing-logfmt",
  "tracing-subscriber",
+ "url",
  "utoipa",
  "windows",
  "zip",

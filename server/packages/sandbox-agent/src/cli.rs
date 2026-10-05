@@ -1113,24 +1113,34 @@ fn run_profiles(command: &ProfilesCommand, cli: &CliConfig) -> Result<(), CliErr
     }
 }
 
-fn profile_path(agent: &str, name: &str) -> Result<String, CliError> {
-    for (label, value) in [("agent", agent), ("name", name)] {
-        let value = value.trim();
-        if value.is_empty() {
-            return Err(CliError::Server(format!(
-                "profile {label} must not be empty"
-            )));
-        }
-        if value.contains('/') {
-            return Err(CliError::Server(format!(
-                "profile {label} must not contain '/'"
-            )));
+/// Percent-encodes one URL path segment, keeping only RFC 3986 unreserved characters.
+fn encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
         }
     }
+    out
+}
+
+fn validate_cli_profile_name(name: &str) -> Result<(), CliError> {
+    crate::profiles::validate_profile_name(name).map_err(|err| CliError::Server(err.to_string()))
+}
+
+fn profile_path(agent: &str, name: &str) -> Result<String, CliError> {
+    let agent = agent.trim();
+    let name = name.trim();
+    if AgentId::parse(agent).is_none() {
+        return Err(CliError::Server(format!("unknown agent '{agent}'")));
+    }
+    validate_cli_profile_name(name)?;
     Ok(format!(
         "{API_PREFIX}/config/profiles/{}/{}",
-        agent.trim(),
-        name.trim()
+        encode_path_segment(agent),
+        encode_path_segment(name)
     ))
 }
 
@@ -1775,7 +1785,8 @@ fn build_acp_server_path(
         ));
     }
 
-    let mut query = Vec::new();
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    let mut has_query = false;
     if let Some(agent) = bootstrap_agent {
         let agent = agent.trim();
         if agent.is_empty() {
@@ -1783,7 +1794,8 @@ fn build_acp_server_path(
                 "agent must not be empty when provided".to_string(),
             ));
         }
-        query.push(format!("agent={agent}"));
+        query.append_pair("agent", agent);
+        has_query = true;
     }
     if let Some(profile) = profile {
         let profile = profile.trim();
@@ -1792,13 +1804,15 @@ fn build_acp_server_path(
                 "profile must not be empty when provided".to_string(),
             ));
         }
-        query.push(format!("profile={profile}"));
+        validate_cli_profile_name(profile)?;
+        query.append_pair("profile", profile);
+        has_query = true;
     }
 
     let mut path = format!("{API_PREFIX}/acp/{server_id}");
-    if !query.is_empty() {
+    if has_query {
         path.push('?');
-        path.push_str(&query.join("&"));
+        path.push_str(&query.finish());
     }
     Ok(path)
 }
@@ -2469,6 +2483,62 @@ mod tests {
         );
         assert!(profile_path("claude", "a/b").is_err());
         assert!(profile_path(" ", "review").is_err());
+    }
+
+    #[test]
+    fn profile_path_rejects_names_that_break_the_url() {
+        for name in [
+            "..",
+            "review#zzz",
+            "a?b",
+            "a%2Fb",
+            "a/b",
+            "a b",
+            ".hidden",
+            "",
+        ] {
+            assert!(
+                profile_path("mock", name).is_err(),
+                "name {name:?} must be rejected"
+            );
+        }
+        assert_eq!(
+            profile_path("mock", "re-view_1.2").unwrap(),
+            "/v1/config/profiles/mock/re-view_1.2"
+        );
+    }
+
+    #[test]
+    fn profile_path_rejects_unknown_agents() {
+        for agent in [
+            "unknown", "..", "mock#x", "mock?x", "mo%63k", "a/b", "mo ck",
+        ] {
+            assert!(
+                profile_path(agent, "review").is_err(),
+                "agent {agent:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_reserved_characters() {
+        assert_eq!(encode_path_segment("a b/#?%"), "a%20b%2F%23%3F%25");
+        assert_eq!(encode_path_segment("Az09-._~"), "Az09-._~");
+    }
+
+    #[test]
+    fn acp_server_path_rejects_profile_query_injection() {
+        assert!(build_acp_server_path("s1", Some("claude"), Some("x&agent=codex")).is_err());
+        assert!(build_acp_server_path("s1", None, Some("..")).is_err());
+        assert!(build_acp_server_path("s1", None, Some("a#b")).is_err());
+    }
+
+    #[test]
+    fn acp_server_path_encodes_agent_query() {
+        assert_eq!(
+            build_acp_server_path("s1", Some("a&profile=x"), None).unwrap(),
+            "/v1/acp/s1?agent=a%26profile%3Dx"
+        );
     }
 
     #[test]

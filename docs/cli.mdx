@@ -257,7 +257,7 @@ sandbox-agent profiles delete <AGENT> <NAME> [--endpoint <URL>]
 | `--json <JSON>` | - | Profile body (`put`) |
 | `--json-file <FILE>` | - | Profile body from a file (`put`) |
 
-`get` and `put` print the stored and the resolved profile with secret values shown as `***`. In `put`, a `***` value keeps the stored value of that key.
+`get` and `put` print the stored and the resolved profile with secret values shown as `***`. In `put`, a `***` value keeps the stored value of that key. To read the body from stdin, pass `--json-file /dev/stdin`.
 
 ```bash
 sandbox-agent profiles put claude review --json '{"extends":"base","session":{"systemPrompt":{"mode":"replace","text":"You review code."}}}'
