@@ -6,6 +6,7 @@ mod merge;
 mod model;
 mod secrets;
 mod session;
+mod store;
 
 pub use capability::{
     agent_customization_for, unsupported_fields, validate_customization, AgentCustomization,
@@ -18,3 +19,6 @@ pub use model::{
 };
 pub use secrets::{mask_profile, restore_masked_secrets, SECRET_MASK};
 pub use session::{apply_session_profile, is_profile_session_method, PROFILE_SESSION_METHODS};
+pub use store::{
+    load_profiles_file, server_state_dir, ProfileSource, ProfileStore, StoredProfile, STATE_DIR_ENV,
+};
