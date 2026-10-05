@@ -150,6 +150,7 @@ impl AppState {
         let acp_proxy = Arc::new(AcpProxyRuntime::new(
             agent_manager.clone(),
             acp_request_timeout,
+            profiles.clone(),
         ));
         let opencode_server_manager = Arc::new(OpenCodeServerManager::new(
             agent_manager.clone(),
@@ -3456,6 +3457,8 @@ async fn get_v1_acp_servers(
             server_id: instance.server_id,
             agent: instance.agent.as_str().to_string(),
             created_at_ms: instance.created_at_ms,
+            profile_stale: instance.profile.as_ref().map(|_| instance.profile_stale),
+            profile: instance.profile,
         })
         .collect::<Vec<_>>();
 
@@ -3469,6 +3472,7 @@ async fn get_v1_acp_servers(
     params(
         ("server_id" = String, Path, description = "Client-defined ACP server id"),
         ("agent" = Option<String>, Query, description = "Agent id required for first POST"),
+        ("profile" = Option<String>, Query, description = "Agent profile for the server this request creates; on a running server it must match the server's profile"),
         ("x-sandboxagent-async-prompt" = Option<String>, Header, description = "Set to `1` to receive `session/prompt` responses over SSE (POST returns 202)")
     ),
     request_body = AcpEnvelope,
@@ -3478,8 +3482,8 @@ async fn get_v1_acp_servers(
         (status = 406, description = "Client does not accept JSON responses", body = ProblemDetails),
         (status = 415, description = "Unsupported media type", body = ProblemDetails),
         (status = 400, description = "Invalid ACP envelope", body = ProblemDetails),
-        (status = 404, description = "Unknown ACP server", body = ProblemDetails),
-        (status = 409, description = "ACP server bound to different agent", body = ProblemDetails),
+        (status = 404, description = "Unknown ACP server or profile", body = ProblemDetails),
+        (status = 409, description = "ACP server bound to a different agent or profile", body = ProblemDetails),
         (status = 504, description = "ACP agent process response timeout", body = ProblemDetails)
     )
 )]
@@ -3519,6 +3523,12 @@ async fn post_v1_acp(
         None => None,
     };
 
+    let profile = query
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+
     let mode = if async_prompt_requested(&headers) {
         PostMode::AsyncPrompt
     } else {
@@ -3527,7 +3537,7 @@ async fn post_v1_acp(
 
     match state
         .acp_proxy()
-        .post(&server_id, bootstrap_agent, payload, mode)
+        .post(&server_id, bootstrap_agent, profile, payload, mode)
         .await?
     {
         ProxyPostOutcome::Response(value) => Ok((StatusCode::OK, Json(value)).into_response()),

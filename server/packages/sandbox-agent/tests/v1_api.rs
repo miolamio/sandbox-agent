@@ -299,5 +299,7 @@ mod fs_download_batch;
 mod mock_agent;
 #[path = "v1_api/processes.rs"]
 mod processes;
+#[path = "v1_api/profiles.rs"]
+mod profiles;
 #[path = "v1_api/turn_events.rs"]
 mod turn_events;

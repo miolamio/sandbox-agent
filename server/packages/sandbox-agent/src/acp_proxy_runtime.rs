@@ -17,6 +17,8 @@ use sandbox_agent_opencode_adapter::{AcpDispatch, AcpDispatchResult, AcpPayloadS
 use serde_json::{Number, Value};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::profiles::ProfileStore;
+
 /// Env var for the ACP request timeout. `--acp-request-timeout-ms` overrides it.
 pub const REQUEST_TIMEOUT_ENV: &str = "SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS";
 
@@ -59,6 +61,7 @@ struct AcpProxyRuntimeInner {
     agent_manager: Arc<AgentManager>,
     require_preinstall: bool,
     request_timeout: Duration,
+    profiles: Arc<ProfileStore>,
     instances: RwLock<HashMap<String, Arc<ProxyInstance>>>,
     instance_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     install_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
@@ -72,6 +75,15 @@ struct ProxyInstance {
     agent: AgentId,
     runtime: Arc<AdapterRuntime>,
     created_at_ms: i64,
+    profile: Option<BoundProfile>,
+}
+
+/// Profile an agent server was started with, and the `process` part it was
+/// started with (to report `profileStale` once the profile changes).
+#[derive(Debug, Clone)]
+struct BoundProfile {
+    name: String,
+    process_fingerprint: String,
 }
 
 #[derive(Debug)]
@@ -85,6 +97,8 @@ pub struct AcpServerInstanceInfo {
     pub server_id: String,
     pub agent: AgentId,
     pub created_at_ms: i64,
+    pub profile: Option<String>,
+    pub profile_stale: bool,
 }
 
 pub type PinBoxSseStream =
@@ -118,7 +132,11 @@ impl ProxyInstance {
 
 impl AcpProxyRuntime {
     /// `request_timeout` bounds each ACP request; see [`resolve_request_timeout`].
-    pub fn new(agent_manager: Arc<AgentManager>, request_timeout: Duration) -> Self {
+    pub fn new(
+        agent_manager: Arc<AgentManager>,
+        request_timeout: Duration,
+        profiles: Arc<ProfileStore>,
+    ) -> Self {
         let require_preinstall = std::env::var("SANDBOX_AGENT_REQUIRE_PREINSTALL")
             .ok()
             .is_some_and(|value| {
@@ -133,6 +151,7 @@ impl AcpProxyRuntime {
                 agent_manager,
                 require_preinstall,
                 request_timeout,
+                profiles,
                 instances: RwLock::new(HashMap::new()),
                 instance_locks: Mutex::new(HashMap::new()),
                 install_locks: Mutex::new(HashMap::new()),
@@ -155,10 +174,24 @@ impl AcpProxyRuntime {
                 server_id: instance.server_id.clone(),
                 agent: instance.agent,
                 created_at_ms: instance.created_at_ms,
+                profile: instance.profile.as_ref().map(|bound| bound.name.clone()),
+                profile_stale: instance
+                    .profile
+                    .as_ref()
+                    .is_some_and(|bound| self.profile_is_stale(instance.agent, bound)),
             })
             .collect::<Vec<_>>();
         infos.sort_by(|left, right| left.server_id.cmp(&right.server_id));
         infos
+    }
+
+    /// True when the profile's `process` part changed, or the profile is gone,
+    /// since the agent process started with it.
+    fn profile_is_stale(&self, agent: AgentId, bound: &BoundProfile) -> bool {
+        match self.inner.profiles.resolve(agent, &bound.name) {
+            Ok(current) => current.process_fingerprint() != bound.process_fingerprint,
+            Err(_) => true,
+        }
     }
 
     /// Forwards a `/v1/acp` request. A server created by this call publishes
@@ -167,10 +200,11 @@ impl AcpProxyRuntime {
         &self,
         server_id: &str,
         bootstrap_agent: Option<AgentId>,
+        profile: Option<&str>,
         payload: Value,
         mode: PostMode,
     ) -> Result<ProxyPostOutcome, SandboxError> {
-        self.post_with_origin(server_id, bootstrap_agent, payload, mode, true)
+        self.post_with_origin(server_id, bootstrap_agent, profile, payload, mode, true)
             .await
     }
 
@@ -181,6 +215,7 @@ impl AcpProxyRuntime {
         &self,
         server_id: &str,
         bootstrap_agent: Option<AgentId>,
+        profile: Option<&str>,
         payload: Value,
         mode: PostMode,
         turn_events: bool,
@@ -197,12 +232,13 @@ impl AcpProxyRuntime {
             method = method,
             id = %id,
             bootstrap_agent = ?bootstrap_agent,
+            profile = ?profile,
             "acp_proxy: POST received"
         );
 
         let start = std::time::Instant::now();
         let instance = self
-            .get_or_create_instance(server_id, bootstrap_agent, turn_events)
+            .get_or_create_instance(server_id, bootstrap_agent, profile, turn_events)
             .await?;
         let instance_elapsed = start.elapsed();
 
@@ -343,19 +379,11 @@ impl AcpProxyRuntime {
         &self,
         server_id: &str,
         bootstrap_agent: Option<AgentId>,
+        profile: Option<&str>,
         turn_events: bool,
     ) -> Result<Arc<ProxyInstance>, SandboxError> {
         if let Some(existing) = self.live_instance(server_id).await {
-            if let Some(agent) = bootstrap_agent {
-                if agent != existing.agent {
-                    return Err(SandboxError::Conflict {
-                        message: format!(
-                            "server '{server_id}' already exists for agent '{}'; requested '{agent}'",
-                            existing.agent.as_str()
-                        ),
-                    });
-                }
-            }
+            check_existing(&existing, server_id, bootstrap_agent, profile)?;
             return Ok(existing);
         }
 
@@ -369,16 +397,7 @@ impl AcpProxyRuntime {
         let _guard = lock.lock().await;
 
         if let Some(existing) = self.live_instance(server_id).await {
-            if let Some(agent) = bootstrap_agent {
-                if agent != existing.agent {
-                    return Err(SandboxError::Conflict {
-                        message: format!(
-                            "server '{server_id}' already exists for agent '{}'; requested '{agent}'",
-                            existing.agent.as_str()
-                        ),
-                    });
-                }
-            }
+            check_existing(&existing, server_id, bootstrap_agent, profile)?;
             return Ok(existing);
         }
 
@@ -391,7 +410,9 @@ impl AcpProxyRuntime {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(shutting_down_error());
         }
-        let created = self.create_instance(server_id, agent, turn_events).await?;
+        let created = self
+            .create_instance(server_id, agent, profile, turn_events)
+            .await?;
         {
             let mut instances = self.inner.instances.write().await;
             if self.inner.shutting_down.load(Ordering::SeqCst) {
@@ -410,6 +431,7 @@ impl AcpProxyRuntime {
         &self,
         server_id: &str,
         agent: AgentId,
+        profile: Option<&str>,
         turn_events: bool,
     ) -> Result<Arc<ProxyInstance>, SandboxError> {
         let total_started = std::time::Instant::now();
@@ -418,6 +440,13 @@ impl AcpProxyRuntime {
             agent = agent.as_str(),
             "create_instance: starting"
         );
+
+        // Resolve the profile first: an unknown or broken profile starts no
+        // agent process and installs nothing.
+        let profile = match profile {
+            Some(name) => Some((name.to_string(), self.inner.profiles.resolve(agent, name)?)),
+            None => None,
+        };
 
         let install_started = std::time::Instant::now();
         self.ensure_installed(agent).await?;
@@ -447,6 +476,20 @@ impl AcpProxyRuntime {
                     .entry("SANDBOX_AGENT_BIN".to_string())
                     .or_insert(path);
             }
+        }
+
+        if let Some((name, resolved)) = &profile {
+            for (key, value) in &resolved.process.env {
+                launch.env.insert(key.clone(), value.clone());
+            }
+            // Keys only: profile env values are often secrets.
+            tracing::info!(
+                server_id = server_id,
+                agent = agent.as_str(),
+                profile = name.as_str(),
+                env_keys = ?resolved.process.env.keys().collect::<Vec<_>>(),
+                "create_instance: applied profile process env"
+            );
         }
 
         tracing::info!(
@@ -487,6 +530,10 @@ impl AcpProxyRuntime {
             agent,
             runtime: Arc::new(runtime),
             created_at_ms: now_ms(),
+            profile: profile.map(|(name, resolved)| BoundProfile {
+                name,
+                process_fingerprint: resolved.process_fingerprint(),
+            }),
         }))
     }
 
@@ -582,7 +629,7 @@ impl AcpDispatch for AcpProxyRuntime {
             // It also tracks turns itself, so its servers do not publish turn
             // lifecycle events.
             match self
-                .post_with_origin(&server_id, agent, payload, PostMode::Sync, false)
+                .post_with_origin(&server_id, agent, None, payload, PostMode::Sync, false)
                 .await
             {
                 Ok(ProxyPostOutcome::Response(value)) => Ok(AcpDispatchResult::Response(value)),
@@ -628,6 +675,37 @@ fn shutting_down_error() -> SandboxError {
     SandboxError::Conflict {
         message: "server is shutting down".to_string(),
     }
+}
+
+/// A request for a running server must not ask for another agent or profile.
+/// A request without a profile uses the profile the server was started with.
+fn check_existing(
+    existing: &ProxyInstance,
+    server_id: &str,
+    agent: Option<AgentId>,
+    profile: Option<&str>,
+) -> Result<(), SandboxError> {
+    if let Some(agent) = agent {
+        if agent != existing.agent {
+            return Err(SandboxError::Conflict {
+                message: format!(
+                    "server '{server_id}' already exists for agent '{}'; requested '{agent}'",
+                    existing.agent.as_str()
+                ),
+            });
+        }
+    }
+    if let Some(requested) = profile {
+        let bound = existing.profile.as_ref().map(|bound| bound.name.as_str());
+        if bound != Some(requested) {
+            return Err(SandboxError::ProfileMismatch {
+                server_id: server_id.to_string(),
+                bound: bound.map(str::to_string),
+                requested: requested.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn remove_exited_instance(inner: &AcpProxyRuntimeInner, instance: &Arc<ProxyInstance>) {

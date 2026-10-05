@@ -215,6 +215,8 @@ pub struct FsUploadBatchResponse {
 pub struct AcpPostQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
@@ -223,6 +225,13 @@ pub struct AcpServerInfo {
     pub server_id: String,
     pub agent: String,
     pub created_at_ms: i64,
+    /// Profile the agent process was started with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Set with `profile`: true when the profile's `process` part changed (or
+    /// the profile was deleted) since the process started. Restart to apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_stale: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
