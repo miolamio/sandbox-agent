@@ -64,8 +64,9 @@ pub fn merge_profiles(base: &AgentProfile, derived: &AgentProfile) -> AgentProfi
     }
 }
 
+/// Trimmed, as in `validate_profile_shape`.
 fn mcp_server_name(server: &Value) -> Option<&str> {
-    server.get("name").and_then(Value::as_str)
+    server.get("name").and_then(Value::as_str).map(str::trim)
 }
 
 /// Base order is kept; a derived entry replaces the base entry of the same
@@ -105,6 +106,12 @@ pub fn parse_extends(agent: AgentId, raw: &str) -> Result<String, SandboxError> 
     let raw = raw.trim();
     let name = match raw.split_once('/') {
         Some((parent_agent, name)) => {
+            if parent_agent.is_empty() || name.is_empty() || name.contains('/') {
+                return Err(profile_invalid(
+                    format!("extends '{raw}' must be '<name>' or '<agent>/<name>'"),
+                    &["extends"],
+                ));
+            }
             if parent_agent != agent.as_str() {
                 return Err(profile_invalid(
                     format!(
@@ -344,5 +351,60 @@ mod tests {
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_chain_reports_self_cycle() {
+        let profiles: BTreeMap<String, AgentProfile> =
+            [("a".to_string(), p(json!({ "extends": "a" })))]
+                .into_iter()
+                .collect();
+        let (message, fields) =
+            invalid(resolve_chain(AgentId::Mock, "a", |name| profiles.get(name)).unwrap_err());
+        assert_eq!(fields, vec!["extends"]);
+        assert!(message.contains("cycle: a -> a"), "{message}");
+    }
+
+    #[test]
+    fn parse_extends_accepts_plain_and_prefixed_names() {
+        assert_eq!(parse_extends(AgentId::Mock, "base").unwrap(), "base");
+        assert_eq!(parse_extends(AgentId::Mock, "mock/base").unwrap(), "base");
+        assert_eq!(parse_extends(AgentId::Mock, "  base  ").unwrap(), "base");
+    }
+
+    #[test]
+    fn parse_extends_rejects_malformed_values() {
+        for bad in ["mock/", "/base", "a/b/c", "mock/a/b"] {
+            let (message, fields) = invalid(parse_extends(AgentId::Mock, bad).unwrap_err());
+            assert_eq!(fields, vec!["extends"], "{bad}");
+            assert!(
+                message.contains("must be '<name>' or '<agent>/<name>'"),
+                "{bad}: {message}"
+            );
+            assert!(!message.contains("agent ''"), "{bad}: {message}");
+        }
+        let (message, fields) = invalid(parse_extends(AgentId::Mock, "my base").unwrap_err());
+        assert_eq!(fields, vec!["extends"]);
+        assert!(message.contains("not a valid profile name"), "{message}");
+    }
+
+    #[test]
+    fn derived_empty_env_value_overrides_base() {
+        let base = p(json!({ "process": { "env": { "A": "base" } } }));
+        let derived = p(json!({ "process": { "env": { "A": "" } } }));
+        let merged = merge_profiles(&base, &derived);
+        assert_eq!(merged.process.env.get("A").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn mcp_servers_merge_by_trimmed_name() {
+        let base = p(json!({ "session": { "mcpServers": [{ "name": "fs", "command": "base" }] } }));
+        let derived =
+            p(json!({ "session": { "mcpServers": [{ "name": " fs ", "command": "derived" }] } }));
+        let merged = merge_profiles(&base, &derived);
+        assert_eq!(
+            merged.session.mcp_servers,
+            vec![json!({ "name": " fs ", "command": "derived" })]
+        );
     }
 }
