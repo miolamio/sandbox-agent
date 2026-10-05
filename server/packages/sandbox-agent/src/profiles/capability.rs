@@ -60,7 +60,18 @@ pub fn agent_customization_for(agent: AgentId) -> AgentCustomization {
     }
 }
 
+/// A JSON value counts as set unless it is null, an empty array or an empty object.
+fn value_is_set(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(map) => !map.is_empty(),
+        _ => true,
+    }
+}
+
 /// Fields set in `profile` that `agent` does not support, as dotted paths.
+/// Empty arrays and objects count as unset.
 pub fn unsupported_fields(agent: AgentId, profile: &AgentProfile) -> Vec<String> {
     let caps = agent_customization_for(agent);
     let mut fields = Vec::new();
@@ -75,12 +86,16 @@ pub fn unsupported_fields(agent: AgentId, profile: &AgentProfile) -> Vec<String>
         "process.env",
     );
     check(
-        profile.process.args.is_some(),
+        profile
+            .process
+            .args
+            .as_ref()
+            .is_some_and(|args| !args.is_empty()),
         caps.process.args,
         "process.args",
     );
     check(
-        profile.process.config.is_some(),
+        profile.process.config.as_ref().is_some_and(value_is_set),
         caps.process.config.is_some(),
         "process.config",
     );
@@ -99,7 +114,11 @@ pub fn unsupported_fields(agent: AgentId, profile: &AgentProfile) -> Vec<String>
         "session.mcpServers",
     );
     check(
-        profile.session.skills.is_some(),
+        profile
+            .session
+            .skills
+            .as_ref()
+            .is_some_and(|skills| !skills.is_empty()),
         caps.session.skills,
         "session.skills",
     );
@@ -159,11 +178,11 @@ mod tests {
     #[test]
     fn unsupported_fields_lists_every_field() {
         let profile = p(json!({
-            "process": { "env": { "A": "1" }, "args": ["--x"], "config": {} },
+            "process": { "env": { "A": "1" }, "args": ["--x"], "config": { "model": "x" } },
             "session": {
                 "systemPrompt": { "mode": "replace", "text": "x" },
                 "mcpServers": [{ "name": "fs" }],
-                "skills": [],
+                "skills": [{ "name": "s" }],
                 "plugins": [{ "path": "/p" }],
                 "pluginConfigs": { "p": {} }
             }
@@ -183,6 +202,50 @@ mod tests {
             unsupported_fields(AgentId::Claude, &profile),
             vec!["process.args", "process.config", "session.skills"]
         );
+    }
+
+    #[test]
+    fn empty_fields_count_as_unset() {
+        let profile = p(json!({
+            "process": { "env": {}, "args": [], "config": {} },
+            "session": {
+                "mcpServers": [],
+                "skills": [],
+                "plugins": [],
+                "pluginConfigs": {}
+            }
+        }));
+        for agent in [AgentId::Codex, AgentId::Claude, AgentId::Pi] {
+            assert!(unsupported_fields(agent, &profile).is_empty(), "{agent:?}");
+        }
+        let null_config = p(json!({ "process": { "config": null } }));
+        assert!(unsupported_fields(AgentId::Codex, &null_config).is_empty());
+        let scalar_config = p(json!({ "process": { "config": "x" } }));
+        assert_eq!(
+            unsupported_fields(AgentId::Codex, &scalar_config),
+            vec!["process.config"]
+        );
+    }
+
+    #[test]
+    fn spec_example_profile_is_valid_for_claude() {
+        let profile = p(json!({
+            "agent": "claude",
+            "extends": "base",
+            "process": {
+                "env": { "ANTHROPIC_BASE_URL": "x", "CLAUDE_CODE_PLUGIN_DIRS": "y" },
+                "args": [],
+                "config": {}
+            },
+            "session": {
+                "systemPrompt": { "mode": "replace", "text": "x" },
+                "mcpServers": [],
+                "skills": [],
+                "plugins": [{ "path": "/opt/mods/first-mod" }],
+                "pluginConfigs": {}
+            }
+        }));
+        assert!(validate_customization(AgentId::Claude, &profile).is_ok());
     }
 
     #[test]
