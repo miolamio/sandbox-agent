@@ -240,6 +240,29 @@ eval "$(sandbox-agent credentials extract-env --export)"
 
 When Claude uses `apiKeyHelper`, no `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY` line is printed. A shell comment is printed instead, so the output stays safe to `eval`.
 
+## profiles
+
+Manage [agent profiles](/agent-profiles) on a running server.
+
+```bash
+sandbox-agent profiles list [--endpoint <URL>]
+sandbox-agent profiles get <AGENT> <NAME> [--endpoint <URL>]
+sandbox-agent profiles put <AGENT> <NAME> (--json <JSON> | --json-file <FILE>) [--endpoint <URL>]
+sandbox-agent profiles delete <AGENT> <NAME> [--endpoint <URL>]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-e, --endpoint <URL>` | `http://127.0.0.1:2468` | Target server |
+| `--json <JSON>` | - | Profile body (`put`) |
+| `--json-file <FILE>` | - | Profile body from a file (`put`) |
+
+`get` and `put` print the stored and the resolved profile with secret values shown as `***`. In `put`, a `***` value keeps the stored value of that key.
+
+```bash
+sandbox-agent profiles put claude review --json '{"extends":"base","session":{"systemPrompt":{"mode":"replace","text":"You review code."}}}'
+```
+
 ## api
 
 API subcommands for scripting.

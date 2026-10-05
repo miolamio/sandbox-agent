@@ -88,6 +88,8 @@ pub enum Command {
     InstallAgent(InstallAgentArgs),
     /// Inspect locally discovered credentials.
     Credentials(CredentialsArgs),
+    /// Manage agent profiles on a running server.
+    Profiles(ProfilesArgs),
     /// Internal: stdio JSON-RPC echo agent for the mock agent process.
     #[command(hide = true)]
     MockAgentProcess,
@@ -182,6 +184,44 @@ impl Default for OpencodeArgs {
 pub struct CredentialsArgs {
     #[command(subcommand)]
     command: CredentialsCommand,
+}
+
+#[derive(Args, Debug)]
+pub struct ProfilesArgs {
+    #[command(subcommand)]
+    command: ProfilesCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProfilesCommand {
+    /// List profiles (agent, name, source, extends).
+    List(ClientArgs),
+    /// Show one profile, stored and resolved, with secrets masked.
+    Get(ProfileRefArgs),
+    /// Create or replace a profile from JSON (`***` keeps a stored secret).
+    Put(ProfilePutArgs),
+    /// Delete a profile.
+    Delete(ProfileRefArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ProfileRefArgs {
+    agent: String,
+    name: String,
+    #[command(flatten)]
+    client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct ProfilePutArgs {
+    agent: String,
+    name: String,
+    #[arg(long)]
+    json: Option<String>,
+    #[arg(long = "json-file")]
+    json_file: Option<PathBuf>,
+    #[command(flatten)]
+    client: ClientArgs,
 }
 
 #[derive(Args, Debug)]
@@ -310,6 +350,9 @@ pub struct AcpPostArgs {
     server_id: String,
     #[arg(long = "agent")]
     agent: Option<String>,
+    /// Agent profile for the server this request creates.
+    #[arg(long = "profile")]
+    profile: Option<String>,
     #[arg(long)]
     json: Option<String>,
     #[arg(long = "json-file")]
@@ -462,6 +505,7 @@ pub fn run_command(command: &Command, cli: &CliConfig) -> Result<(), CliError> {
         Command::Daemon(subcommand) => run_daemon(&subcommand.command, cli),
         Command::InstallAgent(args) => install_agent_local(args),
         Command::Credentials(subcommand) => run_credentials(&subcommand.command),
+        Command::Profiles(subcommand) => run_profiles(&subcommand.command, cli),
         Command::MockAgentProcess => run_mock_agent_process(),
     }
 }
@@ -958,8 +1002,8 @@ fn config_value_to_string(value: Option<&Value>) -> Option<String> {
 
 fn call_acp_extension(ctx: &ClientContext, method: &str, params: Value) -> Result<Value, CliError> {
     let server_id = unique_cli_server_id("cli-ext");
-    let initialize_path = build_acp_server_path(&server_id, Some("mock"))?;
-    let request_path = build_acp_server_path(&server_id, None)?;
+    let initialize_path = build_acp_server_path(&server_id, Some("mock"), None)?;
+    let request_path = build_acp_server_path(&server_id, None, None)?;
 
     let initialize = json!({
         "jsonrpc": "2.0",
@@ -1018,13 +1062,17 @@ fn run_acp(command: &AcpCommand, cli: &CliConfig) -> Result<(), CliError> {
         AcpCommand::Post(args) => {
             let ctx = ClientContext::new(cli, &args.client)?;
             let payload = load_json_payload(args.json.as_deref(), args.json_file.as_deref())?;
-            let path = build_acp_server_path(&args.server_id, args.agent.as_deref())?;
+            let path = build_acp_server_path(
+                &args.server_id,
+                args.agent.as_deref(),
+                args.profile.as_deref(),
+            )?;
             let response = ctx.post(&path, &payload)?;
             print_json_or_empty(response)
         }
         AcpCommand::Stream(args) => {
             let ctx = ClientContext::new(cli, &args.client)?;
-            let path = build_acp_server_path(&args.server_id, None)?;
+            let path = build_acp_server_path(&args.server_id, None, None)?;
             let request = ctx
                 .request(Method::GET, &path)
                 .header("accept", "text/event-stream");
@@ -1036,11 +1084,54 @@ fn run_acp(command: &AcpCommand, cli: &CliConfig) -> Result<(), CliError> {
         }
         AcpCommand::Close(args) => {
             let ctx = ClientContext::new(cli, &args.client)?;
-            let path = build_acp_server_path(&args.server_id, None)?;
+            let path = build_acp_server_path(&args.server_id, None, None)?;
             let response = ctx.delete(&path)?;
             print_empty_response(response)
         }
     }
+}
+
+fn run_profiles(command: &ProfilesCommand, cli: &CliConfig) -> Result<(), CliError> {
+    match command {
+        ProfilesCommand::List(args) => {
+            let ctx = ClientContext::new(cli, args)?;
+            print_json_or_empty(ctx.get(&format!("{API_PREFIX}/config/profiles"))?)
+        }
+        ProfilesCommand::Get(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            print_json_or_empty(ctx.get(&profile_path(&args.agent, &args.name)?)?)
+        }
+        ProfilesCommand::Put(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            let payload = load_json_payload(args.json.as_deref(), args.json_file.as_deref())?;
+            print_json_or_empty(ctx.put(&profile_path(&args.agent, &args.name)?, &payload)?)
+        }
+        ProfilesCommand::Delete(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            print_empty_response(ctx.delete(&profile_path(&args.agent, &args.name)?)?)
+        }
+    }
+}
+
+fn profile_path(agent: &str, name: &str) -> Result<String, CliError> {
+    for (label, value) in [("agent", agent), ("name", name)] {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(CliError::Server(format!(
+                "profile {label} must not be empty"
+            )));
+        }
+        if value.contains('/') {
+            return Err(CliError::Server(format!(
+                "profile {label} must not contain '/'"
+            )));
+        }
+    }
+    Ok(format!(
+        "{API_PREFIX}/config/profiles/{}/{}",
+        agent.trim(),
+        name.trim()
+    ))
 }
 
 fn run_opencode(cli: &CliConfig, args: &OpencodeArgs) -> Result<(), CliError> {
@@ -1672,6 +1763,7 @@ fn unique_cli_server_id(prefix: &str) -> String {
 fn build_acp_server_path(
     server_id: &str,
     bootstrap_agent: Option<&str>,
+    profile: Option<&str>,
 ) -> Result<String, CliError> {
     let server_id = server_id.trim();
     if server_id.is_empty() {
@@ -1683,7 +1775,7 @@ fn build_acp_server_path(
         ));
     }
 
-    let mut path = format!("{API_PREFIX}/acp/{server_id}");
+    let mut query = Vec::new();
     if let Some(agent) = bootstrap_agent {
         let agent = agent.trim();
         if agent.is_empty() {
@@ -1691,10 +1783,23 @@ fn build_acp_server_path(
                 "agent must not be empty when provided".to_string(),
             ));
         }
-        path.push_str("?agent=");
-        path.push_str(agent);
+        query.push(format!("agent={agent}"));
+    }
+    if let Some(profile) = profile {
+        let profile = profile.trim();
+        if profile.is_empty() {
+            return Err(CliError::Server(
+                "profile must not be empty when provided".to_string(),
+            ));
+        }
+        query.push(format!("profile={profile}"));
     }
 
+    let mut path = format!("{API_PREFIX}/acp/{server_id}");
+    if !query.is_empty() {
+        path.push('?');
+        path.push_str(&query.join("&"));
+    }
     Ok(path)
 }
 
@@ -1821,6 +1926,14 @@ impl ClientContext {
         body: &T,
     ) -> Result<reqwest::blocking::Response, CliError> {
         Ok(self.request(Method::POST, path).json(body).send()?)
+    }
+
+    fn put<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<reqwest::blocking::Response, CliError> {
+        Ok(self.request(Method::PUT, path).json(body).send()?)
     }
 
     fn delete(&self, path: &str) -> Result<reqwest::blocking::Response, CliError> {
@@ -2303,5 +2416,108 @@ mod tests {
         assert!(thought_values.contains(&"low"));
         assert!(thought_values.contains(&"medium"));
         assert!(thought_values.contains(&"high"));
+    }
+
+    #[test]
+    fn profiles_put_parses_agent_name_and_payload() {
+        let cli = SandboxAgentCli::try_parse_from([
+            "sandbox-agent",
+            "profiles",
+            "put",
+            "claude",
+            "review",
+            "--json-file",
+            "/tmp/review.json",
+            "--endpoint",
+            "http://127.0.0.1:3000",
+        ])
+        .expect("parse profiles put");
+        match cli.command {
+            Command::Profiles(args) => match args.command {
+                ProfilesCommand::Put(put) => {
+                    assert_eq!(put.agent, "claude");
+                    assert_eq!(put.name, "review");
+                    assert_eq!(put.json_file, Some(PathBuf::from("/tmp/review.json")));
+                    assert_eq!(
+                        put.client.endpoint.as_deref(),
+                        Some("http://127.0.0.1:3000")
+                    );
+                }
+                other => panic!("unexpected profiles command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profiles_list_get_delete_parse() {
+        for args in [
+            vec!["sandbox-agent", "profiles", "list"],
+            vec!["sandbox-agent", "profiles", "get", "claude", "review"],
+            vec!["sandbox-agent", "profiles", "delete", "claude", "review"],
+        ] {
+            let cli = SandboxAgentCli::try_parse_from(args.iter().copied()).expect("parse");
+            assert!(matches!(cli.command, Command::Profiles(_)), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn profile_path_validates_parts() {
+        assert_eq!(
+            profile_path("claude", "review").unwrap(),
+            "/v1/config/profiles/claude/review"
+        );
+        assert!(profile_path("claude", "a/b").is_err());
+        assert!(profile_path(" ", "review").is_err());
+    }
+
+    #[test]
+    fn acp_server_path_includes_profile() {
+        assert_eq!(
+            build_acp_server_path("s1", Some("claude"), Some("review")).unwrap(),
+            "/v1/acp/s1?agent=claude&profile=review"
+        );
+        assert_eq!(
+            build_acp_server_path("s1", None, Some("review")).unwrap(),
+            "/v1/acp/s1?profile=review"
+        );
+        assert_eq!(
+            build_acp_server_path("s1", Some("mock"), None).unwrap(),
+            "/v1/acp/s1?agent=mock"
+        );
+        assert_eq!(
+            build_acp_server_path("s1", None, None).unwrap(),
+            "/v1/acp/s1"
+        );
+        assert!(build_acp_server_path("s1", None, Some(" ")).is_err());
+    }
+
+    #[test]
+    fn acp_post_parses_profile() {
+        let cli = SandboxAgentCli::try_parse_from([
+            "sandbox-agent",
+            "api",
+            "acp",
+            "post",
+            "--server-id",
+            "s1",
+            "--agent",
+            "claude",
+            "--profile",
+            "review",
+            "--json",
+            "{}",
+        ])
+        .expect("parse acp post");
+        match cli.command {
+            Command::Api(api) => match api.command {
+                ApiCommand::Acp(acp) => match acp.command {
+                    AcpCommand::Post(post) => assert_eq!(post.profile.as_deref(), Some("review")),
+                    other => panic!("unexpected acp command: {other:?}"),
+                },
+                other => panic!("unexpected api command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }
