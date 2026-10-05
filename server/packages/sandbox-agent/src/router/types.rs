@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::*;
+// Bare names keep utoipa schema refs (`#/components/schemas/AgentProfile`) resolvable.
+use crate::profiles::{AgentCustomization, AgentProfile, ProfileSource};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
 pub struct HealthResponse {
@@ -57,7 +59,7 @@ pub struct AgentInfo {
     pub path: Option<String>,
     pub capabilities: AgentCapabilities,
     /// Profile fields this agent supports.
-    pub customization: crate::profiles::AgentCustomization,
+    pub customization: AgentCustomization,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_status: Option<ServerStatusInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -581,7 +583,7 @@ pub struct ProcessWsQuery {
 pub struct ProfileSummary {
     pub agent: String,
     pub name: String,
-    pub source: crate::profiles::ProfileSource,
+    pub source: ProfileSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extends: Option<String>,
 }
@@ -602,8 +604,8 @@ pub struct ProfileListResponse {
 pub struct ProfileDetailResponse {
     pub agent: String,
     pub name: String,
-    pub source: crate::profiles::ProfileSource,
-    pub stored: crate::profiles::AgentProfile,
-    pub resolved: crate::profiles::AgentProfile,
+    pub source: ProfileSource,
+    pub stored: AgentProfile,
+    pub resolved: AgentProfile,
     pub has_value: BTreeMap<String, bool>,
 }

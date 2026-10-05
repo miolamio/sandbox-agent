@@ -47,6 +47,34 @@ export interface paths {
      */
     delete: operations["delete_v1_config_mcp"];
   };
+  "/v1/config/profiles": {
+    /**
+     * List agent profiles.
+     * @description Returns every profile with its source (`api` or `file`) and parent.
+     */
+    get: operations["get_v1_config_profiles"];
+  };
+  "/v1/config/profiles/{agent}/{name}": {
+    /**
+     * Get one agent profile.
+     * @description Returns the stored profile and the profile resolved through `extends`, with
+     * `process.env`, `session.pluginConfigs` and MCP server `env`/`headers` values
+     * masked as `***`.
+     */
+    get: operations["get_v1_config_profile"];
+    /**
+     * Create or replace an agent profile.
+     * @description A `***` value in `process.env`, `session.pluginConfigs` or an MCP server's
+     * `env`/`headers` entry keeps the stored value. Running agent servers keep
+     * the `process` part they started with.
+     */
+    put: operations["put_v1_config_profile"];
+    /**
+     * Delete an agent profile.
+     * @description Running agent servers keep the settings they started with.
+     */
+    delete: operations["delete_v1_config_profile"];
+  };
   "/v1/config/skills": {
     /**
      * Get a stored skills entry (deprecated).
@@ -502,11 +530,19 @@ export interface components {
     };
     AcpPostQuery: {
       agent?: string | null;
+      profile?: string | null;
     };
     AcpServerInfo: {
       agent: string;
       /** Format: int64 */
       createdAtMs: number;
+      /** @description Profile the agent process was started with. */
+      profile?: string | null;
+      /**
+       * @description Set with `profile`: true when the profile's `process` part changed (or
+       * the profile was deleted) since the process started. Restart to apply.
+       */
+      profileStale?: boolean | null;
       serverId: string;
     };
     AcpServerListResponse: {
@@ -532,11 +568,17 @@ export interface components {
       toolCalls: boolean;
       toolResults: boolean;
     };
+    /** @description Which profile fields an agent supports (`customization` in `/v1/agents`). */
+    AgentCustomization: {
+      process: components["schemas"]["ProcessCustomization"];
+      session: components["schemas"]["SessionCustomization"];
+    };
     AgentInfo: {
       capabilities: components["schemas"]["AgentCapabilities"];
       configError?: string | null;
       configOptions?: unknown[] | null;
       credentialsAvailable: boolean;
+      customization: components["schemas"]["AgentCustomization"];
       id: string;
       installed: boolean;
       path?: string | null;
@@ -560,6 +602,18 @@ export interface components {
     };
     AgentListResponse: {
       agents: components["schemas"]["AgentInfo"][];
+    };
+    /**
+     * @description One agent profile. `agent` and `name` are optional in request bodies (the
+     * path names the profile) and required in the `--profiles` file.
+     */
+    AgentProfile: {
+      agent?: string | null;
+      /** @description Parent profile of the same agent: `"base"` or `"<agent>/base"`. */
+      extends?: string | null;
+      name?: string | null;
+      process?: components["schemas"]["ProfileProcess"];
+      session?: components["schemas"]["ProfileSession"];
     };
     DesktopActionResponse: {
       ok: boolean;
@@ -827,7 +881,10 @@ export interface components {
       | "session_already_exists"
       | "mode_not_supported"
       | "stream_error"
-      | "timeout";
+      | "timeout"
+      | "profile_mismatch"
+      | "profile_read_only"
+      | "profile_invalid";
     FsActionResponse: {
       path: string;
     };
@@ -973,6 +1030,12 @@ export interface components {
       interactive?: boolean;
       tty?: boolean;
     };
+    ProcessCustomization: {
+      args: boolean;
+      /** @description Format of `process.config` (for example `codex-toml`); absent when unsupported. */
+      config?: string | null;
+      env: boolean;
+    };
     ProcessInfo: {
       args: string[];
       command: string;
@@ -1069,12 +1132,69 @@ export interface components {
       /** Format: int32 */
       rows: number;
     };
+    /**
+     * @description One profile as stored and as resolved through `extends`. Values of
+     * `process.env`, `session.pluginConfigs` and the `env`/`headers` entries of
+     * `session.mcpServers` are masked as `***` in both; `hasValue` says which of
+     * them are set (keys like `process.env.TOKEN`,
+     * `session.mcpServers.gh.headers.Authorization`).
+     */
+    ProfileDetailResponse: {
+      agent: string;
+      hasValue: {
+        [key: string]: boolean;
+      };
+      name: string;
+      resolved: components["schemas"]["AgentProfile"];
+      source: components["schemas"]["ProfileSource"];
+      stored: components["schemas"]["AgentProfile"];
+    };
+    ProfileListResponse: {
+      profiles: components["schemas"]["ProfileSummary"][];
+    };
+    ProfilePlugin: {
+      path: string;
+    };
+    /** @description Applied when the agent process starts. */
+    ProfileProcess: {
+      args?: string[] | null;
+      config?: unknown;
+      env?: {
+        [key: string]: string;
+      };
+    };
+    /** @description Applied to every session of the agent process. */
+    ProfileSession: {
+      /** @description MCP servers in the session request format; every entry needs a `name`. */
+      mcpServers?: unknown[];
+      pluginConfigs?: {
+        [key: string]: unknown;
+      };
+      plugins?: components["schemas"]["ProfilePlugin"][];
+      skills?: unknown[] | null;
+      systemPrompt?: components["schemas"]["SystemPrompt"] | null;
+    };
+    /** @enum {string} */
+    ProfileSource: "api" | "file";
+    ProfileSummary: {
+      agent: string;
+      extends?: string | null;
+      name: string;
+      source: components["schemas"]["ProfileSource"];
+    };
     /** @enum {string} */
     ServerStatus: "running" | "stopped";
     ServerStatusInfo: {
       status: components["schemas"]["ServerStatus"];
       /** Format: int64 */
       uptimeMs?: number | null;
+    };
+    SessionCustomization: {
+      mcpServers: boolean;
+      pluginConfigs: boolean;
+      plugins: boolean;
+      skills: boolean;
+      systemPrompt: components["schemas"]["SystemPromptMode"][];
     };
     SkillSource: {
       ref?: string | null;
@@ -1090,6 +1210,12 @@ export interface components {
       directory: string;
       skillName: string;
     };
+    SystemPrompt: {
+      mode: components["schemas"]["SystemPromptMode"];
+      text: string;
+    };
+    /** @enum {string} */
+    SystemPromptMode: "replace" | "append";
   };
   responses: never;
   parameters: never;
@@ -1154,6 +1280,8 @@ export interface operations {
       query?: {
         /** @description Agent id required for first POST */
         agent?: string | null;
+        /** @description Agent profile for the server this request creates; on a running server it must match the server's profile */
+        profile?: string | null;
       };
       header?: {
         /** @description Set to `1` to receive `session/prompt` responses over SSE (POST returns 202) */
@@ -1186,7 +1314,7 @@ export interface operations {
           "application/json": components["schemas"]["ProblemDetails"];
         };
       };
-      /** @description Unknown ACP server */
+      /** @description Unknown ACP server or profile */
       404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -1198,7 +1326,7 @@ export interface operations {
           "application/json": components["schemas"]["ProblemDetails"];
         };
       };
-      /** @description ACP server bound to different agent */
+      /** @description ACP server bound to a different agent or profile */
       409: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -1402,6 +1530,141 @@ export interface operations {
       /** @description Deleted */
       204: {
         content: never;
+      };
+    };
+  };
+  /**
+   * List agent profiles.
+   * @description Returns every profile with its source (`api` or `file`) and parent.
+   */
+  get_v1_config_profiles: {
+    responses: {
+      /** @description Stored agent profiles */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ProfileListResponse"];
+        };
+      };
+    };
+  };
+  /**
+   * Get one agent profile.
+   * @description Returns the stored profile and the profile resolved through `extends`, with
+   * `process.env`, `session.pluginConfigs` and MCP server `env`/`headers` values
+   * masked as `***`.
+   */
+  get_v1_config_profile: {
+    parameters: {
+      path: {
+        /** @description Agent id */
+        agent: string;
+        /** @description Profile name */
+        name: string;
+      };
+    };
+    responses: {
+      /** @description Stored and resolved profile, secrets masked */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ProfileDetailResponse"];
+        };
+      };
+      /** @description Unknown agent */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
+      };
+      /** @description Profile not found */
+      404: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
+      };
+    };
+  };
+  /**
+   * Create or replace an agent profile.
+   * @description A `***` value in `process.env`, `session.pluginConfigs` or an MCP server's
+   * `env`/`headers` entry keeps the stored value. Running agent servers keep
+   * the `process` part they started with.
+   */
+  put_v1_config_profile: {
+    parameters: {
+      path: {
+        /** @description Agent id */
+        agent: string;
+        /** @description Profile name */
+        name: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["AgentProfile"];
+      };
+    };
+    responses: {
+      /** @description Profile stored; stored and resolved profile, secrets masked */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ProfileDetailResponse"];
+        };
+      };
+      /** @description Invalid profile: name, JSON, extends cycle or unknown parent, or fields the agent does not support (listed in details.fields) */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
+      };
+      /** @description Profile comes from the --profiles file and is read-only */
+      409: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
+      };
+      /** @description Request body is not application/json */
+      415: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
+      };
+    };
+  };
+  /**
+   * Delete an agent profile.
+   * @description Running agent servers keep the settings they started with.
+   */
+  delete_v1_config_profile: {
+    parameters: {
+      path: {
+        /** @description Agent id */
+        agent: string;
+        /** @description Profile name */
+        name: string;
+      };
+    };
+    responses: {
+      /** @description Profile deleted */
+      204: {
+        content: never;
+      };
+      /** @description Unknown agent */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
+      };
+      /** @description Profile not found */
+      404: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
+      };
+      /** @description Profile is read-only or another profile extends it */
+      409: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
       };
     };
   };

@@ -74,6 +74,12 @@ export type McpServerConfig = components["schemas"]["McpServerConfig"];
 
 export type SkillsConfigQuery = QueryParams<operations["get_v1_config_skills"]>;
 export type SkillsConfig = components["schemas"]["SkillsConfig"];
+export type AgentProfile = components["schemas"]["AgentProfile"];
+export type AgentCustomization = components["schemas"]["AgentCustomization"];
+export type ProfileSource = components["schemas"]["ProfileSource"];
+export type ProfileSummary = components["schemas"]["ProfileSummary"];
+export type ProfileListResponse = JsonResponse<operations["get_v1_config_profiles"], 200>;
+export type ProfileDetailResponse = JsonResponse<operations["get_v1_config_profile"], 200>;
 
 export type ProcessConfig = JsonResponse<operations["get_v1_processes_config"], 200>;
 export type ProcessCreateRequest = JsonRequestBody<operations["post_v1_processes"]>;

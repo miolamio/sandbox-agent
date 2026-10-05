@@ -8,6 +8,8 @@ use utoipa::OpenApi;
 fn main() {
     emit_stdout("cargo:rerun-if-changed=../sandbox-agent/src/router.rs");
     emit_stdout("cargo:rerun-if-changed=../sandbox-agent/src/lib.rs");
+    // Schemas live in router/types.rs and profiles/*.rs as well.
+    emit_stdout("cargo:rerun-if-changed=../sandbox-agent/src");
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
     let out_path = Path::new(&out_dir).join("openapi.json");

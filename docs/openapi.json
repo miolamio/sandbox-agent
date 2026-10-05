@@ -119,6 +119,16 @@
             }
           },
           {
+            "name": "profile",
+            "in": "query",
+            "description": "Agent profile for the server this request creates; on a running server it must match the server's profile",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
             "name": "x-sandboxagent-async-prompt",
             "in": "header",
             "description": "Set to `1` to receive `session/prompt` responses over SSE (POST returns 202)",
@@ -164,7 +174,7 @@
             }
           },
           "404": {
-            "description": "Unknown ACP server",
+            "description": "Unknown ACP server or profile",
             "content": {
               "application/json": {
                 "schema": {
@@ -184,7 +194,7 @@
             }
           },
           "409": {
-            "description": "ACP server bound to different agent",
+            "description": "ACP server bound to a different agent or profile",
             "content": {
               "application/json": {
                 "schema": {
@@ -537,6 +547,225 @@
           }
         },
         "deprecated": true
+      }
+    },
+    "/v1/config/profiles": {
+      "get": {
+        "tags": ["v1"],
+        "summary": "List agent profiles.",
+        "description": "Returns every profile with its source (`api` or `file`) and parent.",
+        "operationId": "get_v1_config_profiles",
+        "responses": {
+          "200": {
+            "description": "Stored agent profiles",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileListResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/profiles/{agent}/{name}": {
+      "get": {
+        "tags": ["v1"],
+        "summary": "Get one agent profile.",
+        "description": "Returns the stored profile and the profile resolved through `extends`, with\n`process.env`, `session.pluginConfigs` and MCP server `env`/`headers` values\nmasked as `***`.",
+        "operationId": "get_v1_config_profile",
+        "parameters": [
+          {
+            "name": "agent",
+            "in": "path",
+            "description": "Agent id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Profile name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored and resolved profile, secrets masked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown agent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Profile not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": ["v1"],
+        "summary": "Create or replace an agent profile.",
+        "description": "A `***` value in `process.env`, `session.pluginConfigs` or an MCP server's\n`env`/`headers` entry keeps the stored value. Running agent servers keep\nthe `process` part they started with.",
+        "operationId": "put_v1_config_profile",
+        "parameters": [
+          {
+            "name": "agent",
+            "in": "path",
+            "description": "Agent id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Profile name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentProfile"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Profile stored; stored and resolved profile, secrets masked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid profile: name, JSON, extends cycle or unknown parent, or fields the agent does not support (listed in details.fields)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Profile comes from the --profiles file and is read-only",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request body is not application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["v1"],
+        "summary": "Delete an agent profile.",
+        "description": "Running agent servers keep the settings they started with.",
+        "operationId": "delete_v1_config_profile",
+        "parameters": [
+          {
+            "name": "agent",
+            "in": "path",
+            "description": "Agent id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Profile name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Profile deleted"
+          },
+          "400": {
+            "description": "Unknown agent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Profile not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Profile is read-only or another profile extends it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/v1/config/skills": {
@@ -3655,6 +3884,10 @@
           "agent": {
             "type": "string",
             "nullable": true
+          },
+          "profile": {
+            "type": "string",
+            "nullable": true
           }
         }
       },
@@ -3668,6 +3901,16 @@
           "createdAtMs": {
             "type": "integer",
             "format": "int64"
+          },
+          "profile": {
+            "type": "string",
+            "description": "Profile the agent process was started with.",
+            "nullable": true
+          },
+          "profileStale": {
+            "type": "boolean",
+            "description": "Set with `profile`: true when the profile's `process` part changed (or\nthe profile was deleted) since the process started. Restart to apply.",
+            "nullable": true
           },
           "serverId": {
             "type": "string"
@@ -3765,9 +4008,22 @@
           }
         }
       },
+      "AgentCustomization": {
+        "type": "object",
+        "description": "Which profile fields an agent supports (`customization` in `/v1/agents`).",
+        "required": ["process", "session"],
+        "properties": {
+          "process": {
+            "$ref": "#/components/schemas/ProcessCustomization"
+          },
+          "session": {
+            "$ref": "#/components/schemas/SessionCustomization"
+          }
+        }
+      },
       "AgentInfo": {
         "type": "object",
-        "required": ["id", "installed", "credentialsAvailable", "capabilities"],
+        "required": ["id", "installed", "credentialsAvailable", "capabilities", "customization"],
         "properties": {
           "capabilities": {
             "$ref": "#/components/schemas/AgentCapabilities"
@@ -3783,6 +4039,9 @@
           },
           "credentialsAvailable": {
             "type": "boolean"
+          },
+          "customization": {
+            "$ref": "#/components/schemas/AgentCustomization"
           },
           "id": {
             "type": "string"
@@ -3870,6 +4129,32 @@
             }
           }
         }
+      },
+      "AgentProfile": {
+        "type": "object",
+        "description": "One agent profile. `agent` and `name` are optional in request bodies (the\npath names the profile) and required in the `--profiles` file.",
+        "properties": {
+          "agent": {
+            "type": "string",
+            "nullable": true
+          },
+          "extends": {
+            "type": "string",
+            "description": "Parent profile of the same agent: `\"base\"` or `\"<agent>/base\"`.",
+            "nullable": true
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "process": {
+            "$ref": "#/components/schemas/ProfileProcess"
+          },
+          "session": {
+            "$ref": "#/components/schemas/ProfileSession"
+          }
+        },
+        "additionalProperties": false
       },
       "DesktopActionResponse": {
         "type": "object",
@@ -4652,7 +4937,10 @@
           "session_already_exists",
           "mode_not_supported",
           "stream_error",
-          "timeout"
+          "timeout",
+          "profile_mismatch",
+          "profile_read_only",
+          "profile_invalid"
         ]
       },
       "FsActionResponse": {
@@ -5098,6 +5386,23 @@
           }
         }
       },
+      "ProcessCustomization": {
+        "type": "object",
+        "required": ["env", "args"],
+        "properties": {
+          "args": {
+            "type": "boolean"
+          },
+          "config": {
+            "type": "string",
+            "description": "Format of `process.config` (for example `codex-toml`); absent when unsupported.",
+            "nullable": true
+          },
+          "env": {
+            "type": "boolean"
+          }
+        }
+      },
       "ProcessInfo": {
         "type": "object",
         "required": ["id", "command", "args", "tty", "interactive", "owner", "status", "createdAtMs"],
@@ -5392,6 +5697,137 @@
           }
         }
       },
+      "ProfileDetailResponse": {
+        "type": "object",
+        "description": "One profile as stored and as resolved through `extends`. Values of\n`process.env`, `session.pluginConfigs` and the `env`/`headers` entries of\n`session.mcpServers` are masked as `***` in both; `hasValue` says which of\nthem are set (keys like `process.env.TOKEN`,\n`session.mcpServers.gh.headers.Authorization`).",
+        "required": ["agent", "name", "source", "stored", "resolved", "hasValue"],
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "hasValue": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "boolean"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "resolved": {
+            "$ref": "#/components/schemas/AgentProfile"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ProfileSource"
+          },
+          "stored": {
+            "$ref": "#/components/schemas/AgentProfile"
+          }
+        }
+      },
+      "ProfileListResponse": {
+        "type": "object",
+        "required": ["profiles"],
+        "properties": {
+          "profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProfileSummary"
+            }
+          }
+        }
+      },
+      "ProfilePlugin": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProfileProcess": {
+        "type": "object",
+        "description": "Applied when the agent process starts.",
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "nullable": true
+          },
+          "config": {
+            "nullable": true
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProfileSession": {
+        "type": "object",
+        "description": "Applied to every session of the agent process.",
+        "properties": {
+          "mcpServers": {
+            "type": "array",
+            "items": {},
+            "description": "MCP servers in the session request format; every entry needs a `name`."
+          },
+          "pluginConfigs": {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          "plugins": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProfilePlugin"
+            }
+          },
+          "skills": {
+            "type": "array",
+            "items": {},
+            "nullable": true
+          },
+          "systemPrompt": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SystemPrompt"
+              }
+            ],
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProfileSource": {
+        "type": "string",
+        "enum": ["api", "file"]
+      },
+      "ProfileSummary": {
+        "type": "object",
+        "required": ["agent", "name", "source"],
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "extends": {
+            "type": "string",
+            "nullable": true
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ProfileSource"
+          }
+        }
+      },
       "ServerStatus": {
         "type": "string",
         "enum": ["running", "stopped"]
@@ -5408,6 +5844,30 @@
             "format": "int64",
             "nullable": true,
             "minimum": 0
+          }
+        }
+      },
+      "SessionCustomization": {
+        "type": "object",
+        "required": ["systemPrompt", "mcpServers", "skills", "plugins", "pluginConfigs"],
+        "properties": {
+          "mcpServers": {
+            "type": "boolean"
+          },
+          "pluginConfigs": {
+            "type": "boolean"
+          },
+          "plugins": {
+            "type": "boolean"
+          },
+          "skills": {
+            "type": "boolean"
+          },
+          "systemPrompt": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SystemPromptMode"
+            }
           }
         }
       },
@@ -5461,6 +5921,23 @@
             "type": "string"
           }
         }
+      },
+      "SystemPrompt": {
+        "type": "object",
+        "required": ["mode", "text"],
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/SystemPromptMode"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SystemPromptMode": {
+        "type": "string",
+        "enum": ["replace", "append"]
       }
     }
   },

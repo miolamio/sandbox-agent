@@ -71,6 +71,7 @@ const AgentsTab = ({
             version: undefined as string | undefined,
             path: undefined as string | undefined,
             capabilities: emptyFeatureCoverage as AgentInfo["capabilities"],
+            customization: {} as AgentInfo["customization"],
           }))
       ).map((agent) => {
         const isInstalling = installingAgent === agent.id;

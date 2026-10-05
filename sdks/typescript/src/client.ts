@@ -38,6 +38,7 @@ import {
   type AgentInstallRequest,
   type AgentInstallResponse,
   type AgentListResponse,
+  type AgentProfile,
   type DesktopActionResponse,
   type DesktopClipboardQuery,
   type DesktopClipboardResponse,
@@ -108,6 +109,8 @@ import {
   type ProcessTerminalServerFrame,
   type ProcessTerminalResizeRequest,
   type ProcessTerminalResizeResponse,
+  type ProfileDetailResponse,
+  type ProfileListResponse,
   type SessionEvent,
   type SessionPersistDriver,
   type SessionRecord,
@@ -2691,6 +2694,25 @@ export class SandboxAgent {
     await this.requestRaw("DELETE", `${API_PREFIX}/config/skills`, { query });
   }
 
+  /** Lists agent profiles stored on the server (from the API and from `--profiles`). */
+  async listProfiles(): Promise<ProfileListResponse> {
+    return this.requestJson("GET", `${API_PREFIX}/config/profiles`);
+  }
+
+  /** Stored and resolved (`extends` applied) profile; env and plugin config values come back as `***`. */
+  async getProfile(agent: string, name: string): Promise<ProfileDetailResponse> {
+    return this.requestJson("GET", profilePath(agent, name));
+  }
+
+  /** Creates or replaces a profile. A `***` value keeps the value stored for that key. */
+  async putProfile(agent: string, name: string, profile: AgentProfile): Promise<ProfileDetailResponse> {
+    return this.requestJson("PUT", profilePath(agent, name), { body: profile });
+  }
+
+  async deleteProfile(agent: string, name: string): Promise<void> {
+    await this.requestRaw("DELETE", profilePath(agent, name));
+  }
+
   async getProcessConfig(): Promise<ProcessConfig> {
     return this.requestJson("GET", `${API_PREFIX}/processes/config`);
   }
@@ -3939,6 +3961,10 @@ function toAgentQuery(options: AgentQueryOptions | undefined): Record<string, Qu
     config: options.config,
     no_cache: options.noCache,
   };
+}
+
+function profilePath(agent: string, name: string): string {
+  return `${API_PREFIX}/config/profiles/${encodeURIComponent(agent)}/${encodeURIComponent(name)}`;
 }
 
 function normalizeSessionInit(

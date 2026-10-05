@@ -1705,6 +1705,7 @@ export default function App() {
                   installed: false,
                   credentialsAvailable: true,
                   capabilities: {} as AgentInfo["capabilities"],
+                  customization: {} as AgentInfo["customization"],
                 }))
           }
           agentsLoading={agentsLoading}
@@ -1735,6 +1736,7 @@ export default function App() {
                   installed: false,
                   credentialsAvailable: true,
                   capabilities: {} as AgentInfo["capabilities"],
+                  customization: {} as AgentInfo["customization"],
                 }))
           }
           agentsLoading={agentsLoading}

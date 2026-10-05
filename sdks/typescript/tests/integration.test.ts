@@ -2787,3 +2787,65 @@ describe("Integration: agent auth method selection", { timeout: 120_000 }, () =>
     }
   });
 });
+
+describe("Integration: agent profiles", () => {
+  let handle: DockerSandboxAgentHandle;
+  let baseUrl: string;
+  let token: string;
+  let layout: ReturnType<typeof createDockerTestLayout>;
+
+  beforeEach(async () => {
+    layout = createDockerTestLayout();
+    prepareMockAgentDataHome(layout.xdgDataHome);
+    handle = await startDockerSandboxAgent(layout, { timeoutMs: 30000 });
+    baseUrl = handle.baseUrl;
+    token = handle.token;
+  });
+
+  afterEach(async () => {
+    await handle?.dispose?.();
+    if (layout) {
+      disposeDockerTestLayout(layout);
+    }
+  });
+
+  it("manages agent profiles with masked secrets", async () => {
+    const sdk = await SandboxAgent.connect({ baseUrl, token });
+
+    const saved = await sdk.putProfile("mock", "base", {
+      process: { env: { API_TOKEN: "s3cr3t" } },
+      session: { systemPrompt: { mode: "append", text: "Be brief." } },
+    });
+    expect(saved.stored.process?.env?.API_TOKEN).toBe("***");
+    expect(saved.hasValue["process.env.API_TOKEN"]).toBe(true);
+
+    await sdk.putProfile("mock", "review", { extends: "base", session: { systemPrompt: { mode: "replace", text: "Review only." } } });
+    const review = await sdk.getProfile("mock", "review");
+    expect(review.source).toBe("api");
+    expect(review.resolved.process?.env?.API_TOKEN).toBe("***");
+    expect(review.resolved.session?.systemPrompt).toEqual({ mode: "replace", text: "Review only." });
+
+    const listed = await sdk.listProfiles();
+    expect(listed.profiles).toEqual([
+      { agent: "mock", name: "base", source: "api" },
+      { agent: "mock", name: "review", source: "api", extends: "base" },
+    ]);
+
+    const conflict = await sdk.deleteProfile("mock", "base").catch((error: unknown) => error);
+    expect(conflict).toBeInstanceOf(SandboxAgentError);
+    expect((conflict as SandboxAgentError).status).toBe(409);
+
+    const invalid = await sdk.putProfile("codex", "x", { session: { plugins: [{ path: "/p" }] } }).catch((error: unknown) => error);
+    expect((invalid as SandboxAgentError).status).toBe(400);
+    expect((invalid as SandboxAgentError).problem?.type).toBe("urn:sandbox-agent:error:profile_invalid");
+
+    await sdk.deleteProfile("mock", "review");
+    await sdk.deleteProfile("mock", "base");
+    expect((await sdk.listProfiles()).profiles).toEqual([]);
+
+    const agents = await sdk.listAgents();
+    expect(agents.agents.find((agent) => agent.id === "claude")?.customization.session.plugins).toBe(true);
+
+    await sdk.dispose();
+  });
+});
