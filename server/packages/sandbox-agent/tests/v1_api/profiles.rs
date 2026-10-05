@@ -206,3 +206,45 @@ async fn process_change_marks_server_stale() {
         "running process keeps its env"
     );
 }
+
+#[tokio::test]
+async fn deleted_profile_marks_server_stale() {
+    let test_app = TestApp::new(AuthConfig::disabled());
+    install_mock(&test_app.app).await;
+    put_profile(
+        &test_app.app,
+        "mock",
+        "gone",
+        json!({ "process": { "env": { "A": "1" } } }),
+    )
+    .await;
+    let (status, _) = acp(
+        &test_app.app,
+        "/v1/acp/srv-gone?agent=mock&profile=gone",
+        initialize_payload(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        server_entry(&test_app.app, "srv-gone").await["profileStale"],
+        false
+    );
+
+    let (status, _, body) = send_request(
+        &test_app.app,
+        Method::DELETE,
+        "/v1/config/profiles/mock/gone",
+        None,
+        &[],
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "delete profile: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let entry = server_entry(&test_app.app, "srv-gone").await;
+    assert_eq!(entry["profile"], "gone");
+    assert_eq!(entry["profileStale"], true);
+}

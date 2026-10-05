@@ -20,6 +20,7 @@ sandbox-agent-opencode-server-manager.workspace = true
 acp-http-adapter.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 axum.workspace = true
 clap.workspace = true

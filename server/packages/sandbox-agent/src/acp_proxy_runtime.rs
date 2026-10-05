@@ -897,6 +897,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bound_profile_debug_has_no_env_values() {
+        let profile: crate::profiles::AgentProfile = serde_json::from_value(
+            serde_json::json!({ "process": { "env": { "TOKEN": "s3cret-value" } } }),
+        )
+        .expect("profile");
+        let bound = BoundProfile {
+            name: "envp".to_string(),
+            process_fingerprint: profile.process_fingerprint(),
+        };
+        let debug = format!("{bound:?}");
+        assert!(debug.contains("envp"), "{debug}");
+        assert!(!debug.contains("s3cret"), "{debug}");
+    }
+
+    #[test]
     fn request_timeout_defaults_without_flag_or_env() {
         assert_eq!(resolve_request_timeout(None, None), DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(2 * 60 * 60));

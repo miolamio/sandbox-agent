@@ -129,10 +129,18 @@ pub struct ProfilePlugin {
 }
 
 impl AgentProfile {
-    /// Serialized `process` part. Compared to tell whether a running agent
-    /// process still matches its profile (`profileStale`). Kept in memory only.
+    /// SHA-256 (lowercase hex) of the serialized `process` part. Compared to
+    /// tell whether a running agent process still matches its profile
+    /// (`profileStale`). A hash, so no env value is kept or printed by `Debug`.
+    /// Serialization is deterministic: `env` is a `BTreeMap` and JSON objects
+    /// in `config` are sorted maps.
     pub fn process_fingerprint(&self) -> String {
-        serde_json::to_string(&self.process).unwrap_or_default()
+        use sha2::{Digest, Sha256};
+        let serialized = serde_json::to_vec(&self.process).unwrap_or_default();
+        Sha256::digest(&serialized)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 }
 
@@ -347,6 +355,17 @@ mod tests {
         let c = profile(json!({ "process": { "env": { "A": "2" } } }));
         assert_eq!(a.process_fingerprint(), b.process_fingerprint());
         assert_ne!(a.process_fingerprint(), c.process_fingerprint());
+    }
+
+    #[test]
+    fn process_fingerprint_is_a_sha256_hex_without_values() {
+        let secret = profile(json!({ "process": { "env": { "TOKEN": "s3cret-value" } } }));
+        let fingerprint = secret.process_fingerprint();
+        assert_eq!(fingerprint.len(), 64, "{fingerprint}");
+        assert!(fingerprint
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(!fingerprint.contains("s3cret"));
     }
 
     #[test]
