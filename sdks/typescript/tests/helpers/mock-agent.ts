@@ -41,6 +41,8 @@ let nextResumeError = null;
 // The "notfound-after" hook fires once per process, so a resent prompt with the
 // same text runs normally.
 let lateNotFoundUsed = false;
+// Session requests this process received, for "_mock/received".
+const receivedSessionRequests = [];
 
 function sessionNotFound(id, sessionId) {
   emit({
@@ -319,6 +321,27 @@ rl.on("line", (line) => {
       id: msg.id,
       result: {},
     });
+    return;
+  }
+
+  if (method === "session/new" || method === "session/load" || method === "session/resume") {
+    receivedSessionRequests.push({ method, params: msg.params ?? null });
+  }
+
+  // Test hook: the session requests received so far (params as sent by the server).
+  if (method === "_mock/received") {
+    emit({ jsonrpc: "2.0", id: msg.id, result: { requests: receivedSessionRequests } });
+    return;
+  }
+
+  // Test hook: the listed variables of this process's environment (null when unset).
+  if (method === "_mock/env") {
+    const names = Array.isArray(msg?.params?.names) ? msg.params.names : [];
+    const env = {};
+    for (const name of names) {
+      env[name] = process.env[name] ?? null;
+    }
+    emit({ jsonrpc: "2.0", id: msg.id, result: { env } });
     return;
   }
 

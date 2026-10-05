@@ -148,6 +148,8 @@ export interface SessionRecord {
   agentSessionId: string;
   /** Agent server the session was last attached to. Missing on records written by older SDK versions. */
   serverId?: string;
+  /** Agent profile the session's agent server runs with. Only the name is stored. */
+  profile?: string;
   lastConnectionId: string;
   createdAt: number;
   destroyedAt?: number;

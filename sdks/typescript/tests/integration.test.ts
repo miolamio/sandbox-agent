@@ -2848,4 +2848,87 @@ describe("Integration: agent profiles", () => {
 
     await sdk.dispose();
   });
+
+  type ReceivedRequest = { method: string; params: { _meta?: Record<string, unknown>; mcpServers?: Array<{ name: string }> } | null };
+
+  async function putReviewProfile(sdk: SandboxAgent): Promise<void> {
+    await sdk.putProfile("mock", "review", {
+      process: { env: { REVIEW_TOKEN: "s3cr3t-env" } },
+      session: {
+        systemPrompt: { mode: "replace", text: "Review only." },
+        mcpServers: [{ name: "profile-fs", command: "node", args: ["fs.js"], env: [] }],
+      },
+    });
+  }
+
+  it("createSession with a profile starts the server with it and persists only the name", async () => {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 500 });
+    const sdk = await SandboxAgent.connect({ baseUrl, token, persist });
+    await putReviewProfile(sdk);
+
+    const session = await sdk.createSession({ agent: "mock", profile: "review" });
+    expect(session.profile).toBe("review");
+
+    const record = await persist.getSession(session.id);
+    expect(record?.profile).toBe("review");
+    const events = await persist.listEvents({ sessionId: session.id, limit: 500 });
+    expect(JSON.stringify(record)).not.toContain("s3cr3t-env");
+    expect(JSON.stringify(events.items)).not.toContain("s3cr3t-env");
+
+    const servers = await sdk.listAcpServers();
+    expect(servers.servers.find((server) => server.serverId === record?.serverId)).toMatchObject({ profile: "review", profileStale: false });
+
+    const received = (await session.rawSend("_mock/received", {})) as { requests: ReceivedRequest[] };
+    const created = received.requests.find((request) => request.method === "session/new");
+    expect(created?.params?._meta?.systemPrompt).toBe("Review only.");
+    expect(created?.params?.mcpServers?.map((server) => server.name)).toEqual(["profile-fs"]);
+
+    const env = (await session.rawSend("_mock/env", { names: ["REVIEW_TOKEN"] })) as { env: Record<string, string | null> };
+    expect(env.env.REVIEW_TOKEN).toBe("s3cr3t-env");
+
+    const plain = await sdk.createSession({ agent: "mock" });
+    expect((await sdk.getSession(plain.id))?.serverId).not.toBe(record?.serverId);
+
+    await sdk.dispose();
+  });
+
+  it("resumeSession starts a new server with the stored profile", async () => {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 500 });
+    const first = await SandboxAgent.connect({ baseUrl, token, persist });
+    await putReviewProfile(first);
+    const created = await first.createSession({ agent: "mock", profile: "review" });
+    await created.prompt([{ type: "text", text: "first run" }]);
+    const firstServerId = (await persist.getSession(created.id))?.serverId;
+    await first.dispose();
+
+    const second = await SandboxAgent.connect({ baseUrl, token, persist });
+    const restored = await second.resumeSession(created.id);
+    const record = await persist.getSession(created.id);
+    expect(record?.profile).toBe("review");
+    expect(record?.serverId).not.toBe(firstServerId);
+    const servers = await second.listAcpServers();
+    expect(servers.servers.find((server) => server.serverId === record?.serverId)?.profile).toBe("review");
+
+    const received = (await restored.rawSend("_mock/received", {})) as { requests: ReceivedRequest[] };
+    const resumed = received.requests.find((request) => request.method === "session/resume");
+    expect(resumed?.params?._meta?.systemPrompt).toBe("Review only.");
+    expect(resumed?.params?.mcpServers?.map((server) => server.name)).toContain("profile-fs");
+
+    await second.dispose();
+  });
+
+  it("resumeOrCreateSession refuses another profile for an existing session", async () => {
+    const persist = new InMemorySessionPersistDriver({ maxEventsPerSession: 500 });
+    const sdk = await SandboxAgent.connect({ baseUrl, token, persist });
+    await putReviewProfile(sdk);
+    await sdk.putProfile("mock", "other", {});
+    const session = await sdk.resumeOrCreateSession({ id: "profile-session", agent: "mock", profile: "review" });
+    expect(session.profile).toBe("review");
+    await expect(sdk.resumeOrCreateSession({ id: "profile-session", agent: "mock", profile: "other" })).rejects.toThrow(
+      "session 'profile-session' uses profile 'review'; requested 'other'",
+    );
+    const again = await sdk.resumeOrCreateSession({ id: "profile-session", agent: "mock" });
+    expect(again.profile).toBe("review");
+    await sdk.dispose();
+  });
 });

@@ -230,6 +230,11 @@ export interface SessionCreateRequest {
   cwd?: string;
   /** Full session init. When omitted, built from `cwd` (or default) with empty `mcpServers`. */
   sessionInit?: Omit<NewSessionRequest, "_meta">;
+  /**
+   * Server-side agent profile (see `putProfile`). The session's agent server is
+   * started with it; only the name is stored with the session.
+   */
+  profile?: string;
   model?: string;
   mode?: string;
   thoughtLevel?: string;
@@ -242,6 +247,11 @@ export interface SessionResumeOrCreateRequest {
   cwd?: string;
   /** Full session init. When omitted, built from `cwd` (or default) with empty `mcpServers`. */
   sessionInit?: Omit<NewSessionRequest, "_meta">;
+  /**
+   * Server-side agent profile (see `putProfile`). The session's agent server is
+   * started with it; only the name is stored with the session.
+   */
+  profile?: string;
   model?: string;
   mode?: string;
   thoughtLevel?: string;
@@ -498,6 +508,11 @@ export class Session {
     return this.record.serverId;
   }
 
+  /** Agent profile the session's agent server runs with, if any. */
+  get profile(): string | undefined {
+    return this.record.profile;
+  }
+
   get createdAt(): number {
     return this.record.createdAt;
   }
@@ -643,6 +658,8 @@ export class LiveAcpConnection {
   readonly connectionId: string;
   readonly agent: string;
   readonly serverId: string;
+  /** Agent profile this connection's server was (or is expected to be) started with. */
+  readonly profile?: string;
   /** Whether the agent advertised support for resuming an existing session. */
   readonly supportsResume: boolean;
   /**
@@ -692,6 +709,7 @@ export class LiveAcpConnection {
   private constructor(
     agent: string,
     serverId: string,
+    profile: string | undefined,
     supportsResume: boolean,
     ownsServer: boolean,
     connectionId: string,
@@ -702,6 +720,7 @@ export class LiveAcpConnection {
   ) {
     this.agent = agent;
     this.serverId = serverId;
+    this.profile = profile;
     this.supportsResume = supportsResume;
     this.ownsServer = ownsServer;
     this.connectionId = connectionId;
@@ -719,6 +738,8 @@ export class LiveAcpConnection {
     auth?: SandboxAgentAuthOptions | false;
     agent: string;
     serverId: string;
+    /** Agent profile to start the server with (ignored when attaching). */
+    profile?: string;
     /**
      * Attach to a server that already exists: buffered events are not replayed,
      * the server is not created if it is gone (connecting fails instead), and
@@ -743,7 +764,7 @@ export class LiveAcpConnection {
         path: `${API_PREFIX}/acp/${encodeURIComponent(options.serverId)}`,
         // Without the agent the server rejects the first request instead of
         // creating the server, so attaching never starts a server of its own.
-        bootstrapQuery: attach ? undefined : { agent: options.agent },
+        bootstrapQuery: attach ? undefined : options.profile ? { agent: options.agent, profile: options.profile } : { agent: options.agent },
         skipBufferedEvents: attach,
       },
       client: {
@@ -789,6 +810,7 @@ export class LiveAcpConnection {
     live = new LiveAcpConnection(
       options.agent,
       options.serverId,
+      options.profile,
       supportsResume,
       !attach,
       connectionId,
@@ -1595,10 +1617,11 @@ export class SandboxAgent {
 
     const localSessionId = request.id?.trim() || randomId();
     const sessionInit = normalizeSessionInit(request.sessionInit, request.cwd, this.sandboxProvider?.defaultCwd);
+    const profile = normalizeProfileName(request.profile);
     let live: LiveAcpConnection;
     let response: NewSessionResponse;
     try {
-      live = await this.getLiveConnection(request.agent.trim());
+      live = await this.getLiveConnection(request.agent.trim(), profile);
       response = await live.createRemoteSession(localSessionId, sessionInit);
     } catch (error) {
       throw this.disposedErrorOr(error);
@@ -1609,6 +1632,7 @@ export class SandboxAgent {
       agent: request.agent.trim(),
       agentSessionId: response.sessionId,
       serverId: live.serverId,
+      profile,
       lastConnectionId: live.connectionId,
       createdAt: nowMs(),
       sandboxId: this.sandboxProviderId,
@@ -1686,7 +1710,7 @@ export class SandboxAgent {
         }
       }
 
-      const live = await this.getLiveConnection(existing.agent, existing.serverId);
+      const live = await this.getLiveConnection(existing.agent, existing.profile, existing.serverId);
       const sessionInit = normalizeSessionInit(existing.sessionInit, undefined, this.sandboxProvider?.defaultCwd);
 
       const resumed = live.supportsResume ? await this.tryResumeRemoteSession(existing, live, sessionInit) : null;
@@ -1833,6 +1857,10 @@ export class SandboxAgent {
   async resumeOrCreateSession(request: SessionResumeOrCreateRequest): Promise<Session> {
     const existing = await this.persist.getSession(request.id);
     if (existing) {
+      const requestedProfile = normalizeProfileName(request.profile);
+      if (requestedProfile !== undefined && requestedProfile !== existing.profile) {
+        throw new Error(`session '${existing.id}' uses profile '${existing.profile ?? "(none)"}'; requested '${requestedProfile}'`);
+      }
       let session = await this.resumeSession(existing.id);
       if (request.mode) {
         session = (await this.setSessionMode(session.id, request.mode)).session;
@@ -2699,7 +2727,11 @@ export class SandboxAgent {
     return this.requestJson("GET", `${API_PREFIX}/config/profiles`);
   }
 
-  /** Stored and resolved (`extends` applied) profile; env and plugin config values come back as `***`. */
+  /**
+   * Stored and resolved (`extends` applied) profile. Secret values come back as `***`:
+   * `process.env`, `session.pluginConfigs`, and the `value` of `env` and `headers`
+   * entries in `session.mcpServers`.
+   */
   async getProfile(agent: string, name: string): Promise<ProfileDetailResponse> {
     return this.requestJson("GET", profilePath(agent, name));
   }
@@ -2853,27 +2885,27 @@ export class SandboxAgent {
   }
 
   /**
-   * Live connection for an agent. With `preferredServerId` (the server a
+   * Live connection for an agent and profile. With `preferredServerId` (the server a
    * persisted session last ran on), attach to that server first so its agent
    * process and sessions are reused; attaching never creates a server. Only
    * when the server rejects the attach as unknown, and the server list confirms
-   * it is gone, is any connection for the agent reused or a new server started.
+   * it is gone, is any connection for the agent and profile reused or a new server started.
    * If the list cannot be read then, the attach error is thrown instead.
    */
-  private async getLiveConnection(agent: string, preferredServerId?: string): Promise<LiveAcpConnection> {
+  private async getLiveConnection(agent: string, profile?: string, preferredServerId?: string): Promise<LiveAcpConnection> {
     this.assertNotDisposed();
     await this.awaitHealthy();
 
     const preferred = preferredServerId?.trim();
     if (preferred) {
       const existing = this.liveConnections.get(preferred) ?? (await this.pendingLiveConnections.get(preferred)?.catch(() => undefined));
-      if (existing && existing.agent === agent) {
+      if (existing && existing.agent === agent && existing.profile === profile) {
         return existing;
       }
       if (!existing) {
         let attached: LiveAcpConnection | undefined;
         try {
-          attached = await this.openLiveConnection(agent, preferred, true);
+          attached = await this.openLiveConnection(agent, profile, preferred, true);
         } catch (error) {
           // Only a server confirmed gone by the list is replaced by a new one
           // below. Any other failure (network, auth, server error, or a list
@@ -2884,14 +2916,14 @@ export class SandboxAgent {
           }
         }
         if (attached) {
-          const otherAgent = await this.isAcpServerListedForOtherAgent(preferred, agent);
+          const otherServer = await this.isAcpServerListedForOtherAgent(preferred, agent, profile);
           // dispose() may have run during the list call and closed `attached`.
           this.assertNotDisposed();
-          if (!otherAgent) {
+          if (!otherServer) {
             return attached;
           }
-          // The id now belongs to a server of another agent: leave it running
-          // and use a server for this agent instead.
+          // The id now belongs to a server of another agent or profile: leave it
+          // running and use a server for this agent and profile instead.
           await this.discardLiveConnection(attached);
         }
       }
@@ -2900,16 +2932,16 @@ export class SandboxAgent {
     this.assertNotDisposed();
 
     for (const connection of this.liveConnections.values()) {
-      if (connection.agent === agent) {
+      if (connection.agent === agent && connection.profile === profile) {
         return connection;
       }
     }
-    const pendingForAgent = this.pendingLiveConnectionsByAgent.get(agent);
+    const pendingForAgent = this.pendingLiveConnectionsByAgent.get(liveConnectionKey(agent, profile));
     if (pendingForAgent) {
       return pendingForAgent;
     }
 
-    return this.openLiveConnection(agent, `sdk-${agent}-${randomId()}`, false);
+    return this.openLiveConnection(agent, profile, `sdk-${agent}-${randomId()}`, false);
   }
 
   /** Whether the server is listed; rethrows `cause` when the list cannot be read. */
@@ -2924,21 +2956,21 @@ export class SandboxAgent {
   }
 
   /**
-   * Whether the server list shows the server running a different agent. A list
-   * that cannot be read counts as no: the attached server stays in use, since a
-   * session is never moved to a new server on a guess.
+   * Whether the server list shows the server running a different agent or
+   * profile. A list that cannot be read counts as no: the attached server stays
+   * in use, since a session is never moved to a new server on a guess.
    */
-  private async isAcpServerListedForOtherAgent(serverId: string, agent: string): Promise<boolean> {
+  private async isAcpServerListedForOtherAgent(serverId: string, agent: string, profile: string | undefined): Promise<boolean> {
     let servers: AcpServerListResponse;
     try {
       servers = await this.listAcpServers();
     } catch {
       return false;
     }
-    return servers.servers.some((server) => server.serverId === serverId && server.agent !== agent);
+    return servers.servers.some((server) => server.serverId === serverId && (server.agent !== agent || (server.profile ?? undefined) !== profile));
   }
 
-  private async openLiveConnection(agent: string, serverId: string, attach: boolean): Promise<LiveAcpConnection> {
+  private async openLiveConnection(agent: string, profile: string | undefined, serverId: string, attach: boolean): Promise<LiveAcpConnection> {
     this.assertNotDisposed();
     const pending = this.pendingLiveConnections.get(serverId);
     if (pending) {
@@ -2954,6 +2986,7 @@ export class SandboxAgent {
         auth: this.auth,
         agent,
         serverId,
+        profile,
         attach,
         onObservedEnvelope: (connection, envelope, direction, localSessionId, context) => {
           void this.enqueueObservedEnvelopePersistence(connection, envelope, direction, localSessionId, context).catch((error) => {
@@ -2993,7 +3026,7 @@ export class SandboxAgent {
 
     this.pendingLiveConnections.set(serverId, creating);
     if (!attach) {
-      this.pendingLiveConnectionsByAgent.set(agent, creating);
+      this.pendingLiveConnectionsByAgent.set(liveConnectionKey(agent, profile), creating);
     }
     try {
       return await creating;
@@ -3001,8 +3034,8 @@ export class SandboxAgent {
       if (this.pendingLiveConnections.get(serverId) === creating) {
         this.pendingLiveConnections.delete(serverId);
       }
-      if (this.pendingLiveConnectionsByAgent.get(agent) === creating) {
-        this.pendingLiveConnectionsByAgent.delete(agent);
+      if (this.pendingLiveConnectionsByAgent.get(liveConnectionKey(agent, profile)) === creating) {
+        this.pendingLiveConnectionsByAgent.delete(liveConnectionKey(agent, profile));
       }
     }
   }
@@ -3965,6 +3998,16 @@ function toAgentQuery(options: AgentQueryOptions | undefined): Record<string, Qu
 
 function profilePath(agent: string, name: string): string {
   return `${API_PREFIX}/config/profiles/${encodeURIComponent(agent)}/${encodeURIComponent(name)}`;
+}
+
+function normalizeProfileName(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+/** Pending-connection key: one agent server per agent and profile. */
+function liveConnectionKey(agent: string, profile: string | undefined): string {
+  return profile ? `${agent}\u0000${profile}` : agent;
 }
 
 function normalizeSessionInit(
