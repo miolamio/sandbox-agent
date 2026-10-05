@@ -3126,7 +3126,8 @@ async fn delete_v1_config_mcp(Query(query): Query<McpConfigQuery>) -> Result<Sta
 ///
 /// Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
 /// Nothing passes this config to agents. Will be removed in the next minor
-/// release; use agent profiles or per-session `mcpServers` instead.
+/// release; use the file system API to put skill files in the agent's skill
+/// directory instead.
 #[utoipa::path(
     get,
     path = "/v1/config/skills",
@@ -3163,7 +3164,8 @@ async fn get_v1_config_skills(
 ///
 /// Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
 /// Nothing passes this config to agents. Will be removed in the next minor
-/// release; use agent profiles or per-session `mcpServers` instead.
+/// release; use the file system API to put skill files in the agent's skill
+/// directory instead.
 #[utoipa::path(
     put,
     path = "/v1/config/skills",
@@ -3196,7 +3198,8 @@ async fn put_v1_config_skills(
 ///
 /// Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
 /// Nothing passes this config to agents. Will be removed in the next minor
-/// release; use agent profiles or per-session `mcpServers` instead.
+/// release; use the file system API to put skill files in the agent's skill
+/// directory instead.
 #[utoipa::path(
     delete,
     path = "/v1/config/skills",

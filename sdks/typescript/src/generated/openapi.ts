@@ -53,7 +53,8 @@ export interface paths {
      * @deprecated
      * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
      * Nothing passes this config to agents. Will be removed in the next minor
-     * release; use agent profiles or per-session `mcpServers` instead.
+     * release; use the file system API to put skill files in the agent's skill
+     * directory instead.
      */
     get: operations["get_v1_config_skills"];
     /**
@@ -61,7 +62,8 @@ export interface paths {
      * @deprecated
      * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
      * Nothing passes this config to agents. Will be removed in the next minor
-     * release; use agent profiles or per-session `mcpServers` instead.
+     * release; use the file system API to put skill files in the agent's skill
+     * directory instead.
      */
     put: operations["put_v1_config_skills"];
     /**
@@ -69,7 +71,8 @@ export interface paths {
      * @deprecated
      * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
      * Nothing passes this config to agents. Will be removed in the next minor
-     * release; use agent profiles or per-session `mcpServers` instead.
+     * release; use the file system API to put skill files in the agent's skill
+     * directory instead.
      */
     delete: operations["delete_v1_config_skills"];
   };
@@ -1407,7 +1410,8 @@ export interface operations {
    * @deprecated
    * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
    * Nothing passes this config to agents. Will be removed in the next minor
-   * release; use agent profiles or per-session `mcpServers` instead.
+   * release; use the file system API to put skill files in the agent's skill
+   * directory instead.
    */
   get_v1_config_skills: {
     parameters: {
@@ -1438,7 +1442,8 @@ export interface operations {
    * @deprecated
    * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
    * Nothing passes this config to agents. Will be removed in the next minor
-   * release; use agent profiles or per-session `mcpServers` instead.
+   * release; use the file system API to put skill files in the agent's skill
+   * directory instead.
    */
   put_v1_config_skills: {
     parameters: {
@@ -1466,7 +1471,8 @@ export interface operations {
    * @deprecated
    * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
    * Nothing passes this config to agents. Will be removed in the next minor
-   * release; use agent profiles or per-session `mcpServers` instead.
+   * release; use the file system API to put skill files in the agent's skill
+   * directory instead.
    */
   delete_v1_config_skills: {
     parameters: {

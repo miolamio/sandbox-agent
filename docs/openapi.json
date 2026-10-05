@@ -543,7 +543,7 @@
       "get": {
         "tags": ["v1"],
         "summary": "Get a stored skills entry (deprecated).",
-        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use agent profiles or per-session `mcpServers` instead.",
+        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use the file system API to put skill files in the agent's skill\ndirectory instead.",
         "operationId": "get_v1_config_skills",
         "parameters": [
           {
@@ -592,7 +592,7 @@
       "put": {
         "tags": ["v1"],
         "summary": "Store a skills entry (deprecated).",
-        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use agent profiles or per-session `mcpServers` instead.",
+        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use the file system API to put skill files in the agent's skill\ndirectory instead.",
         "operationId": "put_v1_config_skills",
         "parameters": [
           {
@@ -634,7 +634,7 @@
       "delete": {
         "tags": ["v1"],
         "summary": "Delete a stored skills entry (deprecated).",
-        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use agent profiles or per-session `mcpServers` instead.",
+        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use the file system API to put skill files in the agent's skill\ndirectory instead.",
         "operationId": "delete_v1_config_skills",
         "parameters": [
           {
