@@ -13,12 +13,14 @@ pub use capability::{
     ProcessCustomization, SessionCustomization,
 };
 pub use merge::{merge_profiles, parse_extends, resolve_chain};
+pub(crate) use model::{profile_invalid, profile_not_found};
 pub use model::{
     validate_profile_name, validate_profile_shape, AgentProfile, ProfilePlugin, ProfileProcess,
     ProfileSession, SystemPrompt, SystemPromptMode,
 };
 pub use secrets::{mask_profile, restore_masked_secrets, SECRET_MASK};
 pub use session::{apply_session_profile, is_profile_session_method, PROFILE_SESSION_METHODS};
+pub(crate) use store::describe_json_error;
 pub use store::{
     load_profiles_file, server_state_dir, ProfileSource, ProfileStore, StoredProfile, STATE_DIR_ENV,
 };

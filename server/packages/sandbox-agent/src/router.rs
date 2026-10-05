@@ -49,6 +49,10 @@ use crate::process_runtime::{
     ProcessOwner as RuntimeProcessOwner, ProcessRuntime, ProcessRuntimeConfig, ProcessSnapshot,
     ProcessStartSpec, ProcessStatus, ProcessStream, RunSpec,
 };
+use crate::profiles::{
+    describe_json_error, mask_profile, profile_invalid, profile_not_found, AgentProfile,
+    ProfileStore, StoredProfile,
+};
 use crate::ui;
 use acp_http_adapter::process::PostMode;
 
@@ -98,6 +102,7 @@ pub struct AppState {
     opencode_server_manager: Arc<OpenCodeServerManager>,
     process_runtime: Arc<ProcessRuntime>,
     desktop_runtime: Arc<DesktopRuntime>,
+    profiles: Arc<ProfileStore>,
     pub(crate) branding: BrandingMode,
     version_cache: Mutex<HashMap<AgentId, CachedAgentVersion>>,
 }
@@ -119,11 +124,27 @@ impl AppState {
 
     /// Like [`AppState::with_branding`], with an explicit ACP request timeout
     /// (already resolved from `--acp-request-timeout-ms` / env / default).
+    /// Profiles live in memory only: in-process tests and embedders must not
+    /// read or write the developer's real state directory. The CLI server path
+    /// loads the persistent store explicitly via [`AppState::with_profile_store`].
     pub fn with_acp_request_timeout(
         auth: AuthConfig,
         agent_manager: AgentManager,
         branding: BrandingMode,
         acp_request_timeout: Duration,
+    ) -> Self {
+        let profiles = Arc::new(ProfileStore::in_memory());
+        Self::with_profile_store(auth, agent_manager, branding, acp_request_timeout, profiles)
+    }
+
+    /// Like [`AppState::with_acp_request_timeout`], with an explicit profile
+    /// store (the CLI loads the state directory and `--profiles` into it).
+    pub fn with_profile_store(
+        auth: AuthConfig,
+        agent_manager: AgentManager,
+        branding: BrandingMode,
+        acp_request_timeout: Duration,
+        profiles: Arc<ProfileStore>,
     ) -> Self {
         let agent_manager = Arc::new(agent_manager);
         let acp_proxy = Arc::new(AcpProxyRuntime::new(
@@ -146,6 +167,7 @@ impl AppState {
             opencode_server_manager,
             process_runtime,
             desktop_runtime,
+            profiles,
             branding,
             version_cache: Mutex::new(HashMap::new()),
         }
@@ -169,6 +191,10 @@ impl AppState {
 
     pub(crate) fn desktop_runtime(&self) -> Arc<DesktopRuntime> {
         self.desktop_runtime.clone()
+    }
+
+    pub(crate) fn profiles(&self) -> Arc<ProfileStore> {
+        self.profiles.clone()
     }
 
     pub(crate) fn purge_version_cache(&self, agent: AgentId) {
@@ -327,6 +353,13 @@ pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>)
             get(get_v1_config_skills)
                 .put(put_v1_config_skills)
                 .delete(delete_v1_config_skills),
+        )
+        .route("/config/profiles", get(get_v1_config_profiles))
+        .route(
+            "/config/profiles/:agent/:name",
+            get(get_v1_config_profile)
+                .put(put_v1_config_profile)
+                .delete(delete_v1_config_profile),
         )
         .route("/acp", get(get_v1_acp_servers))
         .route(
@@ -516,6 +549,10 @@ pub async fn shutdown_servers(state: &Arc<AppState>, process_grace: std::time::D
         get_v1_config_skills,
         put_v1_config_skills,
         delete_v1_config_skills,
+        get_v1_config_profiles,
+        get_v1_config_profile,
+        put_v1_config_profile,
+        delete_v1_config_profile,
         get_v1_acp_servers,
         post_v1_acp,
         get_v1_acp,
@@ -619,6 +656,16 @@ pub async fn shutdown_servers(state: &Arc<AppState>, process_grace: std::time::D
             McpOAuthConfigOrDisabled,
             SkillsConfig,
             SkillSource,
+            AgentProfile,
+            crate::profiles::ProfileProcess,
+            crate::profiles::ProfileSession,
+            crate::profiles::SystemPrompt,
+            crate::profiles::SystemPromptMode,
+            crate::profiles::ProfilePlugin,
+            crate::profiles::ProfileSource,
+            ProfileSummary,
+            ProfileListResponse,
+            ProfileDetailResponse,
             ProblemDetails,
             ErrorType,
             AcpEnvelope
@@ -3230,6 +3277,155 @@ async fn delete_v1_config_skills(
     entries.remove(&query.skill_name);
     write_named_config_map(&path, &entries)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// List agent profiles.
+///
+/// Returns every profile with its source (`api` or `file`) and parent.
+#[utoipa::path(
+    get,
+    path = "/v1/config/profiles",
+    tag = "v1",
+    responses(
+        (status = 200, description = "Stored agent profiles", body = ProfileListResponse)
+    )
+)]
+async fn get_v1_config_profiles(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ProfileListResponse>, ApiError> {
+    let profiles = state
+        .profiles()
+        .list()
+        .into_iter()
+        .map(|stored| ProfileSummary {
+            agent: stored.agent.as_str().to_string(),
+            name: stored.name,
+            source: stored.source,
+            extends: stored.profile.extends,
+        })
+        .collect();
+    Ok(Json(ProfileListResponse { profiles }))
+}
+
+/// Get one agent profile.
+///
+/// Returns the stored profile and the profile resolved through `extends`, with
+/// `process.env`, `session.pluginConfigs` and MCP server `env`/`headers` values
+/// masked as `***`.
+#[utoipa::path(
+    get,
+    path = "/v1/config/profiles/{agent}/{name}",
+    tag = "v1",
+    params(
+        ("agent" = String, Path, description = "Agent id"),
+        ("name" = String, Path, description = "Profile name")
+    ),
+    responses(
+        (status = 200, description = "Stored and resolved profile, secrets masked", body = ProfileDetailResponse),
+        (status = 400, description = "Unknown agent", body = ProblemDetails),
+        (status = 404, description = "Profile not found", body = ProblemDetails)
+    )
+)]
+async fn get_v1_config_profile(
+    State(state): State<Arc<AppState>>,
+    Path((agent, name)): Path<(String, String)>,
+) -> Result<Json<ProfileDetailResponse>, ApiError> {
+    let agent = parse_agent_path(&agent)?;
+    let stored = state
+        .profiles()
+        .get(agent, &name)
+        .ok_or_else(|| profile_not_found(agent, &name))?;
+    Ok(Json(profile_detail(&state, stored)?))
+}
+
+/// Create or replace an agent profile.
+///
+/// A `***` value in `process.env`, `session.pluginConfigs` or an MCP server's
+/// `env`/`headers` entry keeps the stored value. Running agent servers keep
+/// the `process` part they started with.
+#[utoipa::path(
+    put,
+    path = "/v1/config/profiles/{agent}/{name}",
+    tag = "v1",
+    params(
+        ("agent" = String, Path, description = "Agent id"),
+        ("name" = String, Path, description = "Profile name")
+    ),
+    request_body = AgentProfile,
+    responses(
+        (status = 200, description = "Profile stored; stored and resolved profile, secrets masked", body = ProfileDetailResponse),
+        (status = 400, description = "Invalid profile: name, JSON, extends cycle or unknown parent, or fields the agent does not support (listed in details.fields)", body = ProblemDetails),
+        (status = 409, description = "Profile comes from the --profiles file and is read-only", body = ProblemDetails)
+    )
+)]
+async fn put_v1_config_profile(
+    State(state): State<Arc<AppState>>,
+    Path((agent, name)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<ProfileDetailResponse>, ApiError> {
+    let agent = parse_agent_path(&agent)?;
+    // Raw bytes, not `Json<_>`: serde and axum rejection messages can quote
+    // body values (secrets). Only the error category and position are reported.
+    let profile: AgentProfile = serde_json::from_slice(&body).map_err(|err| {
+        profile_invalid(
+            format!("invalid profile JSON: {}", describe_json_error(&err)),
+            &[],
+        )
+    })?;
+    let stored = state.profiles().put(agent, &name, profile)?;
+    Ok(Json(profile_detail(&state, stored)?))
+}
+
+/// Delete an agent profile.
+///
+/// Running agent servers keep the settings they started with.
+#[utoipa::path(
+    delete,
+    path = "/v1/config/profiles/{agent}/{name}",
+    tag = "v1",
+    params(
+        ("agent" = String, Path, description = "Agent id"),
+        ("name" = String, Path, description = "Profile name")
+    ),
+    responses(
+        (status = 204, description = "Profile deleted"),
+        (status = 400, description = "Unknown agent", body = ProblemDetails),
+        (status = 404, description = "Profile not found", body = ProblemDetails),
+        (status = 409, description = "Profile is read-only or another profile extends it", body = ProblemDetails)
+    )
+)]
+async fn delete_v1_config_profile(
+    State(state): State<Arc<AppState>>,
+    Path((agent, name)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let agent = parse_agent_path(&agent)?;
+    state.profiles().delete(agent, &name)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn parse_agent_path(agent: &str) -> Result<AgentId, SandboxError> {
+    AgentId::parse(agent).ok_or_else(|| SandboxError::UnsupportedAgent {
+        agent: agent.to_string(),
+    })
+}
+
+/// `stored` and `resolved` are both masked: the resolved profile carries the
+/// secrets of every parent in the `extends` chain.
+fn profile_detail(
+    state: &AppState,
+    stored: StoredProfile,
+) -> Result<ProfileDetailResponse, SandboxError> {
+    let resolved = state.profiles().resolve(stored.agent, &stored.name)?;
+    let (stored_masked, _) = mask_profile(&stored.profile);
+    let (resolved_masked, has_value) = mask_profile(&resolved);
+    Ok(ProfileDetailResponse {
+        agent: stored.agent.as_str().to_string(),
+        name: stored.name,
+        source: stored.source,
+        stored: stored_masked,
+        resolved: resolved_masked,
+        has_value,
+    })
 }
 
 #[utoipa::path(

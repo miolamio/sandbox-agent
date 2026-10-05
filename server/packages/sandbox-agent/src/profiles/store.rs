@@ -362,7 +362,7 @@ fn read_profile_file(path: &Path, agent: AgentId, name: &str) -> Result<AgentPro
 
 /// Category and position of a JSON error. The serde message itself is left
 /// out: it can quote values from the file, and profile values are secrets.
-fn describe_json_error(err: &serde_json::Error) -> String {
+pub(crate) fn describe_json_error(err: &serde_json::Error) -> String {
     let category = match err.classify() {
         serde_json::error::Category::Io => "read error",
         serde_json::error::Category::Syntax => "JSON syntax error",

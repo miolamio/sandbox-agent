@@ -566,3 +566,35 @@ pub struct ProcessWsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSummary {
+    pub agent: String,
+    pub name: String,
+    pub source: crate::profiles::ProfileSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileListResponse {
+    pub profiles: Vec<ProfileSummary>,
+}
+
+/// One profile as stored and as resolved through `extends`. Values of
+/// `process.env`, `session.pluginConfigs` and the `env`/`headers` entries of
+/// `session.mcpServers` are masked as `***` in both; `hasValue` says which of
+/// them are set (keys like `process.env.TOKEN`,
+/// `session.mcpServers.gh.headers.Authorization`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileDetailResponse {
+    pub agent: String,
+    pub name: String,
+    pub source: crate::profiles::ProfileSource,
+    pub stored: crate::profiles::AgentProfile,
+    pub resolved: crate::profiles::AgentProfile,
+    pub has_value: BTreeMap<String, bool>,
+}

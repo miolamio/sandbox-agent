@@ -12,6 +12,7 @@ mod build_version {
 }
 
 use crate::desktop_install::{install_desktop, DesktopInstallRequest, DesktopPackageManager};
+use crate::profiles::{load_profiles_file, server_state_dir, ProfileStore};
 use crate::router::{
     build_router_with_state, resolve_request_timeout, shutdown_servers, AppState, AuthConfig,
     BrandingMode, ACP_REQUEST_TIMEOUT_ENV,
@@ -132,6 +133,11 @@ pub struct ServerArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     acp_request_timeout_ms: Option<u64>,
+
+    /// JSON array of agent profiles loaded at startup. They are read-only and
+    /// win over profiles created through the API with the same agent and name.
+    #[arg(long = "profiles", value_name = "FILE")]
+    profiles: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -485,11 +491,20 @@ fn run_server(cli: &CliConfig, server: &ServerArgs) -> Result<(), CliError> {
         server.acp_request_timeout_ms,
         std::env::var(ACP_REQUEST_TIMEOUT_ENV).ok().as_deref(),
     );
-    let state = Arc::new(AppState::with_acp_request_timeout(
+    let profiles = Arc::new(ProfileStore::load(server_state_dir().join("profiles")));
+    if let Some(path) = server.profiles.as_deref() {
+        let file_profiles =
+            load_profiles_file(path).map_err(|err| CliError::Server(err.to_string()))?;
+        profiles
+            .install_file_profiles(file_profiles)
+            .map_err(|err| CliError::Server(format!("profiles file {}: {err}", path.display())))?;
+    }
+    let state = Arc::new(AppState::with_profile_store(
         auth,
         agent_manager,
         branding,
         acp_request_timeout,
+        profiles,
     ));
     let (mut router, state) = build_router_with_state(state);
 
@@ -1908,6 +1923,24 @@ fn write_stderr_line(text: &str) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_parses_profiles_flag() {
+        let cli = SandboxAgentCli::try_parse_from([
+            "sandbox-agent",
+            "server",
+            "--profiles",
+            "/etc/sandbox-agent/profiles.json",
+        ])
+        .expect("parse server args");
+        match cli.command {
+            Command::Server(args) => assert_eq!(
+                args.profiles,
+                Some(PathBuf::from("/etc/sandbox-agent/profiles.json"))
+            ),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn cors_exposes_server_generation_header() {
