@@ -431,3 +431,11 @@ Update this file continuously during the migration.
 - Owner: Unassigned.
 - Status: resolved
 - Links: `sdks/acp-http-client/src/index.ts`, `sdks/typescript/src/client.ts`, `sdks/typescript/tests/integration.test.ts`, `sdks/acp-http-client/tests/smoke.test.ts`, `docs/sdk-overview.mdx`, `docs/session-restoration.mdx`
+
+- Date: 2026-10-05
+- Area: Server-side agent profiles, session part (SBA-86, SBA-87, SBA-91)
+- Issue: The SDK could not pass `_meta` on `session/new` (typed `Omit<NewSessionRequest, "_meta">`) and lost it on resume; `/v1/config/mcp|skills` were never passed to agents.
+- Decision: The proxy adds a server profile's `session` part to `session/new`, `session/load` and `session/resume` of a server started with `?profile=`, resolving the profile on every such request so a changed profile reaches the next new or restored session. If the bound profile was deleted, these requests fail with 404 (other requests still reach the running process; the server list reports `profileStale: true`). `mcpServers` go into the standard field, merged by `name` (client wins). For `claude` (and `mock`, which mirrors it for tests): `systemPrompt` replace as a string and append as `{append}` in `_meta.systemPrompt`; plugins as `_meta.claudeCode.options.plugins = [{type:"local", path}]`; plugin configs as `_meta.claudeCode.options.settings.pluginConfigs`. Client `_meta` is kept, the profile wins conflicts (key paths logged, values never). The `_meta` shape is not yet verified against a real Claude (stage 4); `session.skills` stays unsupported until then.
+- Owner: Unassigned.
+- Status: open (verify with real Claude, SBA-88)
+- Links: `server/packages/sandbox-agent/src/profiles/session.rs`, `server/packages/sandbox-agent/src/acp_proxy_runtime.rs`, `docs/superpowers/specs/2026-10-05-agent-profiles-design.md`

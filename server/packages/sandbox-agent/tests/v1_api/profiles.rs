@@ -247,4 +247,181 @@ async fn deleted_profile_marks_server_stale() {
     let entry = server_entry(&test_app.app, "srv-gone").await;
     assert_eq!(entry["profile"], "gone");
     assert_eq!(entry["profileStale"], true);
+
+    // New and restored sessions need the profile; other requests still reach
+    // the running process.
+    for (id, method) in [
+        (2, "session/new"),
+        (3, "session/load"),
+        (4, "session/resume"),
+    ] {
+        let (status, body) = acp(
+            &test_app.app,
+            "/v1/acp/srv-gone",
+            rpc(
+                id,
+                method,
+                json!({ "sessionId": "s1", "cwd": "/tmp", "mcpServers": [] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}: {body}");
+    }
+    let (status, body) = acp(
+        &test_app.app,
+        "/v1/acp/srv-gone",
+        rpc(5, "mock/env", json!({ "names": ["A"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["env"]["A"], "1");
+}
+
+fn session_profile() -> Value {
+    json!({
+        "session": {
+            "systemPrompt": { "mode": "replace", "text": "You are a reviewer." },
+            "mcpServers": [
+                { "name": "fs", "command": "node", "args": ["fs.js"], "env": [] },
+                { "name": "shared", "command": "profile-cmd", "args": [], "env": [] }
+            ],
+            "plugins": [{ "path": "/opt/mods/first" }]
+        }
+    })
+}
+
+#[tokio::test]
+async fn session_settings_reach_new_load_and_resume() {
+    let test_app = TestApp::new(AuthConfig::disabled());
+    install_mock(&test_app.app).await;
+    put_profile(&test_app.app, "mock", "sess", session_profile()).await;
+    let (status, _) = acp(
+        &test_app.app,
+        "/v1/acp/srv-sess?agent=mock&profile=sess",
+        initialize_payload(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = acp(
+        &test_app.app,
+        "/v1/acp/srv-sess",
+        rpc(2, "session/new", json!({
+            "cwd": "/tmp",
+            "mcpServers": [{ "name": "shared", "command": "client-cmd", "args": [], "env": [] }],
+            "_meta": { "client.example/trace": "t1", "claudeCode": { "options": { "model": "x" } } }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let params = &body["result"]["echoed"]["params"];
+    assert_eq!(params["_meta"]["systemPrompt"], "You are a reviewer.");
+    assert_eq!(params["_meta"]["client.example/trace"], "t1");
+    assert_eq!(params["_meta"]["claudeCode"]["options"]["model"], "x");
+    assert_eq!(
+        params["_meta"]["claudeCode"]["options"]["plugins"],
+        json!([{ "type": "local", "path": "/opt/mods/first" }])
+    );
+    let names: Vec<&str> = params["mcpServers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["fs", "shared"]);
+    assert_eq!(params["mcpServers"][1]["command"], "client-cmd");
+
+    for (id, method) in [(3, "session/load"), (4, "session/resume")] {
+        let (status, body) = acp(
+            &test_app.app,
+            "/v1/acp/srv-sess",
+            rpc(
+                id,
+                method,
+                json!({ "sessionId": "s1", "cwd": "/tmp", "mcpServers": [] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{method}: {body}");
+        let params = &body["result"]["echoed"]["params"];
+        assert_eq!(
+            params["_meta"]["systemPrompt"], "You are a reviewer.",
+            "{method}"
+        );
+        assert_eq!(params["mcpServers"][0]["name"], "fs", "{method}");
+        assert_eq!(params["sessionId"], "s1", "{method}");
+    }
+
+    let (status, body) = acp(
+        &test_app.app,
+        "/v1/acp/srv-sess",
+        rpc(
+            5,
+            "session/prompt",
+            json!({ "sessionId": "s1", "prompt": [] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["result"]["echoed"]["params"].get("_meta").is_none(),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn new_sessions_get_the_updated_session_part() {
+    let test_app = TestApp::new(AuthConfig::disabled());
+    install_mock(&test_app.app).await;
+    put_profile(&test_app.app, "mock", "sess", session_profile()).await;
+    let (status, _) = acp(
+        &test_app.app,
+        "/v1/acp/srv-upd?agent=mock&profile=sess",
+        initialize_payload(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    put_profile(
+        &test_app.app,
+        "mock",
+        "sess",
+        json!({ "session": { "systemPrompt": { "mode": "append", "text": "Updated." } } }),
+    )
+    .await;
+    let (_, body) = acp(
+        &test_app.app,
+        "/v1/acp/srv-upd",
+        rpc(2, "session/new", json!({ "cwd": "/tmp", "mcpServers": [] })),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["echoed"]["params"]["_meta"]["systemPrompt"],
+        json!({ "append": "Updated." })
+    );
+    assert_eq!(
+        server_entry(&test_app.app, "srv-upd").await["profileStale"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn servers_without_profile_pass_session_requests_through() {
+    let test_app = TestApp::new(AuthConfig::disabled());
+    install_mock(&test_app.app).await;
+    let (status, _) = acp(
+        &test_app.app,
+        "/v1/acp/srv-raw?agent=mock",
+        initialize_payload(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let params = json!({ "cwd": "/tmp", "mcpServers": [] });
+    let (_, body) = acp(
+        &test_app.app,
+        "/v1/acp/srv-raw",
+        rpc(2, "session/new", params.clone()),
+    )
+    .await;
+    assert_eq!(body["result"]["echoed"]["params"], params);
 }

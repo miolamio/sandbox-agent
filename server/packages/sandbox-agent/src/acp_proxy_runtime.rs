@@ -17,7 +17,7 @@ use sandbox_agent_opencode_adapter::{AcpDispatch, AcpDispatchResult, AcpPayloadS
 use serde_json::{Number, Value};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::profiles::ProfileStore;
+use crate::profiles::{apply_session_profile, is_profile_session_method, ProfileStore};
 
 /// Env var for the ACP request timeout. `--acp-request-timeout-ms` overrides it.
 pub const REQUEST_TIMEOUT_ENV: &str = "SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS";
@@ -249,6 +249,16 @@ impl AcpProxyRuntime {
             "acp_proxy: instance resolved"
         );
 
+        // Session settings of the server's profile, read fresh so a changed
+        // profile reaches the next new or restored session. A deleted profile
+        // fails these requests with 404 (the server reports `profileStale`).
+        let payload = match &instance.profile {
+            Some(bound) if is_profile_session_method(&method) => {
+                let resolved = self.inner.profiles.resolve(instance.agent, &bound.name)?;
+                apply_session_profile(instance.agent, &resolved.session, payload)
+            }
+            _ => payload,
+        };
         let payload = normalize_payload_for_agent(instance.agent, payload);
 
         match instance.runtime.post_with_mode(payload, mode).await {
