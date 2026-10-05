@@ -22,13 +22,55 @@ export interface paths {
     post: operations["post_v1_agent_install"];
   };
   "/v1/config/mcp": {
+    /**
+     * Get a stored MCP server entry (deprecated).
+     * @deprecated
+     * @description Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.
+     * Nothing passes this config to agents. Will be removed in the next minor
+     * release; use agent profiles or per-session `mcpServers` instead.
+     */
     get: operations["get_v1_config_mcp"];
+    /**
+     * Store an MCP server entry (deprecated).
+     * @deprecated
+     * @description Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.
+     * Nothing passes this config to agents. Will be removed in the next minor
+     * release; use agent profiles or per-session `mcpServers` instead.
+     */
     put: operations["put_v1_config_mcp"];
+    /**
+     * Delete a stored MCP server entry (deprecated).
+     * @deprecated
+     * @description Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.
+     * Nothing passes this config to agents. Will be removed in the next minor
+     * release; use agent profiles or per-session `mcpServers` instead.
+     */
     delete: operations["delete_v1_config_mcp"];
   };
   "/v1/config/skills": {
+    /**
+     * Get a stored skills entry (deprecated).
+     * @deprecated
+     * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
+     * Nothing passes this config to agents. Will be removed in the next minor
+     * release; use agent profiles or per-session `mcpServers` instead.
+     */
     get: operations["get_v1_config_skills"];
+    /**
+     * Store a skills entry (deprecated).
+     * @deprecated
+     * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
+     * Nothing passes this config to agents. Will be removed in the next minor
+     * release; use agent profiles or per-session `mcpServers` instead.
+     */
     put: operations["put_v1_config_skills"];
+    /**
+     * Delete a stored skills entry (deprecated).
+     * @deprecated
+     * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
+     * Nothing passes this config to agents. Will be removed in the next minor
+     * release; use agent profiles or per-session `mcpServers` instead.
+     */
     delete: operations["delete_v1_config_skills"];
   };
   "/v1/desktop/clipboard": {
@@ -1278,6 +1320,13 @@ export interface operations {
       };
     };
   };
+  /**
+   * Get a stored MCP server entry (deprecated).
+   * @deprecated
+   * @description Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.
+   * Nothing passes this config to agents. Will be removed in the next minor
+   * release; use agent profiles or per-session `mcpServers` instead.
+   */
   get_v1_config_mcp: {
     parameters: {
       query: {
@@ -1302,6 +1351,13 @@ export interface operations {
       };
     };
   };
+  /**
+   * Store an MCP server entry (deprecated).
+   * @deprecated
+   * @description Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.
+   * Nothing passes this config to agents. Will be removed in the next minor
+   * release; use agent profiles or per-session `mcpServers` instead.
+   */
   put_v1_config_mcp: {
     parameters: {
       query: {
@@ -1323,6 +1379,13 @@ export interface operations {
       };
     };
   };
+  /**
+   * Delete a stored MCP server entry (deprecated).
+   * @deprecated
+   * @description Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.
+   * Nothing passes this config to agents. Will be removed in the next minor
+   * release; use agent profiles or per-session `mcpServers` instead.
+   */
   delete_v1_config_mcp: {
     parameters: {
       query: {
@@ -1339,6 +1402,13 @@ export interface operations {
       };
     };
   };
+  /**
+   * Get a stored skills entry (deprecated).
+   * @deprecated
+   * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
+   * Nothing passes this config to agents. Will be removed in the next minor
+   * release; use agent profiles or per-session `mcpServers` instead.
+   */
   get_v1_config_skills: {
     parameters: {
       query: {
@@ -1363,6 +1433,13 @@ export interface operations {
       };
     };
   };
+  /**
+   * Store a skills entry (deprecated).
+   * @deprecated
+   * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
+   * Nothing passes this config to agents. Will be removed in the next minor
+   * release; use agent profiles or per-session `mcpServers` instead.
+   */
   put_v1_config_skills: {
     parameters: {
       query: {
@@ -1384,6 +1461,13 @@ export interface operations {
       };
     };
   };
+  /**
+   * Delete a stored skills entry (deprecated).
+   * @deprecated
+   * @description Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
+   * Nothing passes this config to agents. Will be removed in the next minor
+   * release; use agent profiles or per-session `mcpServers` instead.
+   */
   delete_v1_config_skills: {
     parameters: {
       query: {

@@ -1,66 +1,32 @@
 ---
 title: "Skills"
-description: "Configure skill sources for agent sessions."
+description: "Give agents skills."
 sidebarTitle: "Skills"
 icon: "sparkles"
 ---
 
 Skills are local instruction bundles stored in `SKILL.md` files.
 
-## Configuring skills
+## Give an agent skills
 
-Use `setSkillsConfig` / `getSkillsConfig` / `deleteSkillsConfig` to manage skill source config by directory + skill name.
+Agents read skills from their own skill directories. Upload the `SKILL.md` file and its scripts there with the [file system API](/file-system), for example `/workspace/.claude/skills/<skill-name>/SKILL.md` for Claude in a session whose working directory is `/workspace`.
 
 ```ts
-import { SandboxAgent } from "sandbox-agent";
+import fs from "node:fs";
 
-const sdk = await SandboxAgent.connect({
-  baseUrl: "http://127.0.0.1:2468",
-});
+const skill = await fs.promises.readFile("./SKILL.md");
+await sdk.writeFsFile({ path: "/workspace/.claude/skills/my-skill/SKILL.md" }, skill);
 
-// Add a skill
-await sdk.setSkillsConfig(
-  {
-    directory: "/workspace",
-    skillName: "default",
-  },
-  {
-    sources: [
-      { type: "github", source: "rivet-dev/skills", skills: ["sandbox-agent"] },
-      { type: "local", source: "/workspace/my-custom-skill" },
-    ],
-  },
-);
-
-// Create a session using the configured skills
-const session = await sdk.createSession({
-  agent: "claude",
-  cwd: "/workspace",
-});
-
-await session.prompt([
-  { type: "text", text: "Use available skills to help with this task." },
-]);
-
-// List skills
-const config = await sdk.getSkillsConfig({
-  directory: "/workspace",
-  skillName: "default",
-});
-
-console.log(config.sources.length);
-
-// Delete skill
-await sdk.deleteSkillsConfig({
-  directory: "/workspace",
-  skillName: "default",
-});
-
+const session = await sdk.createSession({ agent: "claude", cwd: "/workspace" });
 ```
 
-## Skill sources
+## Deprecated config endpoints
 
-Each `skills.sources` entry describes where to find skills.
+<Warning>
+`setSkillsConfig`, `getSkillsConfig` and `deleteSkillsConfig` (and the HTTP endpoints behind them) are deprecated and will be removed in the next minor release. The server only stores the config as JSON in `<directory>/.sandbox-agent/config/skills.json`. Nothing reads it, so no skill source listed there reaches an agent.
+</Warning>
+
+Stored entries describe skill sources:
 
 | Type | `source` value | Example |
 |------|---------------|---------|
@@ -68,12 +34,8 @@ Each `skills.sources` entry describes where to find skills.
 | `local` | filesystem path | `"/workspace/my-skill"` |
 | `git` | git clone URL | `"https://git.example.com/skills.git"` |
 
-Optional fields:
-
-- `skills`: subset of skill directory names to include
-- `ref`: branch/tag/commit (for `github` and `git`)
-- `subpath`: subdirectory within repo to scan
+Optional fields: `skills` (subset of skill directory names), `ref` (branch, tag or commit for `github` and `git`), `subpath` (subdirectory to scan).
 
 ## Custom skills
 
-To write, upload, and configure your own skills inside the sandbox, see [Custom Tools](/custom-tools).
+To write, upload, and use your own skills inside the sandbox, see [Custom Tools](/custom-tools).

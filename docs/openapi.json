@@ -417,6 +417,8 @@
     "/v1/config/mcp": {
       "get": {
         "tags": ["v1"],
+        "summary": "Get a stored MCP server entry (deprecated).",
+        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use agent profiles or per-session `mcpServers` instead.",
         "operationId": "get_v1_config_mcp",
         "parameters": [
           {
@@ -459,10 +461,13 @@
               }
             }
           }
-        }
+        },
+        "deprecated": true
       },
       "put": {
         "tags": ["v1"],
+        "summary": "Store an MCP server entry (deprecated).",
+        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use agent profiles or per-session `mcpServers` instead.",
         "operationId": "put_v1_config_mcp",
         "parameters": [
           {
@@ -498,10 +503,13 @@
           "204": {
             "description": "Stored"
           }
-        }
+        },
+        "deprecated": true
       },
       "delete": {
         "tags": ["v1"],
+        "summary": "Delete a stored MCP server entry (deprecated).",
+        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use agent profiles or per-session `mcpServers` instead.",
         "operationId": "delete_v1_config_mcp",
         "parameters": [
           {
@@ -527,12 +535,15 @@
           "204": {
             "description": "Deleted"
           }
-        }
+        },
+        "deprecated": true
       }
     },
     "/v1/config/skills": {
       "get": {
         "tags": ["v1"],
+        "summary": "Get a stored skills entry (deprecated).",
+        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use agent profiles or per-session `mcpServers` instead.",
         "operationId": "get_v1_config_skills",
         "parameters": [
           {
@@ -575,10 +586,13 @@
               }
             }
           }
-        }
+        },
+        "deprecated": true
       },
       "put": {
         "tags": ["v1"],
+        "summary": "Store a skills entry (deprecated).",
+        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use agent profiles or per-session `mcpServers` instead.",
         "operationId": "put_v1_config_skills",
         "parameters": [
           {
@@ -614,10 +628,13 @@
           "204": {
             "description": "Stored"
           }
-        }
+        },
+        "deprecated": true
       },
       "delete": {
         "tags": ["v1"],
+        "summary": "Delete a stored skills entry (deprecated).",
+        "description": "Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.\nNothing passes this config to agents. Will be removed in the next minor\nrelease; use agent profiles or per-session `mcpServers` instead.",
         "operationId": "delete_v1_config_skills",
         "parameters": [
           {
@@ -643,7 +660,8 @@
           "204": {
             "description": "Deleted"
           }
-        }
+        },
+        "deprecated": true
       }
     },
     "/v1/desktop/clipboard": {

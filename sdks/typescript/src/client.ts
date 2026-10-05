@@ -2643,26 +2643,50 @@ export class SandboxAgent {
     );
   }
 
+  /**
+   * @deprecated The server only stores this config; it is never passed to agents.
+   * Pass MCP servers in `sessionInit.mcpServers` (or use agent profiles). Removed in the next minor release.
+   */
   async getMcpConfig(query: McpConfigQuery): Promise<McpServerConfig> {
     return this.requestJson("GET", `${API_PREFIX}/config/mcp`, { query });
   }
 
+  /**
+   * @deprecated The server only stores this config; it is never passed to agents.
+   * Pass MCP servers in `sessionInit.mcpServers` (or use agent profiles). Removed in the next minor release.
+   */
   async setMcpConfig(query: McpConfigQuery, config: McpServerConfig): Promise<void> {
     await this.requestRaw("PUT", `${API_PREFIX}/config/mcp`, { query, body: config });
   }
 
+  /**
+   * @deprecated The server only stores this config; it is never passed to agents.
+   * Pass MCP servers in `sessionInit.mcpServers` (or use agent profiles). Removed in the next minor release.
+   */
   async deleteMcpConfig(query: McpConfigQuery): Promise<void> {
     await this.requestRaw("DELETE", `${API_PREFIX}/config/mcp`, { query });
   }
 
+  /**
+   * @deprecated The server only stores this config; it is never passed to agents.
+   * Put skill files where the agent reads skills (or use agent profiles). Removed in the next minor release.
+   */
   async getSkillsConfig(query: SkillsConfigQuery): Promise<SkillsConfig> {
     return this.requestJson("GET", `${API_PREFIX}/config/skills`, { query });
   }
 
+  /**
+   * @deprecated The server only stores this config; it is never passed to agents.
+   * Put skill files where the agent reads skills (or use agent profiles). Removed in the next minor release.
+   */
   async setSkillsConfig(query: SkillsConfigQuery, config: SkillsConfig): Promise<void> {
     await this.requestRaw("PUT", `${API_PREFIX}/config/skills`, { query, body: config });
   }
 
+  /**
+   * @deprecated The server only stores this config; it is never passed to agents.
+   * Put skill files where the agent reads skills (or use agent profiles). Removed in the next minor release.
+   */
   async deleteSkillsConfig(query: SkillsConfigQuery): Promise<void> {
     await this.requestRaw("DELETE", `${API_PREFIX}/config/skills`, { query });
   }

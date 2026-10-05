@@ -63,24 +63,17 @@ curl -X PUT "http://127.0.0.1:2468/v1/fs/file?path=/opt/mcp/custom-tools/mcp-ser
 ```
   </Step>
 
-  <Step title="Register MCP config and create a session">
+  <Step title="Create a session with the MCP server">
 
 ```ts
-await sdk.setMcpConfig(
-  {
-    directory: "/workspace",
-    mcpName: "customTools",
-  },
-  {
-    type: "local",
-    command: "node",
-    args: ["/opt/mcp/custom-tools/mcp-server.cjs"],
-  },
-);
-
 const session = await sdk.createSession({
   agent: "claude",
-  cwd: "/workspace",
+  sessionInit: {
+    cwd: "/workspace",
+    mcpServers: [
+      { name: "customTools", command: "node", args: ["/opt/mcp/custom-tools/mcp-server.cjs"], env: [] },
+    ],
+  },
 });
 
 await session.prompt([
@@ -116,7 +109,7 @@ description: Generate a random integer between min and max.
 Run:
 
 ```bash
-node /opt/skills/random-number/random-number.cjs <min> <max>
+node /workspace/.claude/skills/random-number/random-number.cjs <min> <max>
 ```
 ````
 
@@ -131,10 +124,10 @@ npx esbuild src/random-number.ts --bundle --format=cjs --platform=node --target=
 import fs from "node:fs";
 
 const script = await fs.promises.readFile("./dist/random-number.cjs");
-await sdk.writeFsFile({ path: "/opt/skills/random-number/random-number.cjs" }, script);
+await sdk.writeFsFile({ path: "/workspace/.claude/skills/random-number/random-number.cjs" }, script);
 
 const skill = await fs.promises.readFile("./SKILL.md");
-await sdk.writeFsFile({ path: "/opt/skills/random-number/SKILL.md" }, skill);
+await sdk.writeFsFile({ path: "/workspace/.claude/skills/random-number/SKILL.md" }, skill);
 ```
   </Step>
 
@@ -156,4 +149,4 @@ await session.prompt([
 ## Notes
 
 - The sandbox runtime must include Node.js (or your chosen runtime).
-- For persistent skill-source wiring by directory, see [Skills](/skills-config).
+- Agents read skills from their own skill directories (for Claude, `.claude/skills/` under the session's working directory). The skills config endpoints do not install skills, see [Skills](/skills-config).

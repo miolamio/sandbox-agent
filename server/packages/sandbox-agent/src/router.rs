@@ -202,6 +202,8 @@ pub fn build_router(state: AppState) -> Router {
     build_router_with_state(Arc::new(state)).0
 }
 
+// The legacy /v1/config/mcp and /v1/config/skills handlers are deprecated (SBA-89).
+#[allow(deprecated)]
 pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>) {
     let mut v1_router = Router::new()
         .route("/health", get(get_v1_health))
@@ -441,6 +443,8 @@ pub async fn shutdown_servers(state: &Arc<AppState>, process_grace: std::time::D
     );
 }
 
+// The legacy /v1/config/mcp and /v1/config/skills handlers are deprecated (SBA-89).
+#[allow(deprecated)]
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -3019,6 +3023,11 @@ async fn send_ws_error(socket: &mut WebSocket, message: &str) -> Result<(), ()> 
     .await
 }
 
+/// Get a stored MCP server entry (deprecated).
+///
+/// Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.
+/// Nothing passes this config to agents. Will be removed in the next minor
+/// release; use agent profiles or per-session `mcpServers` instead.
 #[utoipa::path(
     get,
     path = "/v1/config/mcp",
@@ -3032,6 +3041,7 @@ async fn send_ws_error(socket: &mut WebSocket, message: &str) -> Result<(), ()> 
         (status = 404, description = "Entry not found", body = ProblemDetails)
     )
 )]
+#[deprecated(note = "stored config is never passed to agents; use agent profiles (SBA-89)")]
 async fn get_v1_config_mcp(
     Query(query): Query<McpConfigQuery>,
 ) -> Result<Json<McpServerConfig>, ApiError> {
@@ -3050,6 +3060,11 @@ async fn get_v1_config_mcp(
     Ok(Json(value))
 }
 
+/// Store an MCP server entry (deprecated).
+///
+/// Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.
+/// Nothing passes this config to agents. Will be removed in the next minor
+/// release; use agent profiles or per-session `mcpServers` instead.
 #[utoipa::path(
     put,
     path = "/v1/config/mcp",
@@ -3063,6 +3078,7 @@ async fn get_v1_config_mcp(
         (status = 204, description = "Stored")
     )
 )]
+#[deprecated(note = "stored config is never passed to agents; use agent profiles (SBA-89)")]
 async fn put_v1_config_mcp(
     Query(query): Query<McpConfigQuery>,
     Json(body): Json<McpServerConfig>,
@@ -3077,6 +3093,11 @@ async fn put_v1_config_mcp(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Delete a stored MCP server entry (deprecated).
+///
+/// Only stores JSON under `<directory>/.sandbox-agent/config/mcp.json`.
+/// Nothing passes this config to agents. Will be removed in the next minor
+/// release; use agent profiles or per-session `mcpServers` instead.
 #[utoipa::path(
     delete,
     path = "/v1/config/mcp",
@@ -3089,6 +3110,7 @@ async fn put_v1_config_mcp(
         (status = 204, description = "Deleted")
     )
 )]
+#[deprecated(note = "stored config is never passed to agents; use agent profiles (SBA-89)")]
 async fn delete_v1_config_mcp(Query(query): Query<McpConfigQuery>) -> Result<StatusCode, ApiError> {
     validate_named_query(&query.directory, "directory")?;
     validate_named_query(&query.mcp_name, "mcpName")?;
@@ -3100,6 +3122,11 @@ async fn delete_v1_config_mcp(Query(query): Query<McpConfigQuery>) -> Result<Sta
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Get a stored skills entry (deprecated).
+///
+/// Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
+/// Nothing passes this config to agents. Will be removed in the next minor
+/// release; use agent profiles or per-session `mcpServers` instead.
 #[utoipa::path(
     get,
     path = "/v1/config/skills",
@@ -3113,6 +3140,7 @@ async fn delete_v1_config_mcp(Query(query): Query<McpConfigQuery>) -> Result<Sta
         (status = 404, description = "Entry not found", body = ProblemDetails)
     )
 )]
+#[deprecated(note = "stored config is never passed to agents; use agent profiles (SBA-89)")]
 async fn get_v1_config_skills(
     Query(query): Query<SkillsConfigQuery>,
 ) -> Result<Json<SkillsConfig>, ApiError> {
@@ -3131,6 +3159,11 @@ async fn get_v1_config_skills(
     Ok(Json(value))
 }
 
+/// Store a skills entry (deprecated).
+///
+/// Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
+/// Nothing passes this config to agents. Will be removed in the next minor
+/// release; use agent profiles or per-session `mcpServers` instead.
 #[utoipa::path(
     put,
     path = "/v1/config/skills",
@@ -3144,6 +3177,7 @@ async fn get_v1_config_skills(
         (status = 204, description = "Stored")
     )
 )]
+#[deprecated(note = "stored config is never passed to agents; use agent profiles (SBA-89)")]
 async fn put_v1_config_skills(
     Query(query): Query<SkillsConfigQuery>,
     Json(body): Json<SkillsConfig>,
@@ -3158,6 +3192,11 @@ async fn put_v1_config_skills(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Delete a stored skills entry (deprecated).
+///
+/// Only stores JSON under `<directory>/.sandbox-agent/config/skills.json`.
+/// Nothing passes this config to agents. Will be removed in the next minor
+/// release; use agent profiles or per-session `mcpServers` instead.
 #[utoipa::path(
     delete,
     path = "/v1/config/skills",
@@ -3170,6 +3209,7 @@ async fn put_v1_config_skills(
         (status = 204, description = "Deleted")
     )
 )]
+#[deprecated(note = "stored config is never passed to agents; use agent profiles (SBA-89)")]
 async fn delete_v1_config_skills(
     Query(query): Query<SkillsConfigQuery>,
 ) -> Result<StatusCode, ApiError> {
