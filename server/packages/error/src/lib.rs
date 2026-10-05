@@ -23,6 +23,9 @@ pub enum ErrorType {
     ModeNotSupported,
     StreamError,
     Timeout,
+    ProfileMismatch,
+    ProfileReadOnly,
+    ProfileInvalid,
 }
 
 impl ErrorType {
@@ -44,6 +47,9 @@ impl ErrorType {
             Self::ModeNotSupported => "urn:sandbox-agent:error:mode_not_supported",
             Self::StreamError => "urn:sandbox-agent:error:stream_error",
             Self::Timeout => "urn:sandbox-agent:error:timeout",
+            Self::ProfileMismatch => "urn:sandbox-agent:error:profile_mismatch",
+            Self::ProfileReadOnly => "urn:sandbox-agent:error:profile_read_only",
+            Self::ProfileInvalid => "urn:sandbox-agent:error:profile_invalid",
         }
     }
 
@@ -65,6 +71,9 @@ impl ErrorType {
             Self::ModeNotSupported => "Mode Not Supported",
             Self::StreamError => "Stream Error",
             Self::Timeout => "Timeout",
+            Self::ProfileMismatch => "Profile Mismatch",
+            Self::ProfileReadOnly => "Profile Read Only",
+            Self::ProfileInvalid => "Invalid Profile",
         }
     }
 
@@ -86,6 +95,9 @@ impl ErrorType {
             Self::ModeNotSupported => 400,
             Self::StreamError => 502,
             Self::Timeout => 504,
+            Self::ProfileMismatch => 409,
+            Self::ProfileReadOnly => 409,
+            Self::ProfileInvalid => 400,
         }
     }
 }
@@ -171,6 +183,29 @@ pub enum SandboxError {
     StreamError { message: String },
     #[error("timeout")]
     Timeout { message: Option<String> },
+    #[error(
+        "profile mismatch on server '{server_id}': it runs with {}, requested profile '{requested}'",
+        bound_profile_label(.bound)
+    )]
+    ProfileMismatch {
+        server_id: String,
+        bound: Option<String>,
+        requested: String,
+    },
+    #[error("profile '{agent}/{name}' comes from the --profiles file and is read-only")]
+    ProfileReadOnly { agent: String, name: String },
+    #[error("invalid profile: {message}")]
+    ProfileInvalid {
+        message: String,
+        fields: Vec<String>,
+    },
+}
+
+fn bound_profile_label(bound: &Option<String>) -> String {
+    match bound {
+        Some(name) => format!("profile '{name}'"),
+        None => "no profile".to_string(),
+    }
 }
 
 impl SandboxError {
@@ -192,6 +227,9 @@ impl SandboxError {
             Self::ModeNotSupported { .. } => ErrorType::ModeNotSupported,
             Self::StreamError { .. } => ErrorType::StreamError,
             Self::Timeout { .. } => ErrorType::Timeout,
+            Self::ProfileMismatch { .. } => ErrorType::ProfileMismatch,
+            Self::ProfileReadOnly { .. } => ErrorType::ProfileReadOnly,
+            Self::ProfileInvalid { .. } => ErrorType::ProfileInvalid,
         }
     }
 
@@ -297,6 +335,37 @@ impl SandboxError {
                 });
                 (None, None, details)
             }
+            Self::ProfileMismatch {
+                server_id,
+                bound,
+                requested,
+            } => {
+                let mut map = Map::new();
+                map.insert("serverId".to_string(), Value::String(server_id.clone()));
+                map.insert(
+                    "boundProfile".to_string(),
+                    bound.clone().map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert(
+                    "requestedProfile".to_string(),
+                    Value::String(requested.clone()),
+                );
+                (None, None, Some(Value::Object(map)))
+            }
+            Self::ProfileReadOnly { agent, name } => {
+                let mut map = Map::new();
+                map.insert("name".to_string(), Value::String(name.clone()));
+                (Some(agent.clone()), None, Some(Value::Object(map)))
+            }
+            Self::ProfileInvalid { message, fields } => {
+                let mut map = Map::new();
+                map.insert("message".to_string(), Value::String(message.clone()));
+                map.insert(
+                    "fields".to_string(),
+                    Value::Array(fields.iter().cloned().map(Value::String).collect()),
+                );
+                (None, None, Some(Value::Object(map)))
+            }
         };
 
         AgentError {
@@ -348,5 +417,76 @@ impl From<SandboxError> for AgentError {
 impl From<&SandboxError> for AgentError {
     fn from(value: &SandboxError) -> Self {
         value.to_agent_error()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn profile_mismatch_is_a_409_problem() {
+        let problem = SandboxError::ProfileMismatch {
+            server_id: "s1".to_string(),
+            bound: Some("base".to_string()),
+            requested: "review".to_string(),
+        }
+        .to_problem_details();
+        assert_eq!(problem.status, 409);
+        assert_eq!(problem.type_, "urn:sandbox-agent:error:profile_mismatch");
+        assert_eq!(
+            problem.detail.as_deref(),
+            Some("profile mismatch on server 's1': it runs with profile 'base', requested profile 'review'")
+        );
+        assert_eq!(
+            problem.extensions["details"],
+            json!({"serverId": "s1", "boundProfile": "base", "requestedProfile": "review"})
+        );
+    }
+
+    #[test]
+    fn profile_mismatch_without_bound_profile() {
+        let error = SandboxError::ProfileMismatch {
+            server_id: "s1".to_string(),
+            bound: None,
+            requested: "review".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "profile mismatch on server 's1': it runs with no profile, requested profile 'review'"
+        );
+        assert_eq!(
+            error.to_problem_details().extensions["details"]["boundProfile"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn profile_read_only_is_a_409_problem() {
+        let problem = SandboxError::ProfileReadOnly {
+            agent: "claude".to_string(),
+            name: "ops".to_string(),
+        }
+        .to_problem_details();
+        assert_eq!(problem.status, 409);
+        assert_eq!(problem.type_, "urn:sandbox-agent:error:profile_read_only");
+        assert_eq!(problem.extensions["agent"], json!("claude"));
+        assert_eq!(problem.extensions["details"], json!({"name": "ops"}));
+    }
+
+    #[test]
+    fn profile_invalid_lists_fields() {
+        let problem = SandboxError::ProfileInvalid {
+            message: "agent 'codex' does not support: session.skills".to_string(),
+            fields: vec!["session.skills".to_string()],
+        }
+        .to_problem_details();
+        assert_eq!(problem.status, 400);
+        assert_eq!(problem.type_, "urn:sandbox-agent:error:profile_invalid");
+        assert_eq!(
+            problem.extensions["details"]["fields"],
+            json!(["session.skills"])
+        );
     }
 }
