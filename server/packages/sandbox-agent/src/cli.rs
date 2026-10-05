@@ -1273,6 +1273,31 @@ fn run_mock_agent_process() -> Result<(), CliError> {
             }
         }
 
+        if method == Some("mock/env") && has_id {
+            // Test hook: report the listed variables of this agent process's
+            // environment (null when unset).
+            let mut env = serde_json::Map::new();
+            let names = msg
+                .pointer("/params/names")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for name in names.iter().filter_map(Value::as_str) {
+                env.insert(
+                    name.to_string(),
+                    std::env::var(name)
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                );
+            }
+            write_stdout_line(&serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": msg["id"],
+                "result": { "env": env }
+            }))?)?;
+            continue;
+        }
+
         if has_method && has_id {
             // Request -> respond with echo result
             let mut result = json!({ "echoed": msg });

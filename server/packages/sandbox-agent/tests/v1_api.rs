@@ -295,6 +295,8 @@ mod control_plane;
 mod desktop;
 #[path = "v1_api/fs_download_batch.rs"]
 mod fs_download_batch;
+#[path = "v1_api/mock_agent.rs"]
+mod mock_agent;
 #[path = "v1_api/processes.rs"]
 mod processes;
 #[path = "v1_api/turn_events.rs"]
