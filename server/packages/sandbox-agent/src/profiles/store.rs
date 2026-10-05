@@ -60,7 +60,11 @@ pub fn load_profiles_file(path: &Path) -> Result<Vec<AgentProfile>, SandboxError
         message: format!("failed to read profiles file {}: {err}", path.display()),
     })?;
     serde_json::from_str(&text).map_err(|err| SandboxError::InvalidRequest {
-        message: format!("invalid profiles file {}: {err}", path.display()),
+        message: format!(
+            "invalid profiles file {}: {}",
+            path.display(),
+            describe_json_error(&err)
+        ),
     })
 }
 
@@ -349,10 +353,36 @@ fn resolve_in(
 fn read_profile_file(path: &Path, agent: AgentId, name: &str) -> Result<AgentProfile, String> {
     validate_profile_name(name).map_err(|err| err.to_string())?;
     let text = fs::read_to_string(path).map_err(|err| err.to_string())?;
-    let mut profile: AgentProfile = serde_json::from_str(&text).map_err(|err| err.to_string())?;
+    let mut profile: AgentProfile =
+        serde_json::from_str(&text).map_err(|err| describe_json_error(&err))?;
     profile.agent = Some(agent.as_str().to_string());
     profile.name = Some(name.to_string());
     Ok(profile)
+}
+
+/// Category and position of a JSON error. The serde message itself is left
+/// out: it can quote values from the file, and profile values are secrets.
+fn describe_json_error(err: &serde_json::Error) -> String {
+    let category = match err.classify() {
+        serde_json::error::Category::Io => "read error",
+        serde_json::error::Category::Syntax => "JSON syntax error",
+        serde_json::error::Category::Data => "value does not match the profile format",
+        serde_json::error::Category::Eof => "unexpected end of JSON",
+    };
+    format!("{category} at line {} column {}", err.line(), err.column())
+}
+
+/// Creates `dir` and missing parents. New directories are owner-only on unix
+/// (they hold secrets); existing ones keep their permissions.
+fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 /// Writes to a temporary file next to `path`, then renames it over `path`.
@@ -364,7 +394,7 @@ fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
             "profile path has no parent",
         )
     })?;
-    fs::create_dir_all(parent)?;
+    create_private_dir_all(parent)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -747,5 +777,46 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn corrupt_profile_errors_do_not_echo_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.json");
+        fs::write(&path, r#"{"process":{"env":"s3cret-token"}}"#).unwrap();
+        let error = read_profile_file(&path, AgentId::Mock, "base").unwrap_err();
+        assert!(!error.contains("s3cret-token"), "{error}");
+        assert!(error.contains("line 1"), "{error}");
+
+        let file = dir.path().join("profiles.json");
+        fs::write(
+            &file,
+            r#"[{"agent":"mock","name":"a","process":{"env":{"TOKEN":["s3cret-token"]}}}]"#,
+        )
+        .unwrap();
+        let message = load_profiles_file(&file).unwrap_err().to_string();
+        assert!(!message.contains("s3cret-token"), "{message}");
+        assert!(
+            message.contains("profiles.json") && message.contains("line 1"),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_dirs_are_owner_only_and_existing_dirs_are_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        store.put(AgentId::Mock, "base", p(json!({}))).unwrap();
+        assert_eq!(mode(&dir.path().join("profiles")), 0o700);
+        assert_eq!(mode(&dir.path().join("profiles/mock")), 0o700);
+
+        let claude_dir = dir.path().join("profiles/claude");
+        fs::create_dir(&claude_dir).unwrap();
+        fs::set_permissions(&claude_dir, fs::Permissions::from_mode(0o750)).unwrap();
+        store.put(AgentId::Claude, "base", p(json!({}))).unwrap();
+        assert_eq!(mode(&claude_dir), 0o750);
     }
 }
