@@ -95,7 +95,7 @@
 
 ## Секреты
 
-- Значения `process.env` и `session.pluginConfigs` записываются как есть. Наружу отдаётся `"***"` и `hasValue: true`.
+- Значения `process.env`, `session.pluginConfigs` и `value` в `env` и `headers` у `session.mcpServers` записываются как есть. Наружу отдаётся `"***"` и `hasValue: true`. (Маскирование `mcpServers` добавлено 05.10.2026 при проверке плана: там обычно лежат токены.)
 - PUT со значением `"***"` сохраняет прежнее значение.
 - Значения не попадают в tracing-логи, Request Log и Events. Request Log Inspector маскирует тела запросов к `/v1/config/profiles`.
 
