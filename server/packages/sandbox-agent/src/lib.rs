@@ -10,6 +10,7 @@ mod desktop_runtime;
 mod desktop_streaming;
 pub mod desktop_types;
 mod process_runtime;
+pub mod profiles;
 pub mod router;
 pub mod server_logs;
 pub mod telemetry;
