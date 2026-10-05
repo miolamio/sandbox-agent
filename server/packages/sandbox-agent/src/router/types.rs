@@ -56,6 +56,8 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub capabilities: AgentCapabilities,
+    /// Profile fields this agent supports.
+    pub customization: crate::profiles::AgentCustomization,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_status: Option<ServerStatusInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
