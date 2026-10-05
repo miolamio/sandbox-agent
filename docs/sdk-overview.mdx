@@ -220,6 +220,19 @@ claude.onPermissionRequest((request) => {
 });
 ```
 
+Start sessions with a server-side [agent profile](/agent-profiles) (system prompt, MCP servers, plugins, process environment):
+
+```ts
+await sdk.putProfile("claude", "review", {
+  session: { systemPrompt: { mode: "replace", text: "You review code. Never edit files." } },
+});
+
+const reviewer = await sdk.createSession({ agent: "claude", profile: "review" });
+console.log(reviewer.profile); // "review"
+```
+
+Sessions with different profiles run on different agent servers. Only the profile name is stored with the session, and `resumeSession` starts a new agent server with the same profile when the old one is gone. `resumeOrCreateSession` with a different `profile` for an existing session throws an error.
+
 See [Agent Sessions](/agent-sessions) for full details on config options and error handling.
 
 ## Events
@@ -276,6 +289,9 @@ A turn's `turn_ended` is delivered after the turn's other session events. A list
 const health = await sdk.getHealth();
 const agents = await sdk.listAgents();
 await sdk.installAgent("codex", { reinstall: true });
+
+const profiles = await sdk.listProfiles();
+const review = await sdk.getProfile("claude", "review"); // secrets masked as "***"
 
 const entries = await sdk.listFsEntries({ path: "." });
 const writeResult = await sdk.writeFsFile({ path: "./hello.txt" }, "hello");

@@ -1,0 +1,144 @@
+---
+title: "Agent Profiles"
+description: "Named server-side settings for agent processes and their sessions."
+---
+
+import { TabItem, Tabs } from '@astrojs/starlight/components';
+
+An agent profile is a named set of settings stored on the server for one agent, for example `claude/review`. It sets the environment of the agent process and settings applied to every session that runs on it: a system prompt, MCP servers, and Claude Code plugins. Variants for different environments (local, E2B, Daytona) are profiles that extend a shared base.
+
+## Profile format
+
+```json
+{
+  "extends": "base",
+  "process": {
+    "env": { "ANTHROPIC_BASE_URL": "https://llm-proxy.internal" }
+  },
+  "session": {
+    "systemPrompt": { "mode": "append", "text": "Answer in English." },
+    "mcpServers": [
+      { "name": "github", "command": "github-mcp", "args": ["--stdio"], "env": [] }
+    ],
+    "plugins": [{ "path": "/opt/mods/first-mod" }],
+    "pluginConfigs": { "first-mod": { "level": "strict" } }
+  }
+}
+```
+
+| Field | Applied | Agents |
+|---|---|---|
+| `process.env` | when the agent process starts | all |
+| `session.systemPrompt` (`mode`: `replace` or `append`) | every new or restored session | Claude |
+| `session.mcpServers` | every new or restored session | all |
+| `session.plugins` | every new or restored session | Claude |
+| `session.pluginConfigs` | every new or restored session | Claude |
+| `process.args`, `process.config`, `session.skills` | not supported yet | none |
+
+`GET /v1/agents` reports what each agent supports in its `customization` field. Saving a profile with a field the agent does not support fails with `400`, and `details.fields` lists those fields.
+
+`session.mcpServers` entries use the same format as `sessionInit.mcpServers` (see [MCP](/docs/mcp-config)), and every entry needs a `name`.
+
+Profile names use 1 to 64 characters from `A-Z a-z 0-9 . _ -` and start with a letter or digit.
+
+:::caution
+`process.env` is added on top of the environment the agent process would otherwise get, and a profile value replaces any variable with the same name. This includes `PATH`, `HOME`, `LD_PRELOAD`, and the agent's own credentials (such as `ANTHROPIC_API_KEY`). Set only the variables you mean to change: a wrong `PATH` can keep the agent from starting, and anyone who can write profiles controls what the agent process runs.
+:::
+
+## Inheritance
+
+`extends` names a profile of the same agent (`"base"` or `"claude/base"`). The chain is applied from the base to the derived profile:
+
+| Field | Merge |
+|---|---|
+| `process.env`, `session.pluginConfigs` | by key, the derived profile wins |
+| `session.mcpServers` | by `name` |
+| `session.plugins` | by `path` |
+| `process.args`, `process.config`, `session.systemPrompt`, `session.skills` | the derived profile replaces the whole value |
+
+Saving fails with `400` for a cycle, a parent that does not exist, or a parent of another agent. A profile that another profile extends cannot be deleted (`409`, the response lists the profiles that extend it).
+
+## Manage profiles
+
+<Tabs>
+  <TabItem label="TypeScript">
+```ts
+await sdk.putProfile("claude", "base", {
+  process: { env: { ANTHROPIC_BASE_URL: "https://llm-proxy.internal" } },
+});
+await sdk.putProfile("claude", "review", {
+  extends: "base",
+  session: { systemPrompt: { mode: "replace", text: "You review code. Never edit files." } },
+});
+
+const { profiles } = await sdk.listProfiles();
+const review = await sdk.getProfile("claude", "review"); // { stored, resolved, hasValue }
+await sdk.deleteProfile("claude", "review");
+```
+  </TabItem>
+  <TabItem label="HTTP">
+```bash
+curl -X PUT http://127.0.0.1:2468/v1/config/profiles/claude/review \
+  -H 'content-type: application/json' \
+  -d '{"extends":"base","session":{"systemPrompt":{"mode":"replace","text":"You review code."}}}'
+curl http://127.0.0.1:2468/v1/config/profiles
+curl http://127.0.0.1:2468/v1/config/profiles/claude/review
+curl -X DELETE http://127.0.0.1:2468/v1/config/profiles/claude/review
+```
+  </TabItem>
+  <TabItem label="CLI">
+```bash
+sandbox-agent profiles put claude review --json-file ./review.json
+sandbox-agent profiles list
+sandbox-agent profiles get claude review
+sandbox-agent profiles delete claude review
+```
+  </TabItem>
+</Tabs>
+
+`getProfile` and `putProfile` return the profile as saved (`stored`), the profile with `extends` applied (`resolved`), and `hasValue` (see [Secrets](#secrets)). See [CLI](/docs/cli#profiles) for all CLI options.
+
+## Use a profile
+
+```ts
+const session = await sdk.createSession({ agent: "claude", profile: "review" });
+console.log(session.profile); // "review"
+```
+
+- The agent server started for the session runs with the profile, and the profile stays pinned to that server. Sessions with different profiles run on different agent servers. A request for a running server with another profile fails with `409` (`profile_mismatch`). Starting a server with a profile that does not exist fails with `404`.
+- Session settings from the profile are applied every time a session is created or restored, so they are kept when `resumeSession` restores a session. MCP servers you pass in `sessionInit.mcpServers` are merged with the profile's by `name`, and yours win.
+- The SDK stores only the profile name with the session (`session.profile`), never its contents. `resumeSession` uses the stored name and starts a new agent server with the same profile when the old one is gone. `resumeOrCreateSession` with a different `profile` for an existing session throws an error.
+- Without a profile nothing changes.
+
+## Changing a profile
+
+New and restored sessions get the changed `session` settings right away. Changes to `process` apply only to agent processes started afterwards: the agent server list (`sdk.listAcpServers()`) shows `profileStale: true` for a running server whose profile changed. The server does not restart agent processes on its own; delete the agent server (`sdk.destroyAcpServer(serverId)`) to apply the change.
+
+If the profile pinned to a running agent server is deleted, the server is also marked `profileStale: true`, and creating or restoring a session on it fails with `404`. Delete that agent server or create the profile again.
+
+## Secrets
+
+Values of `process.env`, `session.pluginConfigs`, and the `env` and `headers` entries of `session.mcpServers` are stored as given but are never returned: reads show `"***"`, and `hasValue` (for example `"process.env.ANTHROPIC_API_KEY": true` or `"session.mcpServers.github.headers.Authorization": true`) says which keys hold a value. An empty `process.env` value is not masked and shows `false`. Send `"***"` in an update to keep the stored value of that key. Profile files on disk are readable only by the server's user.
+
+Other fields are returned as they are. Keep secrets of MCP servers in `env` or `headers`, not in `args` or `url`, and keep them out of the system prompt and plugin paths.
+
+## Profiles from a file
+
+```bash
+sandbox-agent server --profiles ./profiles.json
+```
+
+The file is a JSON array of profiles, each with `agent` and `name`:
+
+```json
+[
+  { "agent": "claude", "name": "base", "process": { "env": { "ANTHROPIC_BASE_URL": "https://llm-proxy.internal" } } },
+  { "agent": "claude", "name": "e2b", "extends": "base", "session": { "systemPrompt": { "mode": "append", "text": "You run in E2B." } } }
+]
+```
+
+The file is read once at startup and an invalid file stops the server. Its profiles are listed with `source: "file"`, cannot be changed or deleted through the API (`409`, `profile_read_only`), and win over API profiles with the same agent and name.
+
+## Storage
+
+Profiles created through the API are stored one file per profile in `<state dir>/profiles/<agent>/<name>.json`. The state directory is `$SANDBOX_AGENT_STATE_DIR`, by default `sandbox-agent/state` in the user data directory (for example `~/.local/share/sandbox-agent/state` on Linux).

@@ -100,6 +100,7 @@ export const siteConfig = {
           ],
         },
         { slug: "docs/attachments", attrs: { "data-icon": "folder" } },
+        { slug: "docs/agent-profiles", label: "Agent Profiles", attrs: { "data-icon": "blocks" } },
         { slug: "docs/skills-config", label: "Skills Config", attrs: { "data-icon": "puzzle" } },
         { slug: "docs/mcp-config", label: "MCP Config", attrs: { "data-icon": "network" } },
         { slug: "docs/custom-tools", label: "Custom Tools", attrs: { "data-icon": "wrench" } },

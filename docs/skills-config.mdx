@@ -23,7 +23,7 @@ const session = await sdk.createSession({ agent: "claude", cwd: "/workspace" });
 ## Deprecated config endpoints
 
 <Warning>
-`setSkillsConfig`, `getSkillsConfig` and `deleteSkillsConfig` (and the HTTP endpoints behind them) are deprecated and will be removed in the next minor release. The server only stores the config as JSON in `<directory>/.sandbox-agent/config/skills.json`. Nothing reads it, so no skill source listed there reaches an agent.
+`setSkillsConfig`, `getSkillsConfig` and `deleteSkillsConfig` (and the HTTP endpoints behind them) are deprecated and will be removed in the next minor release. The server only stores the config as JSON in `<directory>/.sandbox-agent/config/skills.json`. Nothing reads it, so no skill source listed there reaches an agent. Agent profiles will cover skills once agents support them, see [Agent Profiles](/agent-profiles).
 </Warning>
 
 Stored entries describe skill sources:
