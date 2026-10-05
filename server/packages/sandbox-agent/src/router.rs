@@ -3355,14 +3355,22 @@ async fn get_v1_config_profile(
     responses(
         (status = 200, description = "Profile stored; stored and resolved profile, secrets masked", body = ProfileDetailResponse),
         (status = 400, description = "Invalid profile: name, JSON, extends cycle or unknown parent, or fields the agent does not support (listed in details.fields)", body = ProblemDetails),
-        (status = 409, description = "Profile comes from the --profiles file and is read-only", body = ProblemDetails)
+        (status = 409, description = "Profile comes from the --profiles file and is read-only", body = ProblemDetails),
+        (status = 415, description = "Request body is not application/json", body = ProblemDetails)
     )
 )]
 async fn put_v1_config_profile(
     State(state): State<Arc<AppState>>,
     Path((agent, name)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ProfileDetailResponse>, ApiError> {
+    if !content_type_is(&headers, APPLICATION_JSON) {
+        return Err(SandboxError::UnsupportedMediaType {
+            message: "content-type must be application/json".to_string(),
+        }
+        .into());
+    }
     let agent = parse_agent_path(&agent)?;
     // Raw bytes, not `Json<_>`: serde and axum rejection messages can quote
     // body values (secrets). Only the error category and position are reported.

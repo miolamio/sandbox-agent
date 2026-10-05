@@ -388,6 +388,52 @@ async fn invalid_put_body_does_not_echo_values() {
 }
 
 #[tokio::test]
+async fn put_requires_json_content_type() {
+    let h = harness(Vec::new());
+    for content_type in [
+        None,
+        Some("text/plain"),
+        Some("application/x-www-form-urlencoded"),
+    ] {
+        let mut builder = Request::builder()
+            .method(Method::PUT)
+            .uri("/v1/config/profiles/mock/a");
+        if let Some(value) = content_type {
+            builder = builder.header("content-type", value);
+        }
+        let request = builder.body(Body::from("{}")).expect("request");
+        let response = h.app.clone().oneshot(request).await.expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{content_type:?}"
+        );
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let problem: Value = serde_json::from_slice(&bytes).expect("problem json");
+        assert_eq!(
+            problem["type"], "urn:sandbox-agent:error:unsupported_media_type",
+            "{problem}"
+        );
+    }
+    let (status, _) = call(&h.app, Method::GET, "/v1/config/profiles/mock/a", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/v1/config/profiles/mock/a")
+        .header("content-type", "application/json; charset=utf-8")
+        .body(Body::from("{}"))
+        .expect("request");
+    let response = h.app.clone().oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn default_app_state_keeps_profiles_in_memory() {
     let install_dir = tempfile::tempdir().expect("install dir");
     let state_dir = tempfile::tempdir().expect("state dir");
